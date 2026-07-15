@@ -221,6 +221,17 @@ def _probe_aiter_triton_gemm_mxfp8():
 
 
 @functools.lru_cache(maxsize=1)
+def _probe_aiter_triton_gemm_mxfp4():
+    """Check if AITER Triton MXFP4 GEMM (gemm_afp4wfp4) is available."""
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4 as _  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def _probe_aiter_triton_rope_cached():
     """Check if AITER Triton cached RoPE (SBHD layout) is available."""
     try:

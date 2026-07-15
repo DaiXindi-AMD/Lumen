@@ -20,11 +20,17 @@ from torchao.quantization.quant_primitives import (
 )
 
 from lumen.ops.quantize import (
+    convert_from_mxfp4,
+    convert_from_mxfp4_2d,
     convert_from_mxfp8,
+    convert_to_mxfp4,
+    convert_to_mxfp4_2d,
     convert_to_mxfp8,
     dequant_fp8_tensorwise_impl,
+    hadamard_transform,
     quant_fp8_blockwise_impl,
     quant_fp8_tensorwise_impl,
+    transpose_packed_fp4,
 )
 
 # ---------------------------------------------------------------------------
@@ -466,3 +472,162 @@ def test_mxfp8_dtype_variants(fp8_dtype, shape, block_size):
         atol=1e-1,
         rtol=1e-1,
     )
+
+
+# ---------------------------------------------------------------------------
+# MXFP4
+# ---------------------------------------------------------------------------
+
+MXFP4_BLOCK_SIZE = 32
+MXFP4_SHAPES = [(64, 128), (128, 256)]
+
+
+def _require_mxfp4_dtype():
+    if not hasattr(torch, "float4_e2m1fn_x2"):
+        pytest.skip("torch.float4_e2m1fn_x2 unavailable in this PyTorch build")
+
+
+def _torchao_mxfp4_dequant(data_fp4, scales, block_size=MXFP4_BLOCK_SIZE):
+    return torchao_to_dtype(
+        data_fp4.cpu().contiguous(),
+        scales.cpu().contiguous().view(torch.float8_e8m0fnu),
+        torch.float4_e2m1fn_x2,
+        block_size,
+        torch.float32,
+    )
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_1d_rtn_vs_torchao_mxtensor(shape):
+    """Compare Lumen 1x32 MXFP4 RTN quant/dequant against TorchAO MXTensor."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 RTN quant unavailable on this hardware/build: {e}")
+
+    mx_ref = MXTensor.to_mx(
+        x.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+
+    torch.testing.assert_close(scales.cpu(), mx_ref.scale.view(torch.uint8), atol=0, rtol=0)
+    torch.testing.assert_close(data_fp4.cpu(), mx_ref.qdata.view(torch.uint8), atol=0, rtol=0)
+
+    x_deq_lumen = convert_from_mxfp4(
+        data_fp4, scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+    )
+    x_deq_ref = mx_ref.dequantize(torch.float32)
+    torch.testing.assert_close(x_deq_lumen.cpu(), x_deq_ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_1d_rtn_cross_dequant_with_torchao(shape):
+    """TorchAO should dequantize Lumen's packed MXFP4 payload identically."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 RTN quant unavailable on this hardware/build: {e}")
+
+    x_deq_lumen = convert_from_mxfp4(
+        data_fp4, scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+    )
+    x_deq_torchao = _torchao_mxfp4_dequant(data_fp4, scales)
+    torch.testing.assert_close(x_deq_lumen.cpu(), x_deq_torchao, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_2d_rtn_roundtrip_snr(shape):
+    """Lumen 32x32 MXFP4 weight quantization has no TorchAO MXTensor equivalent."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales_2d = convert_to_mxfp4_2d(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+        )
+        x_deq = convert_from_mxfp4_2d(
+            data_fp4, scales_2d, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 2D quant unavailable on this hardware/build: {e}")
+
+    snr = compute_snr(x.float(), x_deq)
+    assert snr >= 4.0, f"MXFP4 2D roundtrip SNR {snr:.1f} dB too low"
+    assert not torch.isnan(x_deq).any()
+    assert not torch.isinf(x_deq).any()
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_transpose_packed_matches_unpack_reference(shape):
+    """Packed FP4 transpose should match unpack -> transpose -> repack reference."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(11)
+    torch.cuda.manual_seed(11)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, _ = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+        transposed = transpose_packed_fp4(data_fp4)
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 transpose unavailable on this hardware/build: {e}")
+
+    unpacked = data_fp4.cpu().repeat_interleave(2, dim=-1)
+    unpacked[..., ::2] = unpacked[..., ::2] & 0xF
+    unpacked[..., 1::2] = unpacked[..., 1::2] >> 4
+    ref_unpacked_t = unpacked.t().contiguous()
+    ref = ref_unpacked_t[..., ::2] | (ref_unpacked_t[..., 1::2] << 4)
+
+    torch.testing.assert_close(transposed.cpu(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (128, 256)], ids=["64x128", "128x256"])
+def test_mxfp4_hadamard_transform_matches_torchao_matrix(shape):
+    """Lumen blockwise RHT should match TorchAO's explicit 16x16 RHT matrix."""
+    from torchao.prototype.moe_training.nvfp4_training.hadamard_utils import get_rht_matrix
+
+    M, N = shape
+    # TorchAO's helper currently exposes only 16x16 Hadamard matrices. Lumen's
+    # runtime MXFP4 path uses g=32, but the same kernel supports g=16, which lets
+    # us compare the operator against TorchAO's reference matrix directly.
+    g = 16
+    torch.manual_seed(17)
+    torch.cuda.manual_seed(17)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(
+        torch.rand(g, device="cuda") >= 0.5,
+        torch.ones(g, device="cuda"),
+        -torch.ones(g, device="cuda"),
+    )
+
+    try:
+        y = hadamard_transform(x, sign, g=g)
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen Hadamard transform unavailable on this hardware/build: {e}")
+
+    h = get_rht_matrix(tuple(sign.cpu().to(torch.int8).tolist()), "cpu", torch.float32, g)
+    ref = (x.float().cpu().reshape(M, N // g, g) @ h).reshape(M, N)
+    torch.testing.assert_close(y.float().cpu(), ref, atol=1e-2, rtol=1e-2)

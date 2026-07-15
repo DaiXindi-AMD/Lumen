@@ -7,7 +7,7 @@
 """
 lumen.quantize — low-precision training lifecycle for AMD GPUs.
 
-Supports FP8 (E4M3 / E5M2), MXFP8, and FP4 formats.
+Supports FP8 (E4M3 / E5M2), MXFP8, MXFP4, and FP4 formats.
 
 Usage::
 
