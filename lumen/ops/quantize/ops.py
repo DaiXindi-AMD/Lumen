@@ -768,6 +768,21 @@ def transpose_packed_fp4(data_fp4: torch.Tensor) -> torch.Tensor:
     return output
 
 
+_hadamard_cache: dict[tuple[int, torch.device], torch.Tensor] = {}
+
+
+def _get_hadamard_matrix(g: int, device: torch.device) -> torch.Tensor:
+    """Return the normalized g×g Hadamard matrix, cached per (g, device)."""
+    key = (g, device)
+    if key not in _hadamard_cache:
+        H = torch.tensor([[1.0]], device=device)
+        while H.shape[0] < g:
+            H = torch.cat([torch.cat([H, H], dim=1),
+                           torch.cat([H, -H], dim=1)], dim=0)
+        _hadamard_cache[key] = H * (1.0 / (g ** 0.5))
+    return _hadamard_cache[key]
+
+
 def hadamard_transform(
     x: torch.Tensor,
     sign_vector: torch.Tensor,
@@ -775,25 +790,18 @@ def hadamard_transform(
 ) -> torch.Tensor:
     """Apply blockwise Random Hadamard Transform.
 
-    Applies H_g @ diag(S) to blocks of g elements along the last dimension.
-    Uses Lumen Triton kernel (no AITER equivalent).
+    Computes (x * diag(S)) @ H_g for blocks of g elements along the last
+    dimension, where H_g is the normalized Hadamard matrix.
     """
-    from lumen.kernels.mxfp4 import _hadamard_transform_kernel
-
     assert x.shape[-1] % g == 0, f"N={x.shape[-1]} not divisible by g={g}"
     assert (g & (g - 1)) == 0, f"g={g} must be a power of 2"
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
     M, N = x_2d.shape
-    output = torch.empty_like(x_2d)
 
-    grid = (M, N // g)
-    _hadamard_transform_kernel[grid](
-        x_2d, output, sign_vector,
-        M, N,
-        x_2d.stride(0), x_2d.stride(1),
-        output.stride(0), output.stride(1),
-        G=g,
-    )
-    return output.reshape(orig_shape)
+    H = _get_hadamard_matrix(g, x.device)
+    x_blocked = x_2d.float().reshape(M, N // g, g)
+    x_blocked = x_blocked * sign_vector.float()
+    out = (x_blocked @ H).to(x.dtype).reshape(orig_shape)
+    return out

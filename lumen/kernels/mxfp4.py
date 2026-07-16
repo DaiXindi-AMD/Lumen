@@ -91,7 +91,10 @@ def _calculate_fp4_scales(
     mask = ((1 << (hp_ebits + sbits)) - 1) << hp_mbits
     max_abs = (max_abs + val_to_add) & mask
 
-    extracted_pow2 = ((max_abs >> hp_mbits) & 0b11111111) - hp_exp_bias
+    # NOTE: the masked exponent field is unsigned; cast to signed int32 before
+    # subtracting the biases, otherwise ``extracted_pow2 - target_max_pow2`` can
+    # underflow to a huge positive value and clamp to the max E8M0 scale (2**128).
+    extracted_pow2 = ((max_abs >> hp_mbits) & 0b11111111).to(tl.int32) - hp_exp_bias
     scale_e8m0_unbiased = extracted_pow2 - target_max_pow2
 
     scale_e8m0_unbiased = tl.minimum(
@@ -150,7 +153,7 @@ def _pack_fp4(
     scales = tl.where(scales < 1, 1, scales)
     scales_fp32 = (scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
     F32_MIN_NORMAL: tl.constexpr = 2**-126
-    min_frag = (F32_MIN_NORMAL).to(tl.float32)
+    min_frag = F32_MIN_NORMAL
     scales_fp32 = tl.where(scales_fp32 < min_frag, min_frag, scales_fp32)
 
     if IS_2D_BLOCK:
@@ -180,7 +183,7 @@ def _pack_fp4(
                     asm="v_cvt_scalef32_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
                     constraints="=&v,v,v,v",
                     args=[x0, x1, scales_fp32],
-                    dtype=tl.uint8,
+                    dtype=tl.uint32,
                     is_pure=True,
                     pack=1,
                 )
@@ -193,7 +196,7 @@ def _pack_fp4(
                     asm="v_cvt_scalef32_sr_pk_fp4_f32 $0, $1, $2, $3 op_sel:[0,0,0,0];",
                     constraints="=&v,v,v,v",
                     args=[x_packed, randval0, scales_fp32],
-                    dtype=tl.uint8,
+                    dtype=tl.uint32,
                     is_pure=True,
                     pack=1,
                 )
@@ -207,7 +210,7 @@ def _pack_fp4(
                     asm="v_cvt_scalef32_pk_fp4_bf16 $0, $1, $2 op_sel:[0,0,0,0];",
                     constraints="=&v,v,v",
                     args=[x_packed_bf16, scales_fp32],
-                    dtype=tl.uint8,
+                    dtype=tl.uint32,
                     is_pure=True,
                     pack=1,
                 )
@@ -219,13 +222,16 @@ def _pack_fp4(
                     asm="v_cvt_scalef32_sr_pk_fp4_bf16 $0, $1, $2, $3 op_sel:[0,0,0,0];",
                     constraints="=&v,v,v,v",
                     args=[x_packed_bf16, randval0, scales_fp32],
-                    dtype=tl.uint8,
+                    dtype=tl.uint32,
                     is_pure=True,
                     pack=1,
                 )
 
-        # Output is already packed: bits[3:0]=fp4(x0), bits[7:4]=fp4(x1)
-        # Reshape from (BLOCK_M, HALF_BLOCK_N) to the packed output layout
+        # Output is already packed: bits[3:0]=fp4(x0), bits[7:4]=fp4(x1).
+        # The pk instruction writes the packed byte into the low 8 bits of a
+        # 32-bit VGPR (op_sel selects byte 0); a uint8 asm output constraint is
+        # not allocatable to a `v` register, so we declare uint32 and mask.
+        y = (y & 0xFF).to(tl.uint8)
         y = y.reshape(BLOCK_M, HALF_BLOCK_N)
     else:
         # Software fallback: manual FP4 E2M1 conversion
@@ -243,7 +249,7 @@ def _pack_fp4(
 
         # FP4 E2M1 levels: 0, 0.5, 1, 1.5, 2, 3, 4, 6
         # Boundaries: 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0
-        code = tl.zeros_like(abs_val, dtype=tl.uint8)
+        code = tl.zeros_like(abs_val).to(tl.uint8)
         code = tl.where(abs_val >= 0.25, tl.full(code.shape, 1, dtype=tl.uint8), code)
         code = tl.where(abs_val >= 0.75, tl.full(code.shape, 2, dtype=tl.uint8), code)
         code = tl.where(abs_val >= 1.25, tl.full(code.shape, 3, dtype=tl.uint8), code)
@@ -257,8 +263,7 @@ def _pack_fp4(
 
         # Pack two FP4 codes into one uint8 (AITER convention: even=low nibble)
         codes_reshaped = fp4_code.reshape(BLOCK_M, HALF_BLOCK_N, 2)
-        even = codes_reshaped[:, :, 0:1].reshape(BLOCK_M, HALF_BLOCK_N)
-        odd = codes_reshaped[:, :, 1:2].reshape(BLOCK_M, HALF_BLOCK_N)
+        even, odd = tl.split(codes_reshaped)
         y = even | (odd << 4)
 
     return y
@@ -379,8 +384,7 @@ def _transpose_packed_fp4_kernel(
     transposed = tl.trans(unpacked)
 
     reshaped = tl.reshape(transposed, (BLOCK_N, BLOCK_M_HALF, 2))
-    t_even = tl.reshape(reshaped[:, :, 0:1], (BLOCK_N, BLOCK_M_HALF))
-    t_odd = tl.reshape(reshaped[:, :, 1:2], (BLOCK_N, BLOCK_M_HALF))
+    t_even, t_odd = tl.split(reshaped)
     repacked = t_even | (t_odd << 4)
 
     rn_full = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -420,16 +424,25 @@ def _hadamard_transform_kernel(
     signs = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
     x = x * signs[None, :]
 
-    h = 1
-    log2_G: tl.constexpr = tl.constexpr(int(math.log2(G)))
-    for _ in range(log2_G):
-        x_reshaped = tl.reshape(x, (1, G // (2 * h), 2, h))
-        top = tl.reshape(x_reshaped[:, :, 0:1, :], (1, G // (2 * h), h))
-        bot = tl.reshape(x_reshaped[:, :, 1:2, :], (1, G // (2 * h), h))
+    # Unroll at compile time: derive h from the static induction index and keep
+    # h/groups as constexpr ints (a loop-carried h becomes a traced tensor and
+    # breaks the reshape shapes).
+    log2_g: tl.constexpr = int(math.log2(G))
+    for i in tl.static_range(log2_g):
+        h = 1 << i
+        groups = G // (2 * h)
+        # (1, groups, 2, h): split each 2h-group into two h-blocks (top/bot).
+        # Triton 3.7 has no slice indexing, so permute the pair axis last and
+        # use tl.split.
+        x_reshaped = tl.reshape(x, (1, groups, 2, h))
+        x_perm = tl.permute(x_reshaped, (0, 1, 3, 2))  # (1, groups, h, 2)
+        top, bot = tl.split(x_perm)                     # each (1, groups, h)
         new_top = top + bot
         new_bot = top - bot
-        x = tl.reshape(tl.join(new_top, new_bot), (1, G))
-        h = h * 2
+        # Reassemble as (1, groups, 2, h) -> (1, G).
+        stacked = tl.join(new_top, new_bot)             # (1, groups, h, 2)
+        stacked = tl.permute(stacked, (0, 1, 3, 2))     # (1, groups, 2, h)
+        x = tl.reshape(stacked, (1, G))
 
     x = x * (1.0 / tl.sqrt(float(G)))
 
