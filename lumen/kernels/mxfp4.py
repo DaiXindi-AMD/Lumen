@@ -171,7 +171,12 @@ def _pack_fp4(
         )
 
     if USE_SR:
-        randval0 = _generate_randval(BLOCK_M, BLOCK_N, philox_seed, philox_offset)
+        if USE_ASM:
+            # ASM pk instruction processes 2 values per call; one seed per pair
+            randval0 = _generate_randval(BLOCK_M, HALF_BLOCK_N, philox_seed, philox_offset)
+        else:
+            # Software path applies per-element noise
+            randval0 = _generate_randval(BLOCK_M, BLOCK_N, philox_seed, philox_offset)
     else:
         randval0 = 0
 

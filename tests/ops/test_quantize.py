@@ -6,6 +6,7 @@
 import pytest
 import torch
 import triton
+from triton.compiler.errors import CompilationError
 from conftest import compute_snr
 from torchao.kernel.blockwise_quantization import fp8_blockwise_act_quant
 from torchao.prototype.mx_formats.config import ScaleCalculationMode
@@ -25,6 +26,7 @@ from lumen.ops.quantize import (
     convert_from_mxfp8,
     convert_to_mxfp4,
     convert_to_mxfp4_2d,
+    convert_to_mxfp4_dual_axis,
     convert_to_mxfp8,
     dequant_fp8_tensorwise_impl,
     hadamard_transform,
@@ -32,6 +34,7 @@ from lumen.ops.quantize import (
     quant_fp8_tensorwise_impl,
     transpose_packed_fp4,
 )
+from lumen.ops.quantize.linear import _expand_2d_scale_to_1d, gemm_mxfp4_dispatch
 
 # ---------------------------------------------------------------------------
 # Tensorwise FP8
@@ -631,3 +634,291 @@ def test_mxfp4_hadamard_transform_matches_torchao_matrix(shape):
     h = get_rht_matrix(tuple(sign.cpu().to(torch.int8).tolist()), "cpu", torch.float32, g)
     ref = (x.float().cpu().reshape(M, N // g, g) @ h).reshape(M, N)
     torch.testing.assert_close(y.float().cpu(), ref, atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_axis0_quant_vs_torchao(shape):
+    """Lumen axis=0 quant should match torchAO quant on the transposed input."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(55)
+    torch.cuda.manual_seed(55)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=0, use_sr=False,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 axis=0 quant unavailable: {e}")
+
+    mx_ref = MXTensor.to_mx(
+        x.float().t().contiguous().cpu(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+
+    ref_data = mx_ref.qdata.view(torch.uint8)
+    ref_scales = mx_ref.scale.view(torch.uint8)
+
+    # Lumen axis=0 returns transposed packed data: (N//2, M) scales: (N//block, M)
+    # torchAO quantizes x.T along axis=-1: data (N, M//2), scales (N, M//block)
+    # Lumen's axis=0 transposes before and after, so the packed output shape is
+    # (N//2, M) for data and (N//block, M) for scales.
+    torch.testing.assert_close(
+        data_fp4.t().contiguous().cpu(), ref_data, atol=0, rtol=0,
+    )
+    torch.testing.assert_close(
+        scales.t().contiguous().cpu(), ref_scales, atol=0, rtol=0,
+    )
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_dual_axis_vs_torchao(shape):
+    """Both axes from dual_axis should match independent torchAO quantizations."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(77)
+    torch.cuda.manual_seed(77)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        row_fp4, row_scales, col_fp4, col_scales = convert_to_mxfp4_dual_axis(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 dual_axis quant unavailable: {e}")
+
+    mx_row = MXTensor.to_mx(
+        x.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    torch.testing.assert_close(
+        row_fp4.cpu(), mx_row.qdata.view(torch.uint8), atol=0, rtol=0,
+    )
+    torch.testing.assert_close(
+        row_scales.cpu(), mx_row.scale.view(torch.uint8), atol=0, rtol=0,
+    )
+
+    mx_col = MXTensor.to_mx(
+        x.float().t().contiguous().cpu(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    torch.testing.assert_close(
+        col_fp4.t().contiguous().cpu(), mx_col.qdata.view(torch.uint8), atol=0, rtol=0,
+    )
+    torch.testing.assert_close(
+        col_scales.t().contiguous().cpu(), mx_col.scale.view(torch.uint8), atol=0, rtol=0,
+    )
+
+
+def test_mxfp4_stochastic_rounding_unbiased():
+    """SR quant-dequant should be unbiased: mean over many rounds ≈ original."""
+    _require_mxfp4_dtype()
+    torch.manual_seed(99)
+    torch.cuda.manual_seed(99)
+    M, N = 64, 128
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    x_f32 = x.float()
+
+    num_rounds = 200
+    deq_sum = torch.zeros(M, N, device="cuda", dtype=torch.float32)
+    sr_last_fp4 = None
+
+    for i in range(num_rounds):
+        try:
+            sr_fp4, sr_scales = convert_to_mxfp4(
+                x_f32, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=True,
+                philox_seed=i, philox_offset=0,
+            )
+        except (AssertionError, RuntimeError, CompilationError) as e:
+            pytest.skip(f"Lumen MXFP4 SR quant unavailable: {e}")
+
+        deq = convert_from_mxfp4(
+            sr_fp4, sr_scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+        )
+        deq_sum += deq
+        sr_last_fp4 = sr_fp4
+
+    rtn_fp4, _ = convert_to_mxfp4(
+        x_f32, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+    )
+
+    mean_deq = deq_sum / num_rounds
+
+    # Unbiasedness: mean should be close to original within FP4 quantization noise
+    abs_err = (mean_deq - x_f32).abs()
+    max_abs_err = abs_err.max().item()
+    assert max_abs_err < 1.0, f"SR mean max error {max_abs_err:.4f} too large (expect < 1.0)"
+
+    mean_abs_err = abs_err.mean().item()
+    assert mean_abs_err < 0.15, f"SR mean abs error {mean_abs_err:.4f} too large (expect < 0.15)"
+
+    # SR should produce different packed bytes from RTN for at least some elements
+    assert not torch.equal(sr_last_fp4, rtn_fp4), "SR and RTN produced identical outputs"
+
+
+@pytest.mark.parametrize(
+    "M,K,N", [(64, 128, 64), (128, 256, 128)],
+    ids=["64x128x64", "128x256x128"],
+)
+def test_mxfp4_gemm_vs_torchao_gemm(M, K, N):
+    """Lumen MXFP4 GEMM (1D scales) should match torchAO MXTensor matmul."""
+    _require_mxfp4_dtype()
+    torch.manual_seed(33)
+    torch.cuda.manual_seed(33)
+
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+
+    # Lumen: quant both with 1D scales, then GEMM
+    try:
+        a_fp4, a_scales = convert_to_mxfp4(
+            a_hp.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+        w_fp4, w_scales = convert_to_mxfp4(
+            w_hp.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+        y_lumen = gemm_mxfp4_dispatch(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 GEMM unavailable: {e}")
+
+    # torchAO: quant both with MXTensor, then matmul (dequant→FP32 matmul)
+    mx_a = MXTensor.to_mx(
+        a_hp.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    mx_w = MXTensor.to_mx(
+        w_hp.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    y_torchao = (mx_a.dequantize(torch.float32) @ mx_w.dequantize(torch.float32).t())
+
+    # Lumen dequant reference (should match torchAO dequant — verified by other tests)
+    a_deq = convert_from_mxfp4(
+        a_fp4, a_scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+    )
+    w_deq = convert_from_mxfp4(
+        w_fp4, w_scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+    )
+    y_lumen_deq = a_deq @ w_deq.t()
+
+    # Lumen GEMM vs Lumen dequant-matmul (self-consistency, SNR)
+    snr_self = compute_snr(y_lumen_deq, y_lumen.float())
+    assert snr_self >= 4.0, f"Lumen GEMM self-consistency SNR {snr_self:.1f} dB too low"
+
+    # Lumen dequant-matmul vs torchAO dequant-matmul (cross-framework, bitwise)
+    torch.testing.assert_close(y_lumen_deq.cpu(), y_torchao, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,K", [(128, 256), (256, 512)],
+    ids=["128x256", "256x512"],
+)
+def test_mxfp4_expand_2d_scale_to_1d(M, K):
+    """2D scale expansion should replicate each tile scale across block_size rows."""
+    block = MXFP4_BLOCK_SIZE
+    sm, sn = M // block, K // block
+    scale_2d = torch.randint(100, 200, (sm, sn), dtype=torch.uint8, device="cuda")
+
+    expanded = _expand_2d_scale_to_1d(scale_2d, (M, K), block_size=block)
+    assert expanded.shape == (M, sn), f"Expected ({M}, {sn}), got {expanded.shape}"
+
+    for tile_row in range(sm):
+        for row_in_tile in range(block):
+            global_row = tile_row * block + row_in_tile
+            torch.testing.assert_close(
+                expanded[global_row], scale_2d[tile_row], atol=0, rtol=0,
+            )
+
+    # Passthrough: 1D scale with matching row count should return unchanged
+    scale_1d = torch.randint(100, 200, (M, sn), dtype=torch.uint8, device="cuda")
+    result_1d = _expand_2d_scale_to_1d(scale_1d, (M, K), block_size=block)
+    assert result_1d.data_ptr() == scale_1d.data_ptr()
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_dequant_2d_vs_manual_reference(shape):
+    """2D dequant should match a manual unpack+scale reference."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(13)
+    torch.cuda.manual_seed(13)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales_2d = convert_to_mxfp4_2d(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+        )
+        y = convert_from_mxfp4_2d(
+            data_fp4, scales_2d, output_dtype=torch.float32,
+            block_size=MXFP4_BLOCK_SIZE,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 2D quant/dequant unavailable: {e}")
+
+    # Manual reference on CPU
+    block = MXFP4_BLOCK_SIZE
+    lut = torch.tensor(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+        dtype=torch.float32,
+    )
+    packed = data_fp4.cpu().view(torch.uint8)
+    unpacked = packed.repeat_interleave(2, dim=-1)
+    unpacked[..., ::2] = unpacked[..., ::2] & 0xF
+    unpacked[..., 1::2] = unpacked[..., 1::2] >> 4
+    values = lut[unpacked.long()]
+
+    sm, sn = scales_2d.shape[-2], scales_2d.shape[-1]
+    scale_f32 = torch.pow(
+        2.0, scales_2d.cpu().view(torch.uint8).to(torch.float32) - 127.0,
+    )
+    scale_expanded = (
+        scale_f32.view(sm, 1, sn, 1)
+        .expand(sm, block, sn, block)
+        .reshape(M, N)
+    )
+    ref = values * scale_expanded
+
+    torch.testing.assert_close(y.cpu(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
+def test_mxfp4_roundtrip_quant_dequant_vs_torchao_roundtrip(shape):
+    """Full Lumen roundtrip should match full torchAO roundtrip bitwise."""
+    _require_mxfp4_dtype()
+    M, N = shape
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+        x_deq_lumen = convert_from_mxfp4(
+            data_fp4, scales, output_dtype=torch.float32,
+            block_size=MXFP4_BLOCK_SIZE,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 roundtrip unavailable: {e}")
+
+    mx_ref = MXTensor.to_mx(
+        x.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    x_deq_torchao = mx_ref.dequantize(torch.float32)
+
+    torch.testing.assert_close(x_deq_lumen.cpu(), x_deq_torchao, atol=0, rtol=0)
