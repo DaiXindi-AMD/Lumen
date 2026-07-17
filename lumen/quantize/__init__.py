@@ -287,7 +287,7 @@ def _patch_linear_layers(
     block_size = config.block_size
     quant_act = config.quantize_activation
     fp8_wgrad = config.fp8_wgrad
-    scaling_type = config.scaling.value
+    scaling_type = config.recipe
 
     megatron_types = _get_megatron_linear_types()
     quantizable_types = (nn.Linear,) + megatron_types
