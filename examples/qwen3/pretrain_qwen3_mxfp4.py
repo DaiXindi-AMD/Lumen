@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+# Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
+"""Qwen3-0.6B pretraining from random init — MXFP4 / FP8 / BF16 + TensorBoard.
+
+Validates end-to-end MXFP4 training pipeline on wikitext-2.
+Model is randomly initialized (no pretrained weights needed).
+
+Usage:
+    torchrun --nproc_per_node=8 examples/qwen3/pretrain_qwen3_mxfp4.py \
+        --mode mxfp4 --tensorboard-dir ./runs/mxfp4_qwen3 --max-steps 50
+"""
+import argparse
+import logging
+import os
+import time
+from argparse import Namespace
+
+import torch
+import torch.distributed as dist
+import torch.nn as nn
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
+from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
+from torch.utils.data import DataLoader, DistributedSampler, Dataset
+
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+
+from lumen.config import LumenConfig
+from lumen.models.fsdp import _rank0_print as rank0
+
+logger = logging.getLogger(__name__)
+
+
+class WikitextPretrainDataset(Dataset):
+    """Tokenize wikitext into fixed-length chunks for causal LM pretraining."""
+
+    def __init__(self, split, tokenizer, seq_length, max_samples=None):
+        from datasets import load_dataset
+        raw = load_dataset("Salesforce/wikitext", "wikitext-2-raw-v1", split=split)
+        text = "\n".join(row["text"] for row in raw if row["text"].strip())
+        tokens = tokenizer(text, return_attention_mask=False)["input_ids"]
+        chunk_len = seq_length + 1
+        n_chunks = len(tokens) // chunk_len
+        if max_samples:
+            n_chunks = min(n_chunks, max_samples)
+        self.chunks = [tokens[i * chunk_len:(i + 1) * chunk_len] for i in range(n_chunks)]
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def __getitem__(self, idx):
+        return {"input_ids": torch.LongTensor(self.chunks[idx])}
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["bf16", "fp8_blockwise2d", "mxfp4"], default="mxfp4")
+    p.add_argument("--seq-length", type=int, default=512)
+    p.add_argument("--micro-batch-size", type=int, default=2)
+    p.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    p.add_argument("--max-steps", type=int, default=50)
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--min-lr", type=float, default=0.0)
+    p.add_argument("--lr-warmup-steps", type=int, default=5)
+    p.add_argument("--weight-decay", type=float, default=0.1)
+    p.add_argument("--max-grad-norm", type=float, default=1.0)
+    p.add_argument("--sharding", choices=["full_shard", "shard_grad_op"], default="full_shard")
+    p.add_argument("--fsdp-version", type=int, choices=[1, 2], default=2)
+    p.add_argument("--aiter-attn", action="store_true")
+    p.add_argument("--lumen-norm", action="store_true")
+    p.add_argument("--fuse-rope", action="store_true")
+    p.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false")
+    p.set_defaults(grad_checkpointing=True)
+    p.add_argument("--log-interval", type=int, default=1)
+    p.add_argument("--eval-interval", type=int, default=10)
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--tensorboard-dir", type=str, default=None)
+    p.add_argument("--num-workers", type=int, default=2)
+    args = p.parse_args()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+    global_rank = int(os.environ.get("RANK", 0))
+    logging.basicConfig(
+        level=logging.INFO if global_rank == 0 else logging.WARNING,
+        format="%(levelname)s:%(name)s:%(message)s",
+    )
+    if not dist.is_initialized():
+        dist.init_process_group("nccl")
+    torch.cuda.set_device(local_rank)
+    torch.manual_seed(args.seed)
+
+    # --- Model: Qwen3-0.6B from random init ---
+    rank0("> Initializing Qwen3-0.6B from random weights ...")
+    config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
+    model.to(torch.device("cuda", local_rank))
+    param_count = sum(p.numel() for p in model.parameters()) / 1e6
+    rank0(f"> Model initialized: {param_count:.0f}M params, head_dim={config.head_dim}")
+
+    if args.fuse_rope:
+        import transformers.models.qwen3.modeling_qwen3 as _q3
+        from lumen.ops.rope import apply_rotary_qk_autograd
+        def _lumen_rope(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+            return apply_rotary_qk_autograd(q, k, cos, sin)
+        _q3.apply_rotary_pos_emb = _lumen_rope
+        rank0("> Fused RoPE enabled")
+
+    if args.grad_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        rank0("> Gradient checkpointing enabled")
+
+    # --- Lumen quantization ---
+    if args.mode == "mxfp4":
+        use_quant, fmt, scaling, blk = True, "mxfp4", "blockwise", 32
+    elif args.mode == "fp8_blockwise2d":
+        use_quant, fmt, scaling, blk = True, "fp8_e4m3", "blockwise2d", 128
+    else:
+        use_quant, fmt, scaling, blk = False, "fp8_e4m3", "delayed", 128
+
+    cfg = LumenConfig.from_args(Namespace(
+        linear_fp8=use_quant, linear_fp8_format=fmt, linear_fp8_scaling=scaling,
+        linear_fp8_block_size=blk, linear_fp8_amax_algo="max", linear_fp8_amax_history=16,
+        linear_fp8_reduce_amax=False, linear_fp8_activation=True, linear_fp8_wgrad=True,
+        linear_fp8_cache_frozen_weight=False, linear_fp8_bpreshuffle=False,
+        grad_quant_type=None, first_last_layers_bf16=False,
+        lumen_norm=args.lumen_norm, hf_attn_patch=args.aiter_attn,
+        lora_rank=0, lora_alpha=32.0, lora_dropout=0.0,
+    ))
+    _manager, model = cfg.enable(model)
+    rank0(f"> Lumen enabled: mode={args.mode}, format={fmt}, scaling={scaling}, block_size={blk}")
+
+    # --- FSDP ---
+    if args.fsdp_version == 2:
+        from lumen.models.fsdp import apply_fsdp2
+        apply_fsdp2(model, Namespace(
+            linear_fp8=use_quant, sharding_strategy=args.sharding,
+            fsdp_fp8_param_storage=False,
+        ))
+        rank0(f"> FSDP2 ready (sharding={args.sharding})")
+    else:
+        _shard = {"full_shard": ShardingStrategy.FULL_SHARD,
+                  "shard_grad_op": ShardingStrategy.SHARD_GRAD_OP}[args.sharding]
+        from functools import partial
+        model = FSDP(
+            model,
+            auto_wrap_policy=partial(transformer_auto_wrap_policy, transformer_layer_cls={Qwen3DecoderLayer}),
+            mixed_precision=MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16),
+            sharding_strategy=_shard, device_id=local_rank, use_orig_params=True,
+        )
+        rank0(f"> FSDP1 ready (sharding={args.sharding})")
+
+    # --- Data ---
+    rank0("> Loading wikitext-2 ...")
+    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    train_ds = WikitextPretrainDataset("train", tokenizer, args.seq_length)
+    val_ds = WikitextPretrainDataset("validation", tokenizer, args.seq_length)
+    rank0(f"> Data: {len(train_ds)} train chunks, {len(val_ds)} val chunks (seq_length={args.seq_length})")
+
+    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True)
+    train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, sampler=train_sampler,
+                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size, shuffle=False,
+                            num_workers=0, pin_memory=True, drop_last=True)
+
+    # --- Optimizer + scheduler ---
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay)
+    import math
+    def lr_lambda(step):
+        w, T = args.lr_warmup_steps, args.max_steps
+        if step < w:
+            return float(step) / max(w, 1)
+        progress = (step - w) / max(T - w, 1)
+        return max(args.min_lr / args.lr, 0.5 * (1.0 + math.cos(math.pi * progress)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
+
+    # --- TensorBoard ---
+    tb_writer = None
+    if global_rank == 0 and args.tensorboard_dir:
+        from torch.utils.tensorboard import SummaryWriter
+        tb_writer = SummaryWriter(log_dir=args.tensorboard_dir)
+        rank0(f"> TensorBoard logging to {args.tensorboard_dir}")
+
+    # --- Helpers ---
+    def compute_loss(batch):
+        ids = batch["input_ids"][:, :-1].to(local_rank)
+        labels = batch["input_ids"][:, 1:].to(local_rank)
+        logits = model(input_ids=ids).logits
+        return nn.functional.cross_entropy(logits.view(-1, logits.size(-1)), labels.reshape(-1))
+
+    @torch.no_grad()
+    def validate():
+        model.eval()
+        total, count = 0.0, 0
+        for batch in val_loader:
+            total += compute_loss(batch).item()
+            count += 1
+            if count >= 5:
+                break
+        model.train()
+        avg = total / max(count, 1)
+        if dist.is_initialized():
+            t = torch.tensor([avg], device="cuda")
+            dist.all_reduce(t, op=dist.ReduceOp.AVG)
+            avg = t.item()
+        return avg
+
+    # --- Training loop ---
+    model.train()
+    ga = args.gradient_accumulation_steps
+    it = iter(train_loader)
+    rank0(f"> Training starts: {args.max_steps} steps, batch_size={args.micro_batch_size}x{ga}x{world_size}")
+
+    for step in range(1, args.max_steps + 1):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        opt.zero_grad()
+        acc_loss = 0.0
+        for _ in range(ga):
+            try:
+                batch = next(it)
+            except StopIteration:
+                it = iter(train_loader)
+                batch = next(it)
+            loss = compute_loss(batch)
+            (loss / ga).backward()
+            acc_loss += loss.item()
+        if args.max_grad_norm > 0:
+            if args.fsdp_version == 2:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+            else:
+                model.clip_grad_norm_(args.max_grad_norm)
+        opt.step()
+        sched.step()
+        torch.cuda.synchronize()
+        step_time_ms = (time.perf_counter() - t0) * 1e3
+
+        if step % args.log_interval == 0:
+            train_loss = acc_loss / ga
+            lr = sched.get_last_lr()[0]
+            rank0(f"  step {step}/{args.max_steps} | loss {train_loss:.4f} | lr {lr:.2e} | step_time_ms {step_time_ms:.1f}")
+            if tb_writer:
+                tb_writer.add_scalar("train/loss", train_loss, step)
+                tb_writer.add_scalar("train/lr", lr, step)
+                tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
+
+        if val_loader and step % args.eval_interval == 0:
+            val_loss = validate()
+            rank0(f"  step {step}/{args.max_steps} | val_loss {val_loss:.4f}")
+            if tb_writer:
+                tb_writer.add_scalar("val/loss", val_loss, step)
+
+    if tb_writer:
+        tb_writer.close()
+    rank0(f"> Training complete after {args.max_steps} steps.")
+
+
+if __name__ == "__main__":
+    main()
