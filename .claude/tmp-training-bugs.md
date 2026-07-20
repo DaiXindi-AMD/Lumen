@@ -15,7 +15,22 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-Delete this placeholder when adding the first open entry.
+### [2026-07-20 mxfp4-8b-no-convergence]
+- Symptom: MXFP4 training on Qwen3-8B (random init, C4, FSDP2 8-way) produces no loss reduction at any learning rate. Loss stays at ~12.75 (random init level) then jumps to 11.9375 (= ln(151936), uniform distribution). Tested lr=6e-5, 2e-5, 3e-6 — all fail identically.
+- Context: Same setup works perfectly on Qwen3-0.6B (lr=6e-5 trains to val_loss 6.34). BF16 + Lumen attn/norm/rope on 8B works fine (lr=6e-5, loss 12.75→7.28 in 200 steps). The problem is isolated to MXFP4 linear quantization on 8B.
+- Possible bug: MXFP4 backward (DGrad or WGrad) produces zero or near-zero gradients at 8B scale. The 4-bit quantization + RHT + packed transpose chain may be truncating gradient signal when matrix dimensions are 4096×4096+ (vs 1024×1024 at 0.6B). Key suspect areas:
+  1. `transpose_packed_fp4` on (4096, 6144/2) weight — nibble packing correctness at large N
+  2. WGrad `hadamard_transform` with G=32 on M-dim after transpose — may amplify quantization error at larger M
+  3. `gemm_afp4wfp4` numerical accuracy at 4096×4096 — AITER kernel may have a shape-dependent bug
+  4. E8M0 scale underflow: 4096-dim vectors may have smaller per-block amax, pushing scales to minimum and zeroing out gradients
+- Evidence so far:
+  - 0.6B MXFP4 trains correctly (val_loss 6.34, matching BF16 within +0.045)
+  - 8B BF16 trains correctly (val_loss 6.05 in 5000 steps)
+  - 8B BF16 + Lumen attn/norm/rope trains correctly (loss 12.75→7.28)
+  - 8B MXFP4 at lr=3e-6 (20x lower than BF16) still shows zero learning
+  - 12/12 MXFP4 op tests pass at small matrix sizes (128×256)
+- Next check: Single-layer gradient comparison: run one forward+backward on a single 8B linear layer (4096×4096), compare MXFP4 grad vs BF16 grad. Check if grad is all-zero or has NaN. Check `transpose_packed_fp4` output at 4096×6144 scale.
+- Status: open
 
 ## Ruled Out
 

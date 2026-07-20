@@ -138,6 +138,8 @@ def build_dataloaders(args, tokenizer, global_rank, world_size):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B",
+                   help="HF model id for config + tokenizer (weights are NOT downloaded, model is randomly initialized)")
     p.add_argument("--mode", choices=["bf16", "fp8_blockwise2d", "mxfp4"], default="mxfp4")
     p.add_argument("--dataset", choices=["wikitext", "c4"], default="c4")
     p.add_argument("--seq-length", type=int, default=512)
@@ -176,9 +178,9 @@ def main():
     torch.cuda.set_device(local_rank)
     torch.manual_seed(args.seed)
 
-    # --- Model: Qwen3-0.6B from random init ---
-    rank0("> Initializing Qwen3-0.6B from random weights ...")
-    config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    # --- Model: random init from HF config ---
+    rank0(f"> Initializing {args.model} from random weights ...")
+    config = AutoConfig.from_pretrained(args.model, trust_remote_code=True)
     model = AutoModelForCausalLM.from_config(config, torch_dtype=torch.bfloat16)
     model.to(torch.device("cuda", local_rank))
     param_count = sum(p.numel() for p in model.parameters()) / 1e6
@@ -237,7 +239,7 @@ def main():
         rank0(f"> FSDP1 ready (sharding={args.sharding})")
 
     # --- Data ---
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     train_loader, val_loader = build_dataloaders(args, tokenizer, global_rank, world_size)
 
     # --- Optimizer + scheduler ---
@@ -314,11 +316,13 @@ def main():
         if step % args.log_interval == 0:
             train_loss = acc_loss / ga
             lr = sched.get_last_lr()[0]
-            rank0(f"  step {step}/{args.max_steps} | loss {train_loss:.4f} | lr {lr:.2e} | step_time_ms {step_time_ms:.1f}")
+            mem_gb = torch.cuda.max_memory_allocated(local_rank) / (1024 ** 3)
+            rank0(f"  step {step}/{args.max_steps} | loss {train_loss:.4f} | lr {lr:.2e} | step_time_ms {step_time_ms:.1f} | mem {mem_gb:.1f}GB")
             if tb_writer:
                 tb_writer.add_scalar("train/loss", train_loss, step)
                 tb_writer.add_scalar("train/lr", lr, step)
                 tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
+                tb_writer.add_scalar("gpu/peak_memory_gb", mem_gb, step)
 
         if step % args.eval_interval == 0:
             val_loss = validate()
