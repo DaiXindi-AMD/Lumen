@@ -220,6 +220,22 @@ The quantization overhead is approximately **fixed-cost** (dominated by memory b
 
 The crossover point where MXFP4 becomes faster than BF16 is expected at **8B+ model scale** on MI350X, where GEMM compute dominates and FP4's 2× throughput advantage outweighs the fixed quantization overhead.
 
+### 5.3 Qwen3-8B Experiment (Open Issue)
+
+8B training was attempted to validate the crossover prediction. BF16 8B trained normally; MXFP4 8B did not converge.
+
+| Run                           | lr     | grad_clip | Result                           |
+|-------------------------------|--------|-----------|----------------------------------|
+| BF16 8B (no Lumen)            | 6e-5   | 1.0       | val_loss 7.16 → 6.05 (5000 steps) ✅ |
+| BF16 8B + Lumen attn/norm/rope| 6e-5   | 1.0       | loss 12.75 → 7.28 (200 steps) ✅ |
+| MXFP4 8B                      | 6e-5   | 1.0       | loss stuck at 11.9375 ❌         |
+| MXFP4 8B                      | 2e-5   | 0.5       | loss stuck at 11.9375 ❌         |
+| MXFP4 8B                      | 3e-6   | 0.5       | loss stuck at 12.75, then 11.9375 ❌ |
+
+The failure is isolated to MXFP4 linear quantization at 8B scale — attention, normalization, and RoPE patches work correctly. The model produces zero learning regardless of learning rate, suggesting the backward pass produces zero or near-zero gradients at 4096+ matrix dimensions. 0.6B (1024×1024 matrices) trains correctly.
+
+**Root cause investigation pending** — requires single-layer gradient comparison (MXFP4 vs BF16) at 4096×4096 to isolate DGrad vs WGrad. Tracked in `.claude/tmp-training-bugs.md` as `[2026-07-20 mxfp4-8b-no-convergence]`.
+
 ---
 
 ## 6. Implementation Artifacts
@@ -253,8 +269,8 @@ The crossover point where MXFP4 becomes faster than BF16 is expected at **8B+ mo
 
 ### Next Steps
 
-1. **8B+ model validation** — Run MXFP4 on Qwen3-8B or LLaMA-3.1-8B to validate at a scale where FP4 compute advantage should manifest.
-2. **Performance profiling at scale** — Measure MXFP4 vs BF16 step time at 8B+ to confirm the crossover point.
+1. **Fix 8B convergence bug** — Single-layer gradient comparison (MXFP4 vs BF16) at 4096×4096 to isolate whether DGrad or WGrad produces zero/corrupt gradients. Check `transpose_packed_fp4`, `hadamard_transform`, and `gemm_afp4wfp4` at large matrix dimensions.
+2. **Re-run 8B validation** — Once the bug is fixed, repeat the BF16 vs MXFP4 comparison at 8B to validate convergence and measure the performance crossover.
 3. **Gradient quantization** — Enable `quantize_grad="mxfp4"` for communication bandwidth reduction in multi-node training.
 4. **Megatron backend** — Wire MXFP4 through the Megatron training path (TP/PP) for larger-scale runs.
 5. **Mixed FP8/FP4** — Investigate hybrid precision (FP8 attention + MXFP4 linear) for optimal accuracy-throughput tradeoff.
