@@ -2,15 +2,27 @@
 # Copyright (c) 2025, Advanced Micro Devices, Inc. All rights reserved.
 """Qwen3-0.6B pretraining from random init — MXFP4 / FP8 / BF16 + TensorBoard.
 
-Validates end-to-end MXFP4 training pipeline on wikitext-2.
+Validates MXFP4 training by comparing against BF16 baseline on the same data.
 Model is randomly initialized (no pretrained weights needed).
 
-Usage:
+Usage (run both, then compare in TensorBoard):
+    # BF16 baseline
     torchrun --nproc_per_node=8 examples/qwen3/pretrain_qwen3_mxfp4.py \
-        --mode mxfp4 --tensorboard-dir ./runs/mxfp4_qwen3 --max-steps 50
+        --mode bf16 --dataset c4 --max-steps 10000 \
+        --tensorboard-dir ./runs/bf16_qwen3
+
+    # MXFP4
+    torchrun --nproc_per_node=8 examples/qwen3/pretrain_qwen3_mxfp4.py \
+        --mode mxfp4 --dataset c4 --max-steps 10000 \
+        --tensorboard-dir ./runs/mxfp4_qwen3
+
+    # Compare
+    tensorboard --logdir ./runs --port 6006 --bind_all
 """
 import argparse
+import itertools
 import logging
+import math
 import os
 import time
 from argparse import Namespace
@@ -21,7 +33,7 @@ import torch.nn as nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.distributed.fsdp.wrap import transformer_auto_wrap_policy
-from torch.utils.data import DataLoader, DistributedSampler, Dataset
+from torch.utils.data import DataLoader, DistributedSampler, Dataset, IterableDataset
 
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 from transformers.models.qwen3.modeling_qwen3 import Qwen3DecoderLayer
@@ -32,8 +44,12 @@ from lumen.models.fsdp import _rank0_print as rank0
 logger = logging.getLogger(__name__)
 
 
-class WikitextPretrainDataset(Dataset):
-    """Tokenize wikitext into fixed-length chunks for causal LM pretraining."""
+# ---------------------------------------------------------------------------
+# Datasets
+# ---------------------------------------------------------------------------
+
+class WikitextDataset(Dataset):
+    """Tokenize wikitext into fixed-length chunks (small, fits in memory)."""
 
     def __init__(self, split, tokenizer, seq_length, max_samples=None):
         from datasets import load_dataset
@@ -53,16 +69,84 @@ class WikitextPretrainDataset(Dataset):
         return {"input_ids": torch.LongTensor(self.chunks[idx])}
 
 
+class C4StreamingDataset(IterableDataset):
+    """C4 streaming — no download, each rank sees distinct data."""
+
+    def __init__(self, tokenizer, seq_length, rank=0, world_size=1, split="train",
+                 val_samples=200):
+        self.tokenizer = tokenizer
+        self.chunk_len = seq_length + 1
+        self.rank = rank
+        self.world_size = world_size
+        self.split = split
+        self.val_samples = val_samples
+
+    def _token_stream(self):
+        from datasets import load_dataset
+        ds = load_dataset("allenai/c4", "en", split=self.split, streaming=True)
+        # Each rank skips to its shard
+        ds = ds.skip(self.rank)
+        buf = []
+        for i, row in enumerate(ds):
+            if i % self.world_size != 0:
+                continue
+            tokens = self.tokenizer(row["text"], return_attention_mask=False)["input_ids"]
+            buf.extend(tokens)
+            while len(buf) >= self.chunk_len:
+                yield {"input_ids": torch.LongTensor(buf[:self.chunk_len])}
+                buf = buf[self.chunk_len:]
+
+    def __iter__(self):
+        if self.split == "validation":
+            count = 0
+            for item in self._token_stream():
+                yield item
+                count += 1
+                if count >= self.val_samples:
+                    return
+        else:
+            yield from self._token_stream()
+
+
+def build_dataloaders(args, tokenizer, global_rank, world_size):
+    if args.dataset == "wikitext":
+        train_ds = WikitextDataset("train", tokenizer, args.seq_length)
+        val_ds = WikitextDataset("validation", tokenizer, args.seq_length)
+        rank0(f"> Data: wikitext-2, {len(train_ds)} train / {len(val_ds)} val chunks")
+        train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True)
+        train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, sampler=train_sampler,
+                                  num_workers=args.num_workers, pin_memory=True, drop_last=True)
+        val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size, shuffle=False,
+                                num_workers=0, pin_memory=True, drop_last=True)
+    else:
+        rank0(f"> Data: C4 streaming (each rank sees distinct shards)")
+        train_ds = C4StreamingDataset(tokenizer, args.seq_length, rank=global_rank,
+                                      world_size=world_size, split="train")
+        val_ds = C4StreamingDataset(tokenizer, args.seq_length, rank=global_rank,
+                                    world_size=world_size, split="validation",
+                                    val_samples=args.val_batches)
+        train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size,
+                                  num_workers=args.num_workers, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size,
+                                num_workers=0, pin_memory=True)
+    return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["bf16", "fp8_blockwise2d", "mxfp4"], default="mxfp4")
+    p.add_argument("--dataset", choices=["wikitext", "c4"], default="c4")
     p.add_argument("--seq-length", type=int, default=512)
     p.add_argument("--micro-batch-size", type=int, default=2)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
-    p.add_argument("--max-steps", type=int, default=50)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--max-steps", type=int, default=10000)
+    p.add_argument("--lr", type=float, default=6e-5)
     p.add_argument("--min-lr", type=float, default=0.0)
-    p.add_argument("--lr-warmup-steps", type=int, default=5)
+    p.add_argument("--lr-warmup-steps", type=int, default=200)
     p.add_argument("--weight-decay", type=float, default=0.1)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--sharding", choices=["full_shard", "shard_grad_op"], default="full_shard")
@@ -72,8 +156,9 @@ def main():
     p.add_argument("--fuse-rope", action="store_true")
     p.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false")
     p.set_defaults(grad_checkpointing=True)
-    p.add_argument("--log-interval", type=int, default=1)
-    p.add_argument("--eval-interval", type=int, default=10)
+    p.add_argument("--log-interval", type=int, default=50)
+    p.add_argument("--eval-interval", type=int, default=500)
+    p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--tensorboard-dir", type=str, default=None)
     p.add_argument("--num-workers", type=int, default=2)
@@ -152,21 +237,11 @@ def main():
         rank0(f"> FSDP1 ready (sharding={args.sharding})")
 
     # --- Data ---
-    rank0("> Loading wikitext-2 ...")
     tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B", trust_remote_code=True)
-    train_ds = WikitextPretrainDataset("train", tokenizer, args.seq_length)
-    val_ds = WikitextPretrainDataset("validation", tokenizer, args.seq_length)
-    rank0(f"> Data: {len(train_ds)} train chunks, {len(val_ds)} val chunks (seq_length={args.seq_length})")
-
-    train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True)
-    train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, sampler=train_sampler,
-                              num_workers=args.num_workers, pin_memory=True, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size, shuffle=False,
-                            num_workers=0, pin_memory=True, drop_last=True)
+    train_loader, val_loader = build_dataloaders(args, tokenizer, global_rank, world_size)
 
     # --- Optimizer + scheduler ---
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay)
-    import math
     def lr_lambda(step):
         w, T = args.lr_warmup_steps, args.max_steps
         if step < w:
@@ -196,7 +271,7 @@ def main():
         for batch in val_loader:
             total += compute_loss(batch).item()
             count += 1
-            if count >= 5:
+            if count >= args.val_batches:
                 break
         model.train()
         avg = total / max(count, 1)
@@ -245,7 +320,7 @@ def main():
                 tb_writer.add_scalar("train/lr", lr, step)
                 tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
 
-        if val_loader and step % args.eval_interval == 0:
+        if step % args.eval_interval == 0:
             val_loss = validate()
             rank0(f"  step {step}/{args.max_steps} | val_loss {val_loss:.4f}")
             if tb_writer:
