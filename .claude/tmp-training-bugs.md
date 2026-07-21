@@ -15,18 +15,23 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-### [2026-07-20 mxfp4-8b-fsdp2-nan-grads]
-- Symptom: MXFP4 8B with FSDP2 multi-GPU produces NaN/Inf gradients in **every** layer on step 1 (without gradient checkpointing). With gradient checkpointing, training runs for ~1250 steps then spikes to loss=11.9375.
-- Root cause: **FSDP2 save_for_backward incompatibility.** MXFP4 forward saves packed FP4 weight + scale via `ctx.save_for_backward()`. FSDP2 `full_shard` reshards weights after forward. When backward runs, the saved FP4 weight tensor references the resharded (partial) data, but MXFP4 backward (`transpose_packed_fp4`, `gemm_afp4wfp4`, `convert_from_mxfp4`) expects the full weight — operating on stale/partial data produces NaN.
+### [2026-07-21 mxfp4-8b-late-loss-spike]
+- Symptom: 8B MXFP4 (after FSDP2 fix) crashes at step 1400-3600 (varies by run). Loss spikes from ~6-7 to 11.9375 (= ln(vocab_size)), not recoverable.
+- Crash mechanism (per-step monitoring, `diag_crash_v2.py`):
+  - Step 1400: normal, nan_g=0, gnorm=2.1
+  - Step 1402: loss=7.19 (looks normal) BUT **nan_g=325** — 325 params have NaN grads. NaN concentrated in **layer 0** (embed_tokens, all proj weights, layernorms). Weight values still normal (wmax=0.09-0.11).
+  - Step 1403: loss=11.94, gnorm=161M, `o_proj.weight` gnorm=26.7M, weights become NaN. clip_grad_norm_ on NaN total_norm → NaN clip_coef → optimizer writes NaN into weights → permanent damage.
+- Root cause: **FP4 dynamic range overflow.** fwd_max reaches 12-14+ during training. FP4 E2M1 max representable = 6.0. Values > 6.0 are clipped during quantization, causing catastrophic info loss in that micro-scaling block. When this hits a gradient-sensitive path (layer 0 backward), accumulated error → NaN.
 - Evidence:
-  - 1 GPU, no FSDP, no grad_ckpt: **0 NaN, 0 Inf** (all 399 grads OK)
-  - 1 GPU, FSDP2, no grad_ckpt: **0 NaN, 0 Inf** (world_size=1, no resharding)
-  - 2 GPU, FSDP2, no grad_ckpt: **397 NaN grads on step 1**
-  - 8 GPU, FSDP2, no grad_ckpt: **397 NaN grads on step 1**
-  - 8 GPU, FSDP2, WITH grad_ckpt: trains ~1250 steps then spikes (grad_ckpt recomputes forward, partially avoiding the stale-tensor issue, but doesn't fix it)
-  - BF16 8B with FSDP2: works perfectly (BF16 backward doesn't use save_for_backward FP4 data)
-- NOT the cause: Hadamard sign (random vs deterministic), SR vs RTN, learning rate, Fprop Hadamard — all tested and ruled out
-- Fix needed: MXFP4 backward must access FSDP2 all-gathered weight, not saved FP4 weight. Options: (a) save `ctx.weight_ref` and re-quantize weight in backward after FSDP2 all-gather; (b) use `ctx.save_for_backward` with FSDP2-aware tensors; (c) always recompute weight quantization in backward (like gradient checkpointing does implicitly).
+  - 0.6B never crashes (activations stay within FP4 range at 1024-dim scale)
+  - 8B crash timing varies by run (data-dependent outlier)
+  - fwd_max=12.6 at crash step, but fwd_max=14.5 at non-crash step → trigger is specific outlier distribution within a 32-element block, not just global max
+  - NaN appears in backward grads, not forward logits — quantization clips silently in forward
+- Possible fixes:
+  1. NaN-aware grad skip: detect NaN grads, zero them before optimizer.step()
+  2. first_last_layers_bf16: exclude embed + lm_head + first/last N layers from MXFP4
+  3. Wgrad BF16 fallback: paper shows Fprop+Dgrad-only MXFP4 has 8-11% token overhead
+  4. AITER prologue fusion: reduce intermediate precision loss
 - Status: open
 
 ## Ruled Out
@@ -34,6 +39,12 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 Move disproved suspicions here instead of deleting them.
 
 ## Resolved
+
+### [2026-07-20 mxfp4-8b-fsdp2-nan-grads]
+- Symptom: MXFP4 8B with FSDP2 multi-GPU: 397/399 NaN grads on step 1 (without grad ckpt).
+- Root cause: FSDP2 reshards weight after forward; saved FP4 weight references stale data.
+- Fix: backward re-quantizes from ctx.weight_ref (BF16 master, all-gathered by FSDP2).
+- Status: resolved
 
 ### [2026-07-20 mxfp4-8b-no-convergence]
 - Symptom: MXFP4 training on Qwen3-8B appeared to produce zero learning at any lr (6e-5, 2e-5, 3e-6). Loss stayed at ~12.75 then jumped to 11.9375 (uniform distribution).
