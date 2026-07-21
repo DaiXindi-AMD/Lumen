@@ -1263,11 +1263,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.scale,
             )
         elif scaling_type == "mxfp4":
-            # MXFP4: save weight (2D scales) and activation (1D scales) for
-            # backward DGrad + Wgrad. Same order as blockwise for consistency.
+            # MXFP4: save only activation (input) in FP4.  Weight is
+            # re-quantized from ctx.weight_ref in backward — FSDP2
+            # reshards weight params after forward, making saved FP4
+            # weight stale in multi-GPU settings.
             ctx.save_for_backward(
-                weight_desc.data,
-                weight_desc.scale,
                 input_desc.data,
                 input_desc.scale,
             )
@@ -1422,7 +1422,10 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
 
-        if scaling_type in ("blockwise", "blockwise2d", "mxfp4"):
+        if scaling_type == "mxfp4":
+            input_data, input_scale = ctx.saved_tensors
+            weight_data = weight_scale = None
+        elif scaling_type in ("blockwise", "blockwise2d"):
             weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
         else:
             input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
@@ -1641,17 +1644,25 @@ class QuantizedLinearFunction(torch.autograd.Function):
             if _aligned:
                 try:
                     # --- DGrad: dX = dY @ W^T ---
+                    # Re-quantize weight from ctx.weight_ref (BF16 master) instead
+                    # of using saved FP4 weight_data.  FSDP2 reshards weights after
+                    # forward, so saved FP4 tensors reference stale data in
+                    # multi-GPU settings.  ctx.weight_ref is all-gathered by FSDP2
+                    # before backward, so it is always valid.
                     from lumen.ops.quantize.padding import pad_to_block
+                    from lumen.ops.quantize.ops import convert_to_mxfp4_2d
                     g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
                     g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
                     g_fp4, g_scale = convert_to_mxfp4(
                         g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
                     )
 
-                    # Transpose saved weight: packed (N, K//2) → (K, N//2)
-                    # 2D scale (N//32, K//32) → (K//32, N//32)
-                    w_fp4_t = transpose_packed_fp4(weight_data)
-                    w_scale_t = weight_scale.t().contiguous()
+                    w_ref = ctx.weight_ref
+                    w_fp4_bwd, w_scale_bwd = convert_to_mxfp4_2d(
+                        w_ref.contiguous(), block_size=mxfp4_block, use_sr=False,
+                    )
+                    w_fp4_t = transpose_packed_fp4(w_fp4_bwd)
+                    w_scale_t = w_scale_bwd.t().contiguous()
 
                     grad_input = gemm_mxfp4_dispatch(g_fp4, w_fp4_t, g_scale, w_scale_t)
 
@@ -1693,17 +1704,14 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     _aligned = False
 
             if not _aligned:
-                # BF16 fallback: dequant weight and activation, use BF16 GEMM
-                weight_bf16 = convert_from_mxfp4_2d(
-                    weight_data, weight_scale,
-                    output_dtype=torch.bfloat16, block_size=mxfp4_block,
-                )
+                # BF16 fallback: use weight_ref directly, dequant activation
+                w_ref = ctx.weight_ref
                 input_bf16 = convert_from_mxfp4(
                     input_data, input_scale,
                     output_dtype=torch.bfloat16, block_size=mxfp4_block,
                 )
                 grad_input = dispatch_gemm(
-                    grad_flat, weight_bf16.t().contiguous(), None, None, "none",
+                    grad_flat, w_ref.t().contiguous(), None, None, "none",
                 )
 
                 def _compute_wgrad():
