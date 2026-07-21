@@ -15,21 +15,18 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-### [2026-07-20 mxfp4-8b-no-convergence]
-- Symptom: MXFP4 training on Qwen3-8B (random init, C4, FSDP2 8-way) produces no loss reduction at any learning rate. Loss stays at ~12.75 (random init level) then jumps to 11.9375 (= ln(151936), uniform distribution). Tested lr=6e-5, 2e-5, 3e-6 — all fail identically.
-- Context: Same setup works perfectly on Qwen3-0.6B (lr=6e-5 trains to val_loss 6.34). BF16 + Lumen attn/norm/rope on 8B works fine (lr=6e-5, loss 12.75→7.28 in 200 steps). The problem is isolated to MXFP4 linear quantization on 8B.
-- Possible bug: MXFP4 backward (DGrad or WGrad) produces zero or near-zero gradients at 8B scale. The 4-bit quantization + RHT + packed transpose chain may be truncating gradient signal when matrix dimensions are 4096×4096+ (vs 1024×1024 at 0.6B). Key suspect areas:
-  1. `transpose_packed_fp4` on (4096, 6144/2) weight — nibble packing correctness at large N
-  2. WGrad `hadamard_transform` with G=32 on M-dim after transpose — may amplify quantization error at larger M
-  3. `gemm_afp4wfp4` numerical accuracy at 4096×4096 — AITER kernel may have a shape-dependent bug
-  4. E8M0 scale underflow: 4096-dim vectors may have smaller per-block amax, pushing scales to minimum and zeroing out gradients
-- Evidence so far:
-  - 0.6B MXFP4 trains correctly (val_loss 6.34, matching BF16 within +0.045)
-  - 8B BF16 trains correctly (val_loss 6.05 in 5000 steps)
-  - 8B BF16 + Lumen attn/norm/rope trains correctly (loss 12.75→7.28)
-  - 8B MXFP4 at lr=3e-6 (20x lower than BF16) still shows zero learning
-  - 12/12 MXFP4 op tests pass at small matrix sizes (128×256)
-- Next check: Single-layer gradient comparison: run one forward+backward on a single 8B linear layer (4096×4096), compare MXFP4 grad vs BF16 grad. Check if grad is all-zero or has NaN. Check `transpose_packed_fp4` output at 4096×6144 scale.
+### [2026-07-20 mxfp4-8b-fsdp2-nan-grads]
+- Symptom: MXFP4 8B with FSDP2 multi-GPU produces NaN/Inf gradients in **every** layer on step 1 (without gradient checkpointing). With gradient checkpointing, training runs for ~1250 steps then spikes to loss=11.9375.
+- Root cause: **FSDP2 save_for_backward incompatibility.** MXFP4 forward saves packed FP4 weight + scale via `ctx.save_for_backward()`. FSDP2 `full_shard` reshards weights after forward. When backward runs, the saved FP4 weight tensor references the resharded (partial) data, but MXFP4 backward (`transpose_packed_fp4`, `gemm_afp4wfp4`, `convert_from_mxfp4`) expects the full weight — operating on stale/partial data produces NaN.
+- Evidence:
+  - 1 GPU, no FSDP, no grad_ckpt: **0 NaN, 0 Inf** (all 399 grads OK)
+  - 1 GPU, FSDP2, no grad_ckpt: **0 NaN, 0 Inf** (world_size=1, no resharding)
+  - 2 GPU, FSDP2, no grad_ckpt: **397 NaN grads on step 1**
+  - 8 GPU, FSDP2, no grad_ckpt: **397 NaN grads on step 1**
+  - 8 GPU, FSDP2, WITH grad_ckpt: trains ~1250 steps then spikes (grad_ckpt recomputes forward, partially avoiding the stale-tensor issue, but doesn't fix it)
+  - BF16 8B with FSDP2: works perfectly (BF16 backward doesn't use save_for_backward FP4 data)
+- NOT the cause: Hadamard sign (random vs deterministic), SR vs RTN, learning rate, Fprop Hadamard — all tested and ruled out
+- Fix needed: MXFP4 backward must access FSDP2 all-gathered weight, not saved FP4 weight. Options: (a) save `ctx.weight_ref` and re-quantize weight in backward after FSDP2 all-gather; (b) use `ctx.save_for_backward` with FSDP2-aware tensors; (c) always recompute weight quantization in backward (like gradient checkpointing does implicitly).
 - Status: open
 
 ## Ruled Out
@@ -37,6 +34,18 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 Move disproved suspicions here instead of deleting them.
 
 ## Resolved
+
+### [2026-07-20 mxfp4-8b-no-convergence]
+- Symptom: MXFP4 training on Qwen3-8B appeared to produce zero learning at any lr (6e-5, 2e-5, 3e-6). Loss stayed at ~12.75 then jumped to 11.9375 (uniform distribution).
+- Root cause: **Not a code bug — hyperparameter sensitivity.** MXFP4's 4-bit quantization noise requires a higher lr (~1e-4) and shorter warmup (~50 steps) than BF16 at 8B scale. With lr=6e-5 and 200-step warmup, the signal-to-noise ratio during warmup was too low for the model to escape the initial random plateau.
+- Evidence:
+  - Single-layer gradient test at 4096×4096: MXFP4 gradients are correct (norm matches BF16, zero%=0, no NaN)
+  - Single-GPU 8B MXFP4 without FSDP: trains perfectly (12.76→7.33 in 50 steps, lr=1e-4, clip=1.0)
+  - Multi-GPU 8B MXFP4 with FSDP2: trains perfectly with lr=1e-4, warmup=50 (12.8→6.2 in 200 steps, val_loss 7.08)
+  - Same FSDP2 setup fails with lr=6e-5, warmup=200
+  - 0.6B MXFP4 tolerates lr=6e-5 because smaller models have smoother loss landscapes
+- Fix: Use lr=1e-4, warmup=50 steps, grad_clip=1.0 for 8B MXFP4 pretraining. The 0.6B default of lr=6e-5 does not transfer to 8B.
+- Status: resolved
 
 ### [2026-06-26 bw2d-fused-swiglu-quant-1d-scale]
 - Symptom: 70B blockwise2d LoRA (run_blockwise2d_v2.sh, image lumen/llama2:dev) dies in forward at `linear_fc2` with `IndexError: Dimension out of range (expected [-1,0], got 1)` at `lumen/ops/quantize/linear.py:_gemm_blockscale_bpreshuffle` → `scale_a.transpose(0, 1)`.

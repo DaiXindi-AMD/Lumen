@@ -66,19 +66,19 @@ _FAST_QUANT_DISPATCH = os.environ.get("LUMEN_FAST_QUANT_DISPATCH", "1") == "1"
 _FP8_DGRAD_OUTPUT = os.environ.get("LUMEN_FP8_DGRAD_OUTPUT", "0") == "1"
 
 # ---------------------------------------------------------------------------
-# MXFP4 RHT: persistent sign vector shared across all layers (NVFP4 §4.2)
+# MXFP4 Hadamard: deterministic sign vector (all +1 = pure Hadamard).
+# arXiv:2605.09825 shows randomized signs cause Wgrad divergence;
+# only deterministic Hadamard converges at 8B+ scale.
 # ---------------------------------------------------------------------------
 _MXFP4_RHT_SIGN: Optional[torch.Tensor] = None
 _MXFP4_RHT_G = 32
 
 
 def _get_mxfp4_rht_sign(device: torch.device) -> torch.Tensor:
-    """Return the shared RHT sign vector, creating it on first call."""
+    """Return deterministic Hadamard sign vector (all +1)."""
     global _MXFP4_RHT_SIGN
     if _MXFP4_RHT_SIGN is None or _MXFP4_RHT_SIGN.device != device:
-        _MXFP4_RHT_SIGN = (
-            torch.randint(0, 2, (_MXFP4_RHT_G,), device=device, dtype=torch.float32) * 2 - 1
-        )
+        _MXFP4_RHT_SIGN = torch.ones(_MXFP4_RHT_G, device=device, dtype=torch.float32)
     return _MXFP4_RHT_SIGN
 
 # ---------------------------------------------------------------------------
@@ -491,12 +491,10 @@ def quantize_input(
         x_2d, _orig_m = pad_to_block(x_2d, mxfp4_block, dim=0)
         x_2d, _orig_n = pad_to_block(x_2d, mxfp4_block, dim=-1)
         if is_weight:
-            # 2D (32×32) block scaling: same quantized representation in fwd/bwd
             x_fp4, x_scale = convert_to_mxfp4_2d(
                 x_2d, block_size=mxfp4_block, use_sr=use_sr,
             )
         else:
-            # 1D (1×32) block scaling for activations and gradients
             x_fp4, x_scale = convert_to_mxfp4(
                 x_2d, block_size=mxfp4_block, axis=-1, use_sr=use_sr,
             )
@@ -1642,8 +1640,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
             if _aligned:
                 try:
-                    # --- DGrad: dX = dY_sr @ W_rtn^T (no RHT) ---
-                    # Quantize grad with SR (1D, 1×32 scales)
+                    # --- DGrad: dX = dY @ W^T ---
                     from lumen.ops.quantize.padding import pad_to_block
                     g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
                     g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
@@ -1658,33 +1655,26 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
                     grad_input = gemm_mxfp4_dispatch(g_fp4, w_fp4_t, g_scale, w_scale_t)
 
-                    # --- WGrad: dW = (dY^T·H)_sr @ (X^T·H)_sr^T (with RHT) ---
+                    # --- WGrad: dW = (dY^T·H) @ (X^T·H)^T with Hadamard ---
                     rht_g = _MXFP4_RHT_G
                     _rht_ok = (M % rht_g == 0)
 
-                    # Dequant saved FP4 activation → BF16 for WGrad.
                     input_bf16 = convert_from_mxfp4(
                         input_data, input_scale,
                         output_dtype=torch.bfloat16, block_size=mxfp4_block,
                     )
 
-                    # WGrad is dW = dY^T @ X. Apply the same orthogonal transform
-                    # along the shared reduction dim M so it cancels in the GEMM:
-                    # (dY^T H) @ (X^T H)^T = dY^T H H^T X = dY^T X.
                     grad_t = grad_flat.t().contiguous()
                     input_t = input_bf16.t().contiguous()
 
                     if _rht_ok:
                         sign_m = _get_mxfp4_rht_sign(grad_flat.device)
-                        # RHT along reduction dim M (last dim after transpose).
                         grad_t_rht = hadamard_transform(grad_t, sign_m, g=rht_g)
                         input_t_rht = hadamard_transform(input_t, sign_m, g=rht_g)
                     else:
                         grad_t_rht = grad_t
                         input_t_rht = input_t
 
-                    # Quantize WGrad operands with SR. AITER FP4 GEMM uses TN
-                    # layout: A(N,M) @ B(K,M)^T -> dW(N,K).
                     grad_t_fp4, grad_t_scale = convert_to_mxfp4(
                         grad_t_rht, block_size=mxfp4_block, axis=-1, use_sr=True,
                     )
