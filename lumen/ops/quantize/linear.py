@@ -71,7 +71,7 @@ _FP8_DGRAD_OUTPUT = os.environ.get("LUMEN_FP8_DGRAD_OUTPUT", "0") == "1"
 # only deterministic Hadamard converges at 8B+ scale.
 # ---------------------------------------------------------------------------
 _MXFP4_RHT_SIGN: Optional[torch.Tensor] = None
-_MXFP4_RHT_G = 32
+_MXFP4_RHT_G = 16
 
 
 def _get_mxfp4_rht_sign(device: torch.device) -> torch.Tensor:

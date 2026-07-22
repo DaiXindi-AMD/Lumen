@@ -162,9 +162,18 @@ def main():
     p.add_argument("--eval-interval", type=int, default=500)
     p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--seed", type=int, default=1234)
-    p.add_argument("--tensorboard-dir", type=str, default=None)
+    p.add_argument("--tensorboard-dir", type=str, default="auto",
+                   help="TensorBoard log dir. 'auto' generates ./runs/<mode>_<model>_<MMDD_HHMM>. 'none' disables.")
     p.add_argument("--num-workers", type=int, default=2)
     args = p.parse_args()
+
+    if args.tensorboard_dir == "auto":
+        from datetime import datetime
+        ts = datetime.now().strftime("%m%d_%H%M")
+        model_short = args.model.split("/")[-1].lower().replace("-", "")
+        args.tensorboard_dir = f"./runs/{args.mode}_{model_short}_{ts}"
+    elif args.tensorboard_dir == "none":
+        args.tensorboard_dir = None
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -206,17 +215,29 @@ def main():
     else:
         use_quant, fmt, scaling, blk = False, "fp8_e4m3", "delayed", 128
 
+    # MXFP4: keep last ~15% layers in BF16 (NVFP4 paper §4:末尾层最敏感)
+    tail_bf16 = args.mode == "mxfp4"
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    tail_count = max(1, round(num_layers * 0.15)) if tail_bf16 else 0
+
     cfg = LumenConfig.from_args(Namespace(
         linear_fp8=use_quant, linear_fp8_format=fmt, linear_fp8_scaling=scaling,
         linear_fp8_block_size=blk, linear_fp8_amax_algo="max", linear_fp8_amax_history=16,
         linear_fp8_reduce_amax=False, linear_fp8_activation=True, linear_fp8_wgrad=True,
         linear_fp8_cache_frozen_weight=False, linear_fp8_bpreshuffle=False,
-        grad_quant_type=None, first_last_layers_bf16=False,
+        grad_quant_type=None,
+        first_last_layers_bf16=tail_bf16,
+        num_layers_at_start_in_bf16=0,
+        num_layers_at_end_in_bf16=tail_count,
+        num_layers=num_layers,
         lumen_norm=args.lumen_norm, hf_attn_patch=args.aiter_attn,
         lora_rank=0, lora_alpha=32.0, lora_dropout=0.0,
     ))
     _manager, model = cfg.enable(model)
-    rank0(f"> Lumen enabled: mode={args.mode}, format={fmt}, scaling={scaling}, block_size={blk}")
+    if tail_bf16:
+        rank0(f"> Lumen enabled: mode={args.mode}, format={fmt}, scaling={scaling}, block_size={blk}, last {tail_count}/{num_layers} layers BF16")
+    else:
+        rank0(f"> Lumen enabled: mode={args.mode}, format={fmt}, scaling={scaling}, block_size={blk}")
 
     # --- FSDP ---
     if args.fsdp_version == 2:
