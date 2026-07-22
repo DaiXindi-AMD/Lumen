@@ -6,7 +6,7 @@ By Dai, Xindi
 
 ## 1. Design Overview
 
-Lumen MXFP4 implements FP4 E2M1 training for linear layers on AMD MI350X (gfx950) hardware. The design is informed by NVFP4 (NVIDIA, 2025) and arXiv:2605.09825 (AMD/PSU, 2025). Forward and DGrad GEMMs are computed in MXFP4; WGrad uses MXFP4 with deterministic Hadamard rotation to stabilize convergence.
+Lumen MXFP4 implements FP4 E2M1 training for linear layers on AMD MI350X (gfx950) hardware. The design is informed by NVFP4 (NVIDIA, arXiv:2509.25149) and arXiv:2605.09825 (AMD/PSU, 2025). Forward and DGrad GEMMs are computed in MXFP4; WGrad uses MXFP4 with deterministic Hadamard rotation to stabilize convergence. Following both papers, the most sensitive layers (last ~15% of transformer blocks) are kept in BF16 (see §1.5).
 
 ### 1.1 Forward (Fprop): Y = Q(X) @ Q(W)^T
 
@@ -59,6 +59,21 @@ WGrad applies a **deterministic Hadamard rotation** (all +1 sign vector = pure H
 | **Total** | **6**  | **1**   | **2**    | **3**     | **3**    |
 
 Compare to BF16: 0 quant, 0 dequant, 0 Hadamard, 0 transpose, 3 BF16 GEMMs.
+
+### 1.5 Mixed Precision: Last Layers in BF16
+
+Both papers find that the **final linear layers are the most sensitive to FP4** and recommend keeping ~15% of layers (末尾为主) in higher precision for convergence stability. This is now enabled by default for MXFP4 in the pretraining script:
+
+```218:221:examples/qwen3/pretrain_qwen3_mxfp4.py
+    # MXFP4: keep last ~15% layers in BF16 (NVFP4 paper §4:末尾层最敏感)
+    tail_bf16 = args.mode == "mxfp4"
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    tail_count = max(1, round(num_layers * 0.15)) if tail_bf16 else 0
+```
+
+- Controlled by `QuantConfig.first_last_layers_bf16` + `num_layers_at_end_in_bf16` (`lumen/quantize/config.py:211-218`). Matching layers are skipped during patching (stay BF16 / unpatched), and `lm_head` is also skipped.
+- MXFP4 default: `num_layers_at_start_in_bf16=0`, `num_layers_at_end_in_bf16=round(0.15·num_layers)` (≥1).
+- **Note**: the 8B run in §4.3 (loss spike) predates this mechanism (all layers were MXFP4); it needs re-validation with the current default (see §8).
 
 ---
 
@@ -188,18 +203,41 @@ BF16 8B trained with the same hyperparameters (lr=6e-5, warmup=200):
 
 | Step   | BF16 val_loss |
 |-------:|--------------:|
-|    250 | 7.438         |
-|  1,000 | 6.563         |
+|    500 | 6.929         |
+|  1,500 | 6.380         |
 |  2,500 | 6.158         |
+|  3,500 | 6.062         |
 |  5,000 | 6.048         |
 
-Median step time: 229 ms. Peak memory: 15.3 GB/GPU.
+Stable convergence throughout. Median step time: 329 ms. Peak memory: 15.3 GB/GPU.
 
-### 4.3 Qwen3-8B: MXFP4 (C4, 5k steps — in progress)
+### 4.3 Qwen3-8B: MXFP4 (C4 — loss spike at step 3600)
 
-After the FSDP2 fix (§2.3), 8B MXFP4 trains with the same lr=6e-5 as BF16. The run that previously diverged at step ~1250 is now stable through step 1500+. Full results pending.
+After the FSDP2 fix (§2.3), 8B MXFP4 (same lr=6e-5 as BF16) trains stably for ~3500 steps, tracking BF16 closely — a major improvement over the previous step-1 NaN / step-~1250 divergence. **All linear layers were MXFP4 in this run** (the §1.5 last-layer-BF16 mechanism was added afterwards and is not reflected here).
 
-Median step time: ~690 ms. Peak memory: 15.3 GB/GPU.
+| Step  | BF16 val_loss | MXFP4 val_loss | Δ      |
+|------:|--------------:|---------------:|-------:|
+|   500 | 6.929         | 6.942          | +0.013 |
+| 1,000 | 6.563         | 6.588          | +0.026 |
+| 1,500 | 6.380         | 6.408          | +0.028 |
+| 2,000 | 6.252         | 6.284          | +0.033 |
+| 2,500 | 6.158         | 6.188          | +0.030 |
+| 3,000 | 6.091         | 6.136          | +0.045 |
+| 3,500 | 6.062         | 6.139          | +0.077 |
+
+**Loss spike at step 3600** (unrecoverable):
+
+```
+step 3525: loss 4.88   (normal)
+step 3575: loss 6.63   (rising)
+step 3600: loss 8.88   (spike)
+step 3650: loss 11.94  (≈ ln(151936) = ln(vocab_size), degenerated to uniform)
+step 3675+: stuck at 11.94
+```
+
+Suspected cause: FP4 E2M1's small dynamic range (max=6.0) cannot represent late-training weight outliers; Wgrad quantization error accumulates until gradients explode — consistent with both papers identifying Wgrad + the final layers as the dominant instability source. Mitigation (last ~15% layers BF16, §1.5) is now enabled and awaits re-validation (§8).
+
+Median step time: 694 ms (2.11× slower than BF16). Peak memory: 15.3 GB/GPU.
 
 ---
 
@@ -207,7 +245,7 @@ Median step time: ~690 ms. Peak memory: 15.3 GB/GPU.
 
 ### 5.1 Why MXFP4 Shows No Speed Benefit Yet
 
-MXFP4 training is **~2× slower** than BF16 at 0.6B and ~3× slower at 8B. This is a known limitation of the current implementation, not the MXFP4 algorithm.
+MXFP4 training is **~2.1× slower** than BF16 at both 0.6B (478 vs 229 ms) and 8B (694 vs 329 ms). This is a known limitation of the current implementation, not the MXFP4 algorithm.
 
 **Root cause: unfused kernel pipeline.** Each MXFP4 GEMM requires 3 separate kernel launches (Hadamard → Quant → GEMM) with global memory reads/writes between each stage:
 
@@ -299,7 +337,9 @@ All variants crashed because the real bug was FSDP2 `save_for_backward`, not Had
 | Accuracy report script | `scripts/mxfp4_accuracy_report.py` |
 | Pretraining script (C4 + TensorBoard) | `examples/qwen3/pretrain_qwen3_mxfp4.py` |
 | SFT script (BF16/FP8/MXFP4) | `examples/qwen3/train_qwen3_fsdp.py` |
-| Paper comparison | `docs/papers/mxfp4_paper_vs_lumen_comparison.md` |
+| Paper comparison (AMD MXFP4) | `docs/papers/mxfp4_paper_vs_lumen_comparison.md` |
+| Paper comparison (NVFP4 + hyperparams) | `docs/papers/nvfp4_paper_vs_lumen_comparison.md` |
+| Status report | `docs/mxfp4_status_report.md` |
 
 ---
 
@@ -317,17 +357,20 @@ All variants crashed because the real bug was FSDP2 `save_for_backward`, not Had
 - [x] 12/12 operator accuracy tests vs torchAO
 - [x] 0.6B BF16 vs MXFP4 convergence validation (Δ val_loss = +0.045)
 - [x] 8B BF16 baseline (val_loss 6.05, 5k steps)
-- [x] 8B MXFP4 training stabilized after FSDP2 fix (in progress)
+- [x] 8B MXFP4 stable to step 3500 after FSDP2 fix (then loss spike at 3600, §4.3)
+- [x] Last ~15% layers BF16 enabled by default for MXFP4 (§1.5)
 
 ### Open Issues
 
-1. **No speed benefit** — MXFP4 is 2-3× slower than BF16 due to unfused kernel pipeline (3 separate kernel launches per GEMM). Requires AITER prologue fusion to match ROCm TE performance.
-2. **No memory saving** — BF16 master weights retained for FSDP2 all-gather and backward re-quantization. Requires FP4 weight storage with FP4-aware FSDP.
+1. **8B loss spike at step ~3600** — full-MXFP4 8B spikes to 11.94 (uniform-dist collapse) after ~3500 stable steps. Suspected late-training weight outliers overflowing FP4 range in Wgrad. Mitigation (last ~15% layers BF16, §1.5) is enabled but not yet re-validated.
+2. **No speed benefit** — MXFP4 is ~2.1× slower than BF16 due to unfused kernel pipeline (3 separate kernel launches per GEMM). Requires AITER prologue fusion to match ROCm TE performance.
+3. **No memory saving** — BF16 master weights retained for FSDP2 all-gather and backward re-quantization. Requires FP4 weight storage with FP4-aware FSDP.
 
 ### Next Steps
 
-1. **Fused Hadamard+Quant Triton kernel** (Lumen) — merge `hadamard_transform` + `convert_to_mxfp4` into one kernel to eliminate one global memory roundtrip.
-2. **AITER GEMM prologue fusion** — request AITER to fuse H+Q into GEMM tile load, eliminating all intermediate memory traffic.
-3. **8B convergence validation** — complete the 5k-step run and publish BF16 vs MXFP4 comparison.
-4. **Gradient quantization** — enable `quantize_grad="mxfp4"` for communication bandwidth reduction.
-5. **Megatron backend** — wire MXFP4 through TP/PP for larger-scale runs.
+1. **Re-run 8B with last-layer BF16** (§1.5) — verify the step-3600 spike is eliminated with the current default config. This is both papers' #1 recommendation for this class of instability and the lowest-cost fix. If it still spikes, add per-layer NaN/grad-norm monitoring around step 3500-3700.
+2. **Optional Hadamard G=32 → G=16** — arXiv:2605.09825 found H16 is 8% faster than H32 and equally stable; `hadamard_transform` already supports g=16 (change `_MXFP4_RHT_G`).
+3. **Fused Hadamard+Quant Triton kernel** (Lumen) — merge `hadamard_transform` + `convert_to_mxfp4` into one kernel to eliminate one global memory roundtrip.
+4. **AITER GEMM prologue fusion** — request AITER to fuse H+Q into GEMM tile load, eliminating all intermediate memory traffic.
+5. **Gradient quantization** — enable `quantize_grad="mxfp4"` for communication bandwidth reduction.
+6. **Megatron backend** — wire MXFP4 through TP/PP for larger-scale runs.
