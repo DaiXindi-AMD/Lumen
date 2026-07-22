@@ -15,30 +15,20 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-### [2026-07-21 mxfp4-8b-late-loss-spike]
-- Symptom: 8B MXFP4 (after FSDP2 fix) crashes at step 1400-3600 (varies by run). Loss spikes from ~6-7 to 11.9375 (= ln(vocab_size)), not recoverable.
-- Crash mechanism (per-step monitoring, `diag_crash_v2.py`):
-  - Step 1400: normal, nan_g=0, gnorm=2.1
-  - Step 1402: loss=7.19 (looks normal) BUT **nan_g=325** — 325 params have NaN grads. NaN concentrated in **layer 0** (embed_tokens, all proj weights, layernorms). Weight values still normal (wmax=0.09-0.11).
-  - Step 1403: loss=11.94, gnorm=161M, `o_proj.weight` gnorm=26.7M, weights become NaN. clip_grad_norm_ on NaN total_norm → NaN clip_coef → optimizer writes NaN into weights → permanent damage.
-- Root cause: **FP4 dynamic range overflow.** fwd_max reaches 12-14+ during training. FP4 E2M1 max representable = 6.0. Values > 6.0 are clipped during quantization, causing catastrophic info loss in that micro-scaling block. When this hits a gradient-sensitive path (layer 0 backward), accumulated error → NaN.
-- Evidence:
-  - 0.6B never crashes (activations stay within FP4 range at 1024-dim scale)
-  - 8B crash timing varies by run (data-dependent outlier)
-  - fwd_max=12.6 at crash step, but fwd_max=14.5 at non-crash step → trigger is specific outlier distribution within a 32-element block, not just global max
-  - NaN appears in backward grads, not forward logits — quantization clips silently in forward
-- Possible fixes:
-  1. NaN-aware grad skip: detect NaN grads, zero them before optimizer.step()
-  2. first_last_layers_bf16: exclude embed + lm_head + first/last N layers from MXFP4
-  3. Wgrad BF16 fallback: paper shows Fprop+Dgrad-only MXFP4 has 8-11% token overhead
-  4. AITER prologue fusion: reduce intermediate precision loss
-- Status: open
+(No open issues)
 
 ## Ruled Out
 
 Move disproved suspicions here instead of deleting them.
 
 ## Resolved
+
+### [2026-07-21 mxfp4-8b-late-loss-spike]
+- Symptom: 8B MXFP4 (after FSDP2 fix) crashes at step 1275-3600 (varies by config). Loss spikes to 11.9375.
+- Root cause: FP4 dynamic range overflow (max=6.0) on late-training outliers + all layers quantized including sensitive末尾layers.
+- Fix: Deterministic Hadamard H16 (G=32→16, sign=all+1) + last 5/36 layers kept in BF16 (`first_last_layers_bf16=True, num_layers_at_end_in_bf16=5`). Per arXiv:2605.09825 + arXiv:2509.25149.
+- Verification: 8B MXFP4, lr=1e-4, 5000 steps, zero divergence, val_loss 7.07→5.74.
+- Status: resolved
 
 ### [2026-07-20 mxfp4-8b-fsdp2-nan-grads]
 - Symptom: MXFP4 8B with FSDP2 multi-GPU: 397/399 NaN grads on step 1 (without grad ckpt).

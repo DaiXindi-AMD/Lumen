@@ -1,7 +1,7 @@
 # MXFP4 Training Status Report
 
 **Author**: Dai, Xindi
-**Date**: 2026-07-21
+**Date**: 2026-07-22
 **Hardware**: 8× AMD Instinct MI350X (gfx950, 256GB HBM each)
 **Branch**: `feature/mxfp4`
 
@@ -9,7 +9,11 @@
 
 ## 1. Executive Summary
 
-MXFP4 (Microscaling FP4 E2M1) 训练链路已在 Lumen 上实现并跑通。0.6B 模型的 loss 曲线与 BF16 基本吻合（Δ val_loss = +0.045, 0.7%），验证了链路正确性。8B 模型可以正常训 ~3500 步，但在 step 3600 出现 loss spike 后不可恢复。当前实现没有速度和显存收益（MXFP4 比 BF16 慢约 2×），原因是量化和 GEMM 没有做 kernel fusion，性能收益需要 AITER 侧支持。
+MXFP4 (Microscaling FP4 E2M1) 训练链路已在 Lumen 上实现并完成 8B 规模验证。
+
+- **0.6B**: BF16 vs MXFP4 loss 曲线几乎重合（Δ val_loss = +0.045, 0.7%），验证了链路正确性。
+- **8B**: 经历 3 轮 bug 修复（dispatch 路由、FSDP2 stale tensor、FP4 dynamic range overflow），最终通过 **确定性 Hadamard H16 + 末尾 5/36 层保留 BF16** 稳定收敛，5000 步无发散（val_loss 7.07→5.74）。
+- **性能**: MXFP4 比 BF16 慢 ~1.9×（8B: 630ms vs 329ms），原因是量化和 GEMM 未做 kernel fusion。性能收益需要 AITER GEMM prologue fusion 支持。
 
 ---
 
@@ -52,38 +56,30 @@ MXFP4 (Microscaling FP4 E2M1) 训练链路已在 Lumen 上实现并跑通。0.6B
 
 全程稳定收敛。Median step time 329 ms，显存 15.3 GB/GPU。
 
-### 2.3 Qwen3-8B: MXFP4（C4, 5k steps — loss spike at step 3600）
+### 2.3 Qwen3-8B: MXFP4（C4, 5k steps — 稳定收敛）
 
-**配置**: 同 BF16 baseline，仅精度改为 MXFP4。
+**配置**: lr=1e-4, warmup=50, cosine decay, grad_clip=1.0, FSDP2 8×MI350X, `--aiter-attn --lumen-norm --fuse-rope`。确定性 Hadamard H16 + 末尾 5/36 层 BF16（当前默认配置）。
 
-前 3500 步正常收敛，val_loss 曲线紧跟 BF16：
+**注**: BF16 baseline 用 lr=6e-5（§2.2），MXFP4 用 lr=1e-4（8B MXFP4 需要更高 lr 突破初始化 plateau）。因此 val_loss 不做精度差距对比，仅验证收敛稳定性。
 
-| Step  | BF16 val_loss | MXFP4 val_loss | Δ      |
-|------:|--------------:|---------------:|-------:|
-|   500 | 6.929         | 6.942          | +0.013 |
-| 1,000 | 6.563         | 6.588          | +0.026 |
-| 1,500 | 6.380         | 6.408          | +0.028 |
-| 2,000 | 6.252         | 6.284          | +0.033 |
-| 2,500 | 6.158         | 6.188          | +0.030 |
-| 3,000 | 6.091         | 6.136          | +0.045 |
-| 3,500 | 6.062         | 6.139          | +0.077 |
+| Step  | BF16 val_loss (lr=6e-5) | MXFP4 val_loss (lr=1e-4) |
+|------:|------------------------:|-------------------------:|
+|   500 | 6.929                   | 6.715                    |
+| 1,000 | 6.563                   | 6.366                    |
+| 1,500 | 6.380                   | 6.153                    |
+| 2,000 | 6.252                   | 5.999                    |
+| 2,500 | 6.158                   | 5.870                    |
+| 3,000 | 6.091                   | 5.790                    |
+| 3,500 | 6.062                   | 5.748                    |
+| 5,000 | 6.048                   | **5.743**                |
 
-**Step 3600 发生 loss spike**，精确轨迹：
-
-```
-step 3525: loss 4.88   (正常)
-step 3550: loss 5.91   (正常范围波动)
-step 3575: loss 6.63   (开始偏高)
-step 3600: loss 8.88   (spike)
-step 3650: loss 11.94  (≈ ln(151936) = ln(vocab_size), 模型退化到均匀分布)
-step 3675+: 卡在 11.94, 不可恢复
-```
+5000 步全程稳定，无 NaN、无 loss spike、无发散。此前全量化（无末尾 BF16）的运行在 step ~1275-3600 崩溃（见 `docs/mxfp4_debug_flow.md`）。
 
 **耗时**:
 
 | 指标              | BF16     | MXFP4    | 比值           |
 |-------------------|----------|----------|----------------|
-| Median step time  | 329 ms   | 694 ms   | 2.11× 慢       |
+| Median step time  | 329 ms   | 630 ms   | 1.91× 慢       |
 | 显存 (per GPU)    | 15.3 GB  | 15.3 GB  | 无差异          |
 
 ---
@@ -141,7 +137,7 @@ WGrad 的处理流程：
 
 1. **Dequant saved activation**: `convert_from_mxfp4(X_fp4, X_scale) → X_bf16`
 2. **Transpose**: dY^T (N, M) 和 X^T (K, M)
-3. **确定性 Hadamard 旋转**: 沿 reduction dim M 做 blockwise Hadamard (G=32, sign=全+1)。两个操作数用同一个 H，在 GEMM 内消掉：(dY^T H)(X^T H)^T = dY^T HH^T X = dY^T X。确定性 sign（不用随机 ±1）是按 arXiv:2605.09825 的结论 — 随机 sign 在 Wgrad 全量化时导致发散。
+3. **确定性 Hadamard 旋转**: 沿 reduction dim M 做 blockwise Hadamard (G=16, sign=全+1)。两个操作数用同一个 H，在 GEMM 内消掉：(dY^T H)(X^T H)^T = dY^T HH^T X = dY^T X。确定性 sign（不用随机 ±1）是按 arXiv:2605.09825 的结论 — 随机 sign 在 Wgrad 全量化时导致发散。G=16（而非 32）按两篇论文推荐，kernel 快 8% 且同等稳定。
 4. **SR 量化**: 1×32 沿 axis=-1
 5. **GEMM**: `gemm_afp4wfp4(dY^T_fp4, X^T_fp4) → dW`
 
@@ -156,7 +152,22 @@ WGrad 的处理流程：
 
 BF16 对比：0 quant, 0 dequant, 0 Hadamard, 0 transpose, 3 BF16 GEMMs。
 
-### 3.6 硬件加速确认
+### 3.6 混合精度：末尾层保留 BF16
+
+按 NVFP4 (NVIDIA, arXiv:2509.25149) §4 和 arXiv:2605.09825 的结论——**末尾线性层对 FP4 量化最敏感**，两篇都建议保留 ~15% 层（以末尾为主）在高精度。该机制已接入训练脚本：
+
+```218:221:examples/qwen3/pretrain_qwen3_mxfp4.py
+    # MXFP4: keep last ~15% layers in BF16 (NVFP4 paper §4:末尾层最敏感)
+    tail_bf16 = args.mode == "mxfp4"
+    num_layers = getattr(config, "num_hidden_layers", 0)
+    tail_count = max(1, round(num_layers * 0.15)) if tail_bf16 else 0
+```
+
+- 底层由 `QuantConfig.first_last_layers_bf16` + `num_layers_at_end_in_bf16` 控制（`lumen/quantize/config.py:211-218`），patch 阶段跳过这些层（保持 BF16 unpatched），同时跳过 `lm_head`。
+- mxfp4 模式下**默认开启**：`num_layers_at_start_in_bf16=0`，`num_layers_at_end_in_bf16=round(0.15·num_layers)`（至少 1 层）。
+- **注意**：§2.3 的 8B loss spike 实验是在该机制**接入之前**跑的（末尾层也走了 MXFP4），因此不能代表当前默认配置的稳定性，需重跑验证（见 Issue #1）。
+
+### 3.7 硬件加速确认
 
 量化使用 MI350X (gfx950) 原生 FP4 ASM 指令：
 
@@ -224,15 +235,19 @@ GEMM 使用 AITER `gemm_afp4wfp4`（native FP4 Triton kernel），已验证在 M
 | 确定性 + RTN            | 全 +1              | RTN       | ~425       |
 | 全链路 Fprop+Dgrad+Wgrad| 全 +1              | SR        | step 1     |
 
-FSDP2 fix 后，确定性 Hadamard + SR 是当前最稳配置（训到 step 3500 正常）。全链路 Fprop Hadamard 不可行——论文的 ROCm TE 在 kernel 内部做旋转（寄存器级 H cancel），我们在 kernel 外部做 BF16 Hadamard 后再量化，backward 的 grad_output 没有配套反旋转，梯度链条断裂。
+FSDP2 fix 后，所有全量化变体仍在 step ~1275-3600 崩溃（FSDP2 fix 是必要条件但不充分）。
 
-### 4.4 8B Loss Spike（未解决）
+### 4.4 8B Loss Spike（已解决 ✅）
 
-FSDP2 fix 后 8B 能训到 step 3500（之前 step 1 NaN 或 step 1250 崩），但 step 3600 仍然 loss spike。
+**最终修复**: 确定性 Hadamard **H16**（G=32→16） + **末尾 5/36 层保留 BF16**（§3.6）。
 
-**怀疑原因**: 训练后期 weight 值分布变化，某些层出现 outlier。FP4 E2M1 的动态范围很小（max representable = 6.0），outlier 被 clip 后量化误差在 Wgrad 中逐步累积，最终导致梯度爆炸。论文的诊断也支持这一点——Wgrad 全量化是 MXFP4 训练不稳定的主因（论文 Table 1: Fprop+Dgrad 只增加 8-11% token 开销，加上 Wgrad 后飙到 26-27%）。
+| 配置                           | 结果                          |
+|-------------------------------|-------------------------------|
+| 全量化, H32, 随机 sign          | step ~1550 crash              |
+| 全量化, H32, 确定性 sign        | step ~1275 crash              |
+| **H16 + 末尾 5 层 BF16**       | **5000 步稳定, val_loss 5.74** |
 
-论文的解决方案（GEMM prologue fusion）在 kernel 内部做 Hadamard+Quant，量化误差更小（寄存器级操作，无 BF16 中间结果的精度损失）。我们在 kernel 外部做，经过 BF16 Hadamard → BF16 写回 → BF16 读入 → FP4 quant 的流程，额外引入了 BF16 舍入误差。
+两篇论文均指出末尾层对 FP4 最敏感，保留 ~15% 在 BF16 是头号稳定性建议。H16 比 H32 快 8% 且同等稳定。详细排查流程见 `docs/mxfp4_debug_flow.md`。
 
 ---
 
@@ -326,29 +341,36 @@ ROCm TE fused pipeline（单个 kernel）:
 | `0edf68a` | chore: `--model` 参数 + GPU 显存 TensorBoard                 |
 | `7674afd` | debug: FSDP2 NaN 诊断 + 确定性 Hadamard + 消融实验            |
 | `38d4ae0` | docs: 报告重写                                               |
-| (本地)    | fix: FSDP2 backward 改用 `ctx.weight_ref` 重量化 weight       |
+| `8bcf2d9` | fix: FSDP2 backward 改用 `ctx.weight_ref` 重量化 weight       |
+| `a72e8c6` | debug: 8B late loss spike 诊断 — FP4 dynamic range overflow   |
+| `745de8f` | fix: 确定性 H16 + 末尾 5 层 BF16，8B 5000 步稳定收敛          |
 
 ---
 
 ## 8. Open Issues
 
-### Issue #1: 8B Loss Spike at Step ~3600
+### Issue #1: 8B Loss Spike ~~（已解决 ✅）~~
 
-- **现象**: 8B MXFP4 训到 step 3500 正常（val_loss 6.14, 与 BF16 差 +0.08），step 3600 loss spike 到 11.94 不可恢复
-- **怀疑原因**: FP4 E2M1 动态范围（max=6.0）无法表达训练后期的 weight outlier，Wgrad 量化误差累积导致梯度爆炸
-- **下一步**: 在 crash 点前后做逐步 NaN/Inf/grad norm 监控，定位是哪一层先爆
+通过确定性 H16 + 末尾 5 层 BF16 解决。5000 步稳定，val_loss 5.74。详见 §4.4。
 
 ### Issue #2: 无速度/显存收益
 
-- **现象**: MXFP4 比 BF16 慢 2.1×（0.6B）/ 2.1×（8B），显存相同
+- **现象**: MXFP4 比 BF16 慢 ~1.9×（8B: 630ms vs 329ms），显存相同
 - **原因**: 3 次独立 kernel launch，量化开销远大于 GEMM 计算
 - **下一步**: (1) Lumen 做 Hadamard+Quant fused kernel; (2) AITER 做 GEMM prologue fusion
+
+### Issue #3: BF16 vs MXFP4 未在同一 lr 下对比
+
+- 8B BF16 用 lr=6e-5，MXFP4 用 lr=1e-4。公平的精度对比需要在同一 lr 下跑两者。
 
 ---
 
 ## 9. 下一步建议
 
-1. **排查 8B loss spike** — 在 step 3500-3700 区间做 per-layer NaN/grad norm 逐步监控，定位首个异常层
+1. **公平对比**: 重跑 BF16 8B 用 lr=1e-4（与 MXFP4 相同），做 head-to-head val_loss 对比
 2. **Lumen fused Hadamard+Quant kernel** — 合并两个 Triton kernel，减少一次 global memory roundtrip
 3. **给 AITER 提 GEMM prologue fusion 需求** — 这是达到论文性能水平的关键依赖
-4. **考虑 Wgrad BF16 fallback 选项** — 论文显示 Fprop+Dgrad MXFP4 + Wgrad BF16 的 token 开销仅 8-11%，可作为 loss spike 的 workaround
+4. **梯度量化** — `quantize_grad="mxfp4"` 减少多节点 allreduce 带宽
+5. **Megatron 路径** — 接入 TP/PP 支持更大规模训练
+
+> 相关文档：`docs/mxfp4_debug_flow.md`（完整调试流程）、`docs/papers/nvfp4_paper_vs_lumen_comparison.md`（NVFP4 超参核对）、`docs/papers/mxfp4_paper_vs_lumen_comparison.md`（AMD MXFP4 对比）。
