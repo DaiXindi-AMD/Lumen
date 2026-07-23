@@ -302,10 +302,10 @@ def _patch_linear_layers(
                 skipped += 1
                 continue
 
-            # Keep PEFT LoRA adapter matrices (lora_A / lora_B) in BF16: they are
-            # the trainable low-rank update and their rank dim (e.g. 16) is not
-            # block-quantizable (blockwise / blockwise2d require dims divisible by
-            # block_size). Only the wrapped base_layer weight is quantized.
+            if config.first_last_layers_bf16 and name.endswith("lm_head"):
+                skipped += 1
+                continue
+
             if "lora_" in name:
                 skipped += 1
                 continue
