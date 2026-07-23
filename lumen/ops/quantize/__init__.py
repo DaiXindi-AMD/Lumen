@@ -19,6 +19,7 @@ from lumen.ops.quantize.ops import (
     convert_to_mxfp4_dual_axis,
     convert_to_mxfp8,
     dequant_fp8_tensorwise_impl,
+    hadamard_quant_mxfp4,
     hadamard_transform,
     is_cdna4,
     quant_fp8_blockwise_impl,
@@ -44,6 +45,7 @@ __all__ = [
     "convert_from_mxfp4_2d",
     "transpose_packed_fp4",
     "hadamard_transform",
+    "hadamard_quant_mxfp4",
     # Quantized linear (autograd)
     "QuantizedLinearFunction",
     "quantized_linear",

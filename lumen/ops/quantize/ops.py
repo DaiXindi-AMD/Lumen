@@ -805,3 +805,77 @@ def hadamard_transform(
     x_blocked = x_blocked * sign_vector.float()
     out = (x_blocked @ H).to(x.dtype).reshape(orig_shape)
     return out
+
+
+_HADAMARD_CACHE: dict = {}
+
+
+def _get_hadamard_matrix_normalized(g: int, device: torch.device) -> torch.Tensor:
+    """Return a (g, g) normalized Hadamard matrix, cached per (g, device)."""
+    key = (g, device)
+    if key not in _HADAMARD_CACHE:
+        H = _get_hadamard_matrix(g, device)
+        _HADAMARD_CACHE[key] = H
+    return _HADAMARD_CACHE[key]
+
+
+def hadamard_quant_mxfp4(
+    x: torch.Tensor,
+    sign_vector: torch.Tensor,
+    block_size: int = 32,
+    g: int = 16,
+    use_sr: bool = True,
+    philox_seed: Optional[int] = None,
+    philox_offset: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fused Hadamard rotation + MXFP4 quantization in a single kernel launch.
+
+    Equivalent to ``convert_to_mxfp4(hadamard_transform(x, sign, g), ...)``,
+    but eliminates one global memory roundtrip (no intermediate BF16 write).
+
+    The Hadamard is applied via matmul with a precomputed (g, g) matrix.
+    The sign_vector is baked into the Hadamard matrix (diag(sign) @ H).
+
+    Returns:
+        (fp4_packed, scales_e8m0) — same format as ``convert_to_mxfp4``.
+    """
+    assert x.dtype in (torch.float32, torch.bfloat16)
+    assert x.shape[-1] % g == 0, f"N={x.shape[-1]} not divisible by g={g}"
+    assert x.shape[-1] % block_size == 0
+
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    M, N = x_2d.shape
+
+    use_asm = is_cdna4()
+
+    if philox_seed is None:
+        philox_seed = random.randint(0, 2**31 - 2)
+    if philox_offset is None:
+        philox_offset = random.randint(0, 2**31 - 2)
+
+    fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
+    scales_e8m0 = torch.empty((M, N // block_size), dtype=torch.uint8, device=x.device)
+
+    BLOCK_M = min(64, M) if M >= 64 else M
+    BLOCK_N = min(64, N) if N >= 64 else N
+    BLOCK_N = max(BLOCK_N, max(block_size, g))
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
+
+    from lumen.kernels.mxfp4 import _fused_hadamard_quant_mxfp4_kernel
+
+    _fused_hadamard_quant_mxfp4_kernel[grid](
+        x_2d, fp4_packed, scales_e8m0, sign_vector,
+        x_2d.stride(0), x_2d.stride(1),
+        fp4_packed.stride(0), fp4_packed.stride(1),
+        scales_e8m0.stride(0), scales_e8m0.stride(1),
+        philox_seed, philox_offset,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        QUANT_BLOCK_SIZE=block_size,
+        USE_SR=use_sr,
+        USE_ASM=use_asm,
+    )
+
+    out_shape = (*orig_shape[:-1], N // 2)
+    scale_shape = (*orig_shape[:-1], N // block_size)
+    return fp4_packed.view(out_shape), scales_e8m0.view(scale_shape)
