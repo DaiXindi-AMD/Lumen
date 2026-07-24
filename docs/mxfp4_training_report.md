@@ -33,7 +33,7 @@ Lumen MXFP4 implements FP4 E2M1 training for linear layers on AMD MI350X (gfx950
 - After re-quantization, weight is transposed via `transpose_packed_fp4`: (N, K/2) → (K, N/2).
 - GEMM kernel: same `gemm_afp4wfp4`.
 
-### 1.3 Backward WGrad: dW = Q(H·dY^T) @ Q(H·X^T)^T
+### 1.3 Backward WGrad: dW = Q(dY^T·H) @ Q(X^T·H)^T
 
 | Operand       | Format          | Rounding | Notes                                    |
 |---------------|-----------------|----------|------------------------------------------|
@@ -90,7 +90,10 @@ Quantization uses Triton inline assembly targeting MI350X VOP3 instructions:
 | `v_cvt_scalef32_pk_fp4_bf16`        | 2×BF16 → packed FP4 byte (RTN)  |
 | `v_cvt_scalef32_sr_pk_fp4_bf16`     | 2×BF16 → packed FP4 byte (SR)   |
 
-Detection: `is_cdna4()` → `target.arch == "gfx950"`. Verified active on MI350X. Non-gfx950 falls back to software LUT-based FP4 E2M1 conversion.
+Detection: `is_cdna4()` → `target.backend == "hip" and target.arch == "gfx950"`. Verified active on MI350X. Fallbacks when the ASM path is not taken:
+- **Quant (non-gfx950, RTN)**: AITER `dynamic_mxfp4_quant` Triton kernel.
+- **Quant (SR, or when AITER MXFP4 quant is unavailable)**: Lumen's software E2M1 packing kernel (threshold-based nibble encoding in `_pack_fp4`, `USE_ASM=False`).
+- **Dequant**: AITER `mxfp4_to_f32` / `e8m0_to_f32` when available, else a pure-Python E2M1 lookup-table path.
 
 ### 2.2 GEMM Dispatch
 
@@ -123,7 +126,7 @@ With gradient checkpointing, backward recomputes forward (triggering FSDP2 all-g
 
 **Fix**: Backward re-quantizes weight from `ctx.weight_ref` (the BF16 master weight managed by FSDP2, which is correctly all-gathered before backward) instead of using saved FP4 weight. Only the activation (not a model parameter, unaffected by FSDP resharding) is saved in `ctx.save_for_backward()`.
 
-This follows the same pattern as the existing FP8 blockwise backward (line 1527-1530 in `linear.py`), which uses `ctx.weight_ref` for DGrad weight access.
+This follows the same pattern as the existing FP8 **blockwise (1D)** backward in `linear.py` (the `scaling_type == "blockwise"` DGrad branch, ~line 1530-1537), which prefers `ctx.weight_ref` (the BF16 master) to build the columnwise-requantized weight for DGrad. (The `blockwise2d` path instead transposes the saved 2D-tile weight directly, since its square-tile scale is transpose-symmetric.)
 
 **Tradeoff**: Backward now pays an extra weight re-quantization cost (BF16→MXFP4 32×32) per layer, adding ~5-10% to backward time. This is the correct behavior — the same approach is used by ROCm Transformer Engine (arXiv:2605.09825 Figure 3).
 
@@ -139,7 +142,7 @@ This follows the same pattern as the existing FP8 blockwise backward (line 1527-
 
 ### 2.6 Backward Fallback
 
-When dimensions are not 32-aligned, backward falls back to BF16 GEMM using `ctx.weight_ref` directly.
+When the M/N/K dimensions are not 32-aligned — or when the FP4 GEMM/quant kernel raises `AssertionError`/`RuntimeError` — backward falls back to BF16 GEMM using `ctx.weight_ref` directly for DGrad and the dequantized saved activation for WGrad.
 
 ---
 
@@ -152,7 +155,7 @@ When dimensions are not 32-aligned, backward falls back to BF16 GEMM using `ctx.
 | 3 | Cross-framework dequant        | `convert_from_mxfp4`         | torchAO `to_dtype`   | bitwise identical   |
 | 4 | 1D Quant (axis=0, RTN)         | `convert_to_mxfp4`           | torchAO MXTensor     | bitwise identical   |
 | 5 | Dual-axis quant                | `convert_to_mxfp4_dual_axis` | torchAO MXTensor     | bitwise identical   |
-| 6 | Roundtrip (quant→dequant)      | `convert_to/from_mxfp4`      | torchAO MXTensor     | bitwise identical (SNR 19.0 dB) |
+| 6 | Roundtrip (quant→dequant)      | `convert_to/from_mxfp4`      | torchAO MXTensor     | matches torchAO roundtrip bitwise; roundtrip SNR ≈19.0 dB vs FP32 |
 | 7 | GEMM (Y=A@W^T)                 | `gemm_mxfp4_dispatch`        | torchAO MXTensor     | bitwise identical   |
 | 8 | 2D Block Quant Roundtrip       | `convert_to/from_mxfp4_2d`   | Manual LUT reference | bitwise identical   |
 | 9 | Packed FP4 Transpose           | `transpose_packed_fp4`       | Python reference     | bitwise identical   |
@@ -196,49 +199,50 @@ Loss curves nearly superimposed. Final gap +0.045 (0.7% relative). No NaN, no di
 |------------------|--------|--------|--------------|
 | Median step time | 229 ms | 478 ms | 2.09× slower |
 
-### 4.2 Qwen3-8B: BF16 Baseline (C4, 5k steps)
+### 4.2 Qwen3-8B: MXFP4 vs BF16 (C4, 5k steps, same lr)
 
-BF16 8B trained with the same hyperparameters (lr=6e-5, warmup=200):
+Fair head-to-head comparison. BF16 baseline uses **pure PyTorch** (zero Lumen dependency): standard `AutoModelForCausalLM` + PyTorch FSDP2 (`pretrain_qwen3_bf16_baseline.py`). MXFP4 uses Lumen with H16 + last 5/36 layers BF16 + AITER attention/norm/RoPE.
 
-| Step   | BF16 val_loss |
-|-------:|--------------:|
-|    500 | 6.929         |
-|  1,500 | 6.380         |
-|  2,500 | 6.158         |
-|  3,500 | 6.062         |
-|  5,000 | 6.048         |
+| Parameter          | Value                                      |
+|--------------------|--------------------------------------------|
+| Model              | Qwen3-8B (dense), random init, 36 layers, head_dim=128 |
+| Dataset            | C4 (allenai/c4, English, streaming)        |
+| Sequence length    | 512                                        |
+| Global batch size  | 16 (micro_batch=2 × 8 GPUs)               |
+| Optimizer          | AdamW (β1=0.9, β2=0.95, ε=1e-8, wd=0.1)  |
+| Learning rate      | **1e-4** peak, 50-step warmup, cosine decay |
+| Grad clip          | 1.0                                        |
+| Parallelism        | FSDP2 full_shard, 8× MI350X               |
+| Steps              | 5,000                                      |
+| Seed               | 1234                                       |
+| BF16 framework     | Pure PyTorch (no Lumen, no AITER)          |
+| MXFP4 framework    | Lumen + AITER attn/norm/RoPE, last 5 layers BF16 |
 
-Stable convergence throughout. Median step time: 329 ms. Peak memory: 15.3 GB/GPU.
+**Convergence (same lr, same seed, same data)**:
 
-### 4.3 Qwen3-8B: MXFP4 (C4 — stabilized with H16 + tail BF16)
+| Step  | BF16 val_loss | MXFP4 val_loss | Δ (MXFP4 − BF16) |
+|------:|--------------:|---------------:|------------------:|
+|   500 | 6.711         | 6.707          | −0.004            |
+| 1,000 | 6.357         | 6.356          | −0.001            |
+| 1,500 | 6.141         | 6.147          | +0.006            |
+| 2,000 | 5.986         | 5.993          | +0.007            |
+| 2,500 | 5.854         | 5.863          | +0.010            |
+| 3,000 | 5.769         | 5.782          | +0.013            |
+| 3,500 | 5.718         | 5.741          | +0.022            |
+| 4,000 | 5.699         | 5.737          | +0.038            |
+| 4,500 | 5.695         | 5.737          | +0.042            |
+| 5,000 | 5.694         | 5.738          | **+0.044**        |
 
-**History**: After the FSDP2 fix (§2.3), 8B MXFP4 with all layers quantized and H32 crashed at step ~1275-3600 (loss spike to 11.94). See §6.3 for ablation details.
-
-**Current (with H16 + last 5 layers BF16, §1.5 + §2.5)**: 5000 steps, zero divergence.
-
-Config: lr=1e-4, warmup=50, cosine decay, grad_clip=1.0, FSDP2, `--aiter-attn --lumen-norm --fuse-rope`, last 5/36 layers BF16.
-
-| Step  | BF16 val_loss (lr=6e-5) | MXFP4 val_loss (lr=1e-4) |
-|------:|------------------------:|-------------------------:|
-|   250 | 7.438                   | 7.071                    |
-|   500 | 6.929                   | 6.715                    |
-| 1,000 | 6.563                   | 6.366                    |
-| 1,500 | 6.380                   | 6.153                    |
-| 2,000 | 6.252                   | 5.999                    |
-| 2,500 | 6.158                   | 5.870                    |
-| 3,000 | 6.091                   | 5.790                    |
-| 3,500 | 6.062                   | 5.748                    |
-| 4,000 | 6.049                   | 5.744                    |
-| 5,000 | 6.048                   | **5.743**                |
-
-**Note**: MXFP4 val_loss is lower than BF16 because MXFP4 used lr=1e-4 (higher effective lr, more aggressive training) while BF16 used lr=6e-5. The comparison validates convergence stability rather than absolute quality parity — a fair head-to-head comparison at the same lr would require re-running BF16 at lr=1e-4.
+Loss curves nearly superimposed through 5000 steps. Final gap **+0.044 (0.8% relative)**. No NaN, no divergence, no loss spike. MXFP4 trains stably at the same lr as BF16.
 
 **Throughput**:
 
-| Metric           | BF16   | MXFP4  | Ratio        |
-|------------------|--------|--------|--------------|
-| Median step time | 329 ms | 630 ms | 1.91× slower |
-| Peak memory      | 15.3 GB | 15.3 GB | identical  |
+| Metric           | BF16 (pure PyTorch) | MXFP4 (Lumen) | Ratio        |
+|------------------|---------------------|----------------|--------------|
+| Median step time | 334 ms              | 623 ms         | 1.86× slower |
+| Peak memory      | 15.3 GB             | 15.3 GB        | identical    |
+
+**Debug history**: Before stabilization, 8B MXFP4 crashed at step ~1275-3600 with all layers quantized. See §6.3 for the full ablation.
 
 ---
 
@@ -246,7 +250,7 @@ Config: lr=1e-4, warmup=50, cosine decay, grad_clip=1.0, FSDP2, `--aiter-attn --
 
 ### 5.1 Why MXFP4 Shows No Speed Benefit Yet
 
-MXFP4 training is **~2.1× slower** than BF16 at both 0.6B (478 vs 229 ms) and 8B (694 vs 329 ms). This is a known limitation of the current implementation, not the MXFP4 algorithm.
+MXFP4 training is **~2.1× slower** than BF16 at 0.6B (478 vs 229 ms) and **~1.9× slower** at 8B (630 vs 329 ms; see §4.3). This is a known limitation of the current implementation, not the MXFP4 algorithm.
 
 **Root cause: unfused kernel pipeline.** Each MXFP4 GEMM requires 3 separate kernel launches (Hadamard → Quant → GEMM) with global memory reads/writes between each stage:
 
@@ -292,12 +296,12 @@ Memory savings would require: (a) FP4 weight storage with FSDP all-gather in FP4
 
 ### 5.3 Path to Performance Parity
 
-| Optimization                  | Owner     | Expected impact             |
-|-------------------------------|-----------|------------------------------|
-| Fused Hadamard+Quant kernel   | Lumen     | −30-40% quant overhead       |
-| GEMM prologue fusion (H+Q+GEMM) | AITER  | Match ROCm TE (9-10% over FP8) |
-| FP4 weight storage + FSDP     | AITER + PyTorch | Memory reduction        |
-| FP4 gradient communication    | Lumen     | Reduced allreduce bandwidth  |
+| Optimization                  | Owner     | Expected impact             | Status |
+|-------------------------------|-----------|------------------------------|--------|
+| Fused Hadamard+Quant kernel   | Lumen     | ~~−30-40% quant overhead~~   | **Tested: no speedup.** Triton butterfly/matmul has higher overhead than `torch.matmul` + separate quant kernel at these tile sizes. See `feature/mxfp4-kernel-fusion` branch. |
+| GEMM prologue fusion (H+Q+GEMM) | AITER  | Match ROCm TE (9-10% over FP8) | **Required.** The only path to actual speedup — fuse H+Q into GEMM tile load in `gemm_afp4wfp4` kernel. |
+| FP4 weight storage + FSDP     | AITER + PyTorch | Memory reduction        | Not started |
+| FP4 gradient communication    | Lumen     | Reduced allreduce bandwidth  | Not started |
 
 ---
 
@@ -345,6 +349,7 @@ Key insights:
 | SFT script (BF16/FP8/MXFP4) | `examples/qwen3/train_qwen3_fsdp.py` |
 | Paper comparison (AMD MXFP4) | `docs/papers/mxfp4_paper_vs_lumen_comparison.md` |
 | Paper comparison (NVFP4 + hyperparams) | `docs/papers/nvfp4_paper_vs_lumen_comparison.md` |
+| BF16 baseline script (pure PyTorch) | `examples/qwen3/pretrain_qwen3_bf16_baseline.py` |
 | Debug flow (full history) | `docs/mxfp4_debug_flow.md` |
 | Status report | `docs/mxfp4_status_report.md` |
 
@@ -363,20 +368,19 @@ Key insights:
 - [x] Dispatch routing fix (`config.recipe`)
 - [x] 12/12 operator accuracy tests vs torchAO (bitwise identical)
 - [x] 0.6B BF16 vs MXFP4 convergence validation (C4, 10k steps, Δ val_loss = +0.045)
-- [x] 8B BF16 baseline (C4, 5k steps, val_loss 6.05)
 - [x] Last ~15% layers BF16 enabled by default for MXFP4 (§1.5)
-- [x] **8B MXFP4 stable 5000 steps** (H16 + last 5 layers BF16, val_loss 5.74, zero divergence, §4.3)
+- [x] **8B MXFP4 stable 5000 steps** (H16 + last 5 layers BF16, val_loss 5.74, zero divergence)
+- [x] **8B fair comparison**: BF16 (pure PyTorch) vs MXFP4, same lr=1e-4, Δ val_loss = **+0.044** (0.8%), §4.2
+- [x] Fused H+Q kernel attempted — no speedup (Triton butterfly overhead > torch.matmul), see `feature/mxfp4-kernel-fusion` branch
 
 ### Open Issues
 
-1. **No speed benefit** — MXFP4 is ~1.9× slower than BF16 at 8B (630 vs 329 ms) due to unfused kernel pipeline. Requires AITER GEMM prologue fusion.
+1. **No speed benefit** — MXFP4 is ~1.86× slower than BF16 at 8B (623 vs 334 ms) due to unfused kernel pipeline. Requires AITER GEMM prologue fusion (§5.3).
 2. **No memory saving** — BF16 master weights retained for FSDP2 and backward re-quantization. Requires FP4 weight storage with FP4-aware FSDP.
-3. **BF16 vs MXFP4 not compared at same lr** — 8B BF16 ran at lr=6e-5, MXFP4 at lr=1e-4. A fair quality comparison needs BF16 at lr=1e-4 (or MXFP4 at lr=6e-5, which requires further stabilization).
 
 ### Next Steps
 
-1. **Fair BF16 vs MXFP4 comparison at 8B** — re-run BF16 8B at lr=1e-4 (same as MXFP4) for head-to-head val_loss comparison.
-2. **Fused Hadamard+Quant Triton kernel** (Lumen) — merge `hadamard_transform` + `convert_to_mxfp4` into one kernel to eliminate one global memory roundtrip.
-3. **AITER GEMM prologue fusion** — request AITER to fuse H+Q into GEMM tile load, eliminating all intermediate memory traffic.
-4. **Gradient quantization** — enable `quantize_grad="mxfp4"` for communication bandwidth reduction in multi-node training.
-5. **Megatron backend** — wire MXFP4 through TP/PP for larger-scale runs.
+1. **AITER GEMM prologue fusion** — fuse H+Q into `gemm_afp4wfp4` tile load stage. This is the **only path** to actual speedup — Lumen-side fusion was tested and provides no benefit (§5.3).
+2. **Gradient quantization** — enable `quantize_grad="mxfp4"` for communication bandwidth reduction in multi-node training.
+3. **Megatron backend** — wire MXFP4 through TP/PP for larger-scale runs.
+4. **Late-training BF16 switchover** — NVFP4 paper §4.1/Appendix D: switch Fprop to BF16 during LR decay phase to close the ~0.8% loss gap with ~6% extra compute.
