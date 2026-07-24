@@ -8,6 +8,84 @@ By Dai, Xindi
 
 Lumen MXFP4 implements FP4 E2M1 training for linear layers on AMD MI350X (gfx950) hardware. The design is informed by NVFP4 (NVIDIA, arXiv:2509.25149) and arXiv:2605.09825 (AMD/PSU, 2025). Forward and DGrad GEMMs are computed in MXFP4; WGrad uses MXFP4 with deterministic Hadamard rotation to stabilize convergence. Following both papers, the most sensitive layers (last ~15% of transformer blocks) are kept in BF16 (see §1.5).
 
+### 1.0 End-to-End Flow (at a glance)
+
+Two independent block sizes: **micro-scaling quant block = 32** (E8M0 shared exponent per 32 elems, per OCP MXFP4) and **Hadamard rotation group G = 16** (see §2.4). These are not the same knob.
+
+```mermaid
+flowchart TB
+    classDef gemm fill:#b7e1cd,stroke:#2f6f4f,color:#000;
+    classDef quant fill:#fce5cd,stroke:#b3701f,color:#000;
+    classDef trans fill:#ffffff,stroke:#333,color:#000;
+    classDef master fill:#eeeeee,stroke:#333,color:#000;
+    classDef opt fill:#f4b6a0,stroke:#8a3b2b,color:#000;
+    classDef save fill:#fff2cc,stroke:#b7950b,stroke-dasharray:4 3,color:#000;
+    classDef dq fill:#d9e1f2,stroke:#2e5aac,color:#000;
+    classDef bf16 fill:#ffffff,stroke:#666,color:#000;
+
+    %% ================= FORWARD =================
+    A0["BF16 Activation<br/>(from layer i-1)"]:::bf16
+    QA["Quantize to MXFP4<br/>1×32 · RTN"]:::quant
+    FP["FPROP<br/>MXFP4 GEMM"]:::gemm
+    AOUT["BF16 Activation<br/>(to layer i+1)"]:::bf16
+    WM["BF16 Master Weight<br/>(FSDP2 all-gathered)"]:::master
+    QW["2D Block Quantize to MXFP4<br/>32×32 · RTN"]:::quant
+    XS["Saved Activation<br/>MXFP4 1×32 (memory-saving)"]:::save
+
+    A0 --> QA --> FP
+    WM --> QW --> FP
+    FP -->|BF16| AOUT
+    QA -. save_for_backward .-> XS
+
+    %% ================= DGRAD =================
+    GY["BF16 Activation Gradient<br/>(dY, from layer i+1)"]:::bf16
+    QGY["Quantize to MXFP4 + SR<br/>1×32"]:::quant
+    QWB["Re-quantize W from BF16 master<br/>MXFP4 32×32 · RTN"]:::quant
+    WT["Transpose packed FP4<br/>(+ scale transpose)"]:::trans
+    DG["DGRAD<br/>MXFP4 GEMM"]:::gemm
+    DXOUT["BF16 Activation Gradient<br/>(dX, to layer i-1)"]:::bf16
+
+    GY --> QGY --> DG
+    WM --> QWB --> WT --> DG
+    DG -->|BF16| DXOUT
+
+    %% ================= WGRAD =================
+    DQ["Dequant saved FP4 → BF16"]:::dq
+
+    subgraph FUS1["fused kernel · hadamard_quant_mxfp4_transpose"]
+        direction TB
+        TR1["Transpose"]:::trans --> HD1["Hadamard<br/>G=16 · deterministic"]:::trans --> QG1["Quantize MXFP4 + SR · 1×32"]:::quant
+    end
+    subgraph FUS2["fused kernel · hadamard_quant_mxfp4_transpose"]
+        direction TB
+        TR2["Transpose"]:::trans --> HD2["Hadamard<br/>G=16 · deterministic"]:::trans --> QG2["Quantize MXFP4 + SR · 1×32"]:::quant
+    end
+
+    WG["WGRAD<br/>MXFP4 GEMM"]:::gemm
+    OPT["Optimizer"]:::opt
+
+    GY --> TR1
+    XS --> DQ --> TR2
+    QG1 --> WG
+    QG2 --> WG
+    WG -->|BF16 dW| OPT
+    OPT -->|update| WM
+```
+
+Key differences from the NVFP4 dataflow (all reflect Lumen's actual implementation):
+
+- **Block size**: quant is 32×32 / 1×32 (OCP MXFP4); the Hadamard group **G=16** is a separate knob (§2.4).
+- **Weight source**: BF16 master (FSDP2 all-gathered). DGrad **re-quantizes** the weight from the master, it does **not** reuse the forward FP4 weight (which FSDP2 reshards → stale → NaN, §2.3).
+- **Dequant (WGrad only)**: the activation is saved in FP4 for memory; WGrad must dequant it back to BF16 before transpose+Hadamard+re-quant (the saved FP4 is scaled along the wrong axis and needs SR).
+- **Deterministic Hadamard** (all-+1 sign), not random (§2.4).
+- **Fusion**: WGrad's transpose + Hadamard + quant are a single kernel (`hadamard_quant_mxfp4_transpose`), shown as the dashed subgraphs.
+- Not shown: the last ~15% of transformer layers stay BF16 and skip this path entirely (§1.5).
+
+Notes:
+
+- **Rounding**: forward + DGrad-weight use **RTN**; all gradient-side quant uses **SR** (unbiased, no pre-scaling on gfx950).
+- Numerically the DGrad weight equals `transpose(forward_weight)` (same BF16 master, same RTN, same 32×32); the *mechanism* is re-quantize-from-master, which is what makes it FSDP2-safe.
+
 ### 1.1 Forward (Fprop): Y = Q(X) @ Q(W)^T
 
 | Operand      | Format          | Rounding | Block Layout | Scales             |
@@ -44,10 +122,10 @@ Lumen MXFP4 implements FP4 E2M1 training for linear layers on AMD MI350X (gfx950
 WGrad applies a **deterministic Hadamard rotation** (all +1 sign vector = pure H, no random diagonal) before quantization, following arXiv:2605.09825:
 
 1. **Dequant saved activation**: `convert_from_mxfp4(X_fp4, X_scale) → X_bf16`
-2. **Transpose**: dY^T (N, M) and X^T (K, M)
-3. **Deterministic Hadamard**: blockwise H with G=16 along reduction dim M. Both operands receive the same H, which cancels in GEMM: (dY^T H)(X^T H)^T = dY^T X.
-4. **SR quantize both**: 1×32 along axis=-1
-5. **GEMM**: `gemm_afp4wfp4(dY^T_fp4, X^T_fp4) → dW`
+2. **Fused transpose + Hadamard + SR quant** (per operand, one kernel): reads the row-major (M, ·) tensor, transposes in-register, applies deterministic blockwise H (G=16) along the reduction dim M, and SR-quantizes to 1×32 — emitting the transposed FP4 directly. Both operands receive the same H, which cancels in GEMM: (dY^T H)(X^T H)^T = dY^T X.
+3. **GEMM**: `gemm_afp4wfp4(dY^T_fp4, X^T_fp4) → dW`
+
+The transpose/Hadamard/quant used to be three separate kernels (a BF16 `.t().contiguous()` copy + `hadamard_transform` + `convert_to_mxfp4`); they are now fused into one kernel per operand — `hadamard_quant_mxfp4_transpose` (`lumen/kernels/mxfp4.py`) — removing the intermediate transposed-BF16 global-memory roundtrip. The fused kernel is bitwise-identical to the unfused path under RTN (validated in `tests/ops/test_quantize.py`).
 
 ### 1.4 Per-Layer Operation Count
 
@@ -59,6 +137,8 @@ WGrad applies a **deterministic Hadamard rotation** (all +1 sign vector = pure H
 | **Total** | **6**  | **1**   | **2**    | **3**     | **3**    |
 
 Compare to BF16: 0 quant, 0 dequant, 0 Hadamard, 0 transpose, 3 BF16 GEMMs.
+
+The counts above are *logical* operations. In WGrad the transpose + Hadamard + quant of each operand are fused into a single kernel (`hadamard_quant_mxfp4_transpose`), so the WGrad **kernel launches** are 1 dequant (X) + 2 fused-transpose-H-quant + 1 GEMM = 4 (vs 8 if unfused). DGrad's weight transpose stays a separate `transpose_packed_fp4` on the packed FP4.
 
 ### 1.5 Mixed Precision: Last Layers in BF16
 
@@ -298,8 +378,9 @@ Memory savings would require: (a) FP4 weight storage with FSDP all-gather in FP4
 
 | Optimization                  | Owner     | Expected impact             | Status |
 |-------------------------------|-----------|------------------------------|--------|
-| Fused Hadamard+Quant kernel   | Lumen     | ~~−30-40% quant overhead~~   | **Tested: no speedup.** Triton butterfly/matmul has higher overhead than `torch.matmul` + separate quant kernel at these tile sizes. See `feature/mxfp4-kernel-fusion` branch. |
-| GEMM prologue fusion (H+Q+GEMM) | AITER  | Match ROCm TE (9-10% over FP8) | **Required.** The only path to actual speedup — fuse H+Q into GEMM tile load in `gemm_afp4wfp4` kernel. |
+| Fused Hadamard+Quant kernel (butterfly) | Lumen | ~~−30-40% quant overhead~~ | **No speedup on its own.** Triton butterfly Hadamard has ≈ the same cost as `torch.matmul` Hadamard + a separate quant kernel at these tile sizes. |
+| Fused **transpose**+Hadamard+quant       | Lumen | Remove BF16 transpose roundtrip | **Adopted in WGrad.** `hadamard_quant_mxfp4_transpose` folds the `.t().contiguous()` BF16 copy into the quant kernel; ~2.8–3× on the transpose+quant preprocessing step at large sizes. Bitwise-identical to unfused (RTN). Does not by itself close the e2e gap (quant+GEMM overhead dominates). See `feature/mxfp4-kernel-fusion`. |
+| GEMM prologue fusion (H+Q+GEMM) | AITER  | Match ROCm TE (9-10% over FP8) | **Required for e2e parity.** Fuse H+Q into the GEMM tile-load stage of `gemm_afp4wfp4` so quantization overhead disappears behind the Matrix-Core pipeline. |
 | FP4 weight storage + FSDP     | AITER + PyTorch | Memory reduction        | Not started |
 | FP4 gradient communication    | Lumen     | Reduced allreduce bandwidth  | Not started |
 
@@ -371,7 +452,8 @@ Key insights:
 - [x] Last ~15% layers BF16 enabled by default for MXFP4 (§1.5)
 - [x] **8B MXFP4 stable 5000 steps** (H16 + last 5 layers BF16, val_loss 5.74, zero divergence)
 - [x] **8B fair comparison**: BF16 (pure PyTorch) vs MXFP4, same lr=1e-4, Δ val_loss = **+0.044** (0.8%), §4.2
-- [x] Fused H+Q kernel attempted — no speedup (Triton butterfly overhead > torch.matmul), see `feature/mxfp4-kernel-fusion` branch
+- [x] Fused H+Q kernel (butterfly) — no speedup on its own vs matmul-H + separate quant
+- [x] **Fused transpose+Hadamard+quant** (`hadamard_quant_mxfp4_transpose`) adopted in WGrad — removes the BF16 `.t().contiguous()` roundtrip, bitwise-identical to unfused (RTN); ~2.8–3× on the transpose+quant step. See `feature/mxfp4-kernel-fusion` branch
 
 ### Open Issues
 
@@ -380,7 +462,7 @@ Key insights:
 
 ### Next Steps
 
-1. **AITER GEMM prologue fusion** — fuse H+Q into `gemm_afp4wfp4` tile load stage. This is the **only path** to actual speedup — Lumen-side fusion was tested and provides no benefit (§5.3).
+1. **AITER GEMM prologue fusion** — fuse H+Q into `gemm_afp4wfp4` tile load stage. This is the path to **end-to-end** parity: Lumen-side fusion (transpose+H+quant) removes preprocessing roundtrips but the residual quant+GEMM overhead still dominates (§5.3).
 2. **Gradient quantization** — enable `quantize_grad="mxfp4"` for communication bandwidth reduction in multi-node training.
 3. **Megatron backend** — wire MXFP4 through TP/PP for larger-scale runs.
 4. **Late-training BF16 switchover** — NVFP4 paper §4.1/Appendix D: switch Fprop to BF16 during LR decay phase to close the ~0.8% loss gap with ~6% extra compute.
