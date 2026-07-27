@@ -7,7 +7,7 @@
 """
 lumen.quantize — low-precision training lifecycle for AMD GPUs.
 
-Supports FP8 (E4M3 / E5M2), MXFP8, and FP4 formats.
+Supports FP8 (E4M3 / E5M2), MXFP8, MXFP4, and FP4 formats.
 
 Usage::
 
@@ -300,7 +300,7 @@ def _patch_linear_layers(
     block_size = config.block_size
     quant_act = config.quantize_activation
     fp8_wgrad = config.fp8_wgrad
-    scaling_type = config.scaling.value
+    scaling_type = config.recipe
 
     megatron_types = _get_megatron_linear_types()
     quantizable_types = (nn.Linear,) + megatron_types
@@ -315,17 +315,10 @@ def _patch_linear_layers(
                 skipped += 1
                 continue
 
-            # Keep the output/vocab-projection layer in BF16 unless explicitly
-            # opted in: its M×N output overflows int32 pointer arithmetic in the
-            # Triton FP8 GEMM kernels for large vocab × long sequence (page fault).
             if not config.quantize_output_layer and _is_output_layer(name):
                 skipped += 1
                 continue
 
-            # Keep PEFT LoRA adapter matrices (lora_A / lora_B) in BF16: they are
-            # the trainable low-rank update and their rank dim (e.g. 16) is not
-            # block-quantizable (blockwise / blockwise2d require dims divisible by
-            # block_size). Only the wrapped base_layer weight is quantized.
             if "lora_" in name:
                 skipped += 1
                 continue

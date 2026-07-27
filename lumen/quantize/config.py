@@ -6,8 +6,8 @@
 
 """Quantization configuration for Lumen.
 
-Supports FP8 (E4M3 / E5M2 / HYBRID), MXFP8, and FP4 formats with multiple
-scaling strategies.
+Supports FP8 (E4M3 / E5M2 / HYBRID), MXFP8, MXFP4, and FP4 formats with
+multiple scaling strategies.
 """
 
 import functools
@@ -46,6 +46,7 @@ def _get_float8_e5m2() -> torch.dtype:
 
 _E4M3_MAX = (448.0, 240.0)  # (OCP, FNUZ)
 _E5M2_MAX = (57344.0, 57344.0)
+FP4_E2M1_MAX = 6.0  # 1 sign + 2 exponent + 1 mantissa, no NaN/Inf
 
 
 def get_fp8_max(fmt: "QuantFormat") -> float:
@@ -78,6 +79,7 @@ class QuantFormat(Enum):
     FP8_E5M2 = "fp8_e5m2"
     HYBRID = "hybrid"  # E4M3 forward, E5M2 backward (TE-style)
     MXFP8 = "mxfp8"
+    MXFP4 = "mxfp4"
     FP4 = "fp4"
 
 
@@ -112,6 +114,7 @@ def _build_format_to_dtype():
         QuantFormat.FP8_E5M2: e5m2,
         QuantFormat.HYBRID: e4m3,  # forward dtype
         QuantFormat.MXFP8: e4m3,
+        QuantFormat.MXFP4: None,  # packed uint8, no native PyTorch dtype
         QuantFormat.FP4: None,
     }
 
@@ -124,6 +127,7 @@ def _format_to_dtype_bwd():
         QuantFormat.FP8_E5M2: e5m2,
         QuantFormat.HYBRID: e5m2,  # backward dtype differs
         QuantFormat.MXFP8: e4m3,
+        QuantFormat.MXFP4: None,
         QuantFormat.FP4: None,
     }
 
@@ -225,7 +229,7 @@ class QuantConfig:
     # are rounded to the specified low-precision format (quant → dequant)
     # before being returned from autograd backward.  This reduces gradient
     # communication bandwidth in distributed training.
-    # Valid values: None (disabled), "fp8", "mxfp8", "fp4" (placeholder).
+    # Valid values: None (disabled), "fp8", "mxfp8", "mxfp4", "fp4" (placeholder).
     quantize_grad: Optional[str] = None
 
     # FP8 dot-product attention: run the attention kernel in FP8.
@@ -242,7 +246,7 @@ class QuantConfig:
 
         Args:
             format: One of ``"fp8_e4m3"``, ``"fp8_e5m2"``, ``"hybrid"``,
-                ``"mxfp8"``, ``"fp4"``.
+                ``"mxfp8"``, ``"mxfp4"``, ``"fp4"``.
             scaling: One of ``"dynamic"``, ``"delayed"``, ``"blockwise"``,
                 ``"blockwise2d"``, ``"per_token"``, ``"none"``.
             **kwargs: Forwarded to :class:`QuantConfig`.  String values for
@@ -256,10 +260,13 @@ class QuantConfig:
             "no_quant": "none",
         }
         scaling = _scaling_aliases.get(scaling, scaling)
+        fmt = QuantFormat(format)
+        if fmt == QuantFormat.MXFP4 and scaling == "delayed":
+            scaling = "blockwise"
         if "amax_algo" in kwargs and isinstance(kwargs["amax_algo"], str):
             kwargs["amax_algo"] = AmaxAlgo(kwargs["amax_algo"])
         return cls(
-            format=QuantFormat(format),
+            format=fmt,
             scaling=ScalingType(scaling),
             **kwargs,
         )
@@ -296,4 +303,6 @@ class QuantConfig:
             return "none"
         if self.format == QuantFormat.MXFP8:
             return "mxfp8"
+        if self.format == QuantFormat.MXFP4:
+            return "mxfp4"
         return self.scaling.value

@@ -15,13 +15,38 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-Delete this placeholder when adding the first open entry.
+(No open issues)
 
 ## Ruled Out
 
 Move disproved suspicions here instead of deleting them.
 
 ## Resolved
+
+### [2026-07-21 mxfp4-8b-late-loss-spike]
+- Symptom: 8B MXFP4 (after FSDP2 fix) crashes at step 1275-3600 (varies by config). Loss spikes to 11.9375.
+- Root cause: FP4 dynamic range overflow (max=6.0) on late-training outliers + all layers quantized including sensitive末尾layers.
+- Fix: Deterministic Hadamard H16 (G=32→16, sign=all+1) + last 5/36 layers kept in BF16 (`first_last_layers_bf16=True, num_layers_at_end_in_bf16=5`). Per arXiv:2605.09825 + arXiv:2509.25149.
+- Verification: 8B MXFP4, lr=1e-4, 5000 steps, zero divergence, val_loss 7.07→5.74.
+- Status: resolved
+
+### [2026-07-20 mxfp4-8b-fsdp2-nan-grads]
+- Symptom: MXFP4 8B with FSDP2 multi-GPU: 397/399 NaN grads on step 1 (without grad ckpt).
+- Root cause: FSDP2 reshards weight after forward; saved FP4 weight references stale data.
+- Fix: backward re-quantizes from ctx.weight_ref (BF16 master, all-gathered by FSDP2).
+- Status: resolved
+
+### [2026-07-20 mxfp4-8b-no-convergence]
+- Symptom: MXFP4 training on Qwen3-8B appeared to produce zero learning at any lr (6e-5, 2e-5, 3e-6). Loss stayed at ~12.75 then jumped to 11.9375 (uniform distribution).
+- Root cause: **Not a code bug — hyperparameter sensitivity.** MXFP4's 4-bit quantization noise requires a higher lr (~1e-4) and shorter warmup (~50 steps) than BF16 at 8B scale. With lr=6e-5 and 200-step warmup, the signal-to-noise ratio during warmup was too low for the model to escape the initial random plateau.
+- Evidence:
+  - Single-layer gradient test at 4096×4096: MXFP4 gradients are correct (norm matches BF16, zero%=0, no NaN)
+  - Single-GPU 8B MXFP4 without FSDP: trains perfectly (12.76→7.33 in 50 steps, lr=1e-4, clip=1.0)
+  - Multi-GPU 8B MXFP4 with FSDP2: trains perfectly with lr=1e-4, warmup=50 (12.8→6.2 in 200 steps, val_loss 7.08)
+  - Same FSDP2 setup fails with lr=6e-5, warmup=200
+  - 0.6B MXFP4 tolerates lr=6e-5 because smaller models have smoother loss landscapes
+- Fix: Use lr=1e-4, warmup=50 steps, grad_clip=1.0 for 8B MXFP4 pretraining. The 0.6B default of lr=6e-5 does not transfer to 8B.
+- Status: resolved
 
 ### [2026-06-26 bw2d-fused-swiglu-quant-1d-scale]
 - Symptom: 70B blockwise2d LoRA (run_blockwise2d_v2.sh, image lumen/llama2:dev) dies in forward at `linear_fc2` with `IndexError: Dimension out of range (expected [-1,0], got 1)` at `lumen/ops/quantize/linear.py:_gemm_blockscale_bpreshuffle` → `scale_a.transpose(0, 1)`.

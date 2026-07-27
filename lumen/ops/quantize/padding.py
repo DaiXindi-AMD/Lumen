@@ -34,6 +34,8 @@ def get_fp8_align_size(scaling_type: str, block_size: int = 128) -> int:
         return block_size
     if scaling_type == "mxfp8":
         return 32 if block_size > 64 else block_size
+    if scaling_type == "mxfp4":
+        return 32
     raise ValueError(f"Unknown scaling_type={scaling_type!r}")
 
 

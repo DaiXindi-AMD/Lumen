@@ -155,7 +155,7 @@ def _get_quant_ops():
 # Gradient quantization helpers
 # ---------------------------------------------------------------------------
 
-GRAD_QUANT_TYPES = (None, "fp8", "mxfp8", "fp4")
+GRAD_QUANT_TYPES = (None, "fp8", "mxfp8", "mxfp4", "fp4")
 
 
 def _round_to_fp8(tensor: torch.Tensor, fp8_dtype: torch.dtype) -> torch.Tensor:
@@ -189,6 +189,27 @@ def _round_to_mxfp8(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
         block_size=block_size,
         axis=-1,
     )
+
+    data_hp = data_hp[:orig_m, :orig_n]
+
+    return data_hp.reshape(orig_shape).to(orig_dtype)
+
+
+def _round_to_mxfp4(tensor: torch.Tensor, block_size: int = 32) -> torch.Tensor:
+    """Microscaling FP4 quant-dequant round-trip."""
+    from lumen.ops.quantize.ops import convert_from_mxfp4, convert_to_mxfp4
+    from lumen.ops.quantize.padding import pad_to_block
+
+    orig_dtype = tensor.dtype
+    orig_shape = tensor.shape
+
+    flat = tensor.reshape(-1, orig_shape[-1]).contiguous()
+    flat, orig_m = pad_to_block(flat, block_size, dim=0)
+    flat, orig_n = pad_to_block(flat, block_size, dim=-1)
+
+    data_bf16 = flat.to(torch.bfloat16)
+    data_lp, scales = convert_to_mxfp4(data_bf16, block_size=block_size, axis=-1, use_sr=True)
+    data_hp = convert_from_mxfp4(data_lp, scales, output_dtype=torch.bfloat16, block_size=block_size, axis=-1)
 
     data_hp = data_hp[:orig_m, :orig_n]
 
@@ -961,6 +982,17 @@ class ScalingManager:
         fp8_max = self._fp8_max_bwd if backward else self._fp8_max
         dtype = self.fp8_dtype_bwd if backward else self.fp8_dtype
 
+        if scale is None and self.config.format == QuantFormat.MXFP4:
+            from lumen.ops.quantize.ops import convert_to_mxfp4
+            # RTN for weights (SR only for gradients per NVFP4 paper §4.4)
+            fp4_tensor, mx_scale = convert_to_mxfp4(
+                tensor,
+                block_size=self.config.block_size,
+                axis=-1,
+                use_sr=False,
+            )
+            return FP8Descriptor(data=fp4_tensor, scale=mx_scale, fp8_dtype=None)
+
         if scale is None and self.config.format == QuantFormat.MXFP8:
             convert_to_mxfp8, _, _ = _get_quant_ops()
             fp8_tensor, mx_scale = convert_to_mxfp8(
@@ -1285,10 +1317,10 @@ class ScalingManager:
 
         Args:
             tensor: The gradient tensor.
-            grad_quant_type: ``"fp8"``, ``"mxfp8"``, ``"fp4"``, or ``None``.
+            grad_quant_type: ``"fp8"``, ``"mxfp8"``, ``"mxfp4"``, ``"fp4"``, or ``None``.
             fp8_dtype: Explicit FP8 dtype for the ``"fp8"`` path.  Auto-detects
                 when ``None``.
-            block_size: Block size for ``"mxfp8"`` quantization.
+            block_size: Block size for ``"mxfp8"`` / ``"mxfp4"`` quantization.
         """
         if grad_quant_type is None:
             return tensor
@@ -1300,6 +1332,9 @@ class ScalingManager:
 
         if grad_quant_type == "mxfp8":
             return _round_to_mxfp8(tensor, block_size=block_size)
+
+        if grad_quant_type == "mxfp4":
+            return _round_to_mxfp4(tensor, block_size=block_size)
 
         if grad_quant_type == "fp4":
             raise NotImplementedError(

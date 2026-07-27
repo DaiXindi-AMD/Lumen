@@ -12,13 +12,14 @@ All backends are AITER implementations — no torch.nn.functional fallbacks.
 All AITER GEMM kernels follow TN layout convention:
     ``Y = X @ W^T``  where X is (M, K) and W is (N, K).
 
-Supports all 7 scaling modes:
+Supports all 8 scaling modes:
     - ``delayed``      — per-tensor FP8 (delayed scaling from amax history)
     - ``dynamic``      — per-tensor FP8 (current scaling from current amax)
     - ``per_token``    — per-row FP8 dynamic scaling
     - ``blockwise``    — per-block FP8 scaling (e.g. block=128)
     - ``blockwise2d``  — 2D block FP8 scaling (same kernel, 2D scale management)
     - ``mxfp8``        — microscaling FP8
+    - ``mxfp4``        — microscaling FP4 (all GEMMs in FP4, SR on gradients only)
     - ``none``         — BF16 passthrough (no quantization)
 
 GEMM backends are selected automatically:
@@ -45,6 +46,7 @@ from lumen.ops.dispatch import (
     _probe_aiter_triton_gemm_mxfp8,
     _probe_aiter_triton_quant,
     _probe_aiter_tuned_gemm_bf16,
+    _probe_aiter_triton_gemm_mxfp4,
     try_backends,
 )
 from lumen.quantize.config import _get_float8_e4m3
@@ -65,6 +67,22 @@ _FP8_DGRAD_OUTPUT = os.environ.get("LUMEN_FP8_DGRAD_OUTPUT", "0") == "1"
 # Route mixed-dtype (hybrid) dgrad/wgrad through torch._scaled_mm, which reaches
 # hipBLASLt's F8B8 Tensile kernels (same path TE uses) instead of AITER Triton.
 _MIXED_SCALED_MM = os.environ.get("LUMEN_MIXED_SCALED_MM", "0") == "1"
+
+# ---------------------------------------------------------------------------
+# MXFP4 Hadamard: deterministic sign vector (all +1 = pure Hadamard).
+# arXiv:2605.09825 shows randomized signs cause Wgrad divergence;
+# only deterministic Hadamard converges at 8B+ scale.
+# ---------------------------------------------------------------------------
+_MXFP4_RHT_SIGN: Optional[torch.Tensor] = None
+_MXFP4_RHT_G = 16
+
+
+def _get_mxfp4_rht_sign(device: torch.device) -> torch.Tensor:
+    """Return deterministic Hadamard sign vector (all +1)."""
+    global _MXFP4_RHT_SIGN
+    if _MXFP4_RHT_SIGN is None or _MXFP4_RHT_SIGN.device != device:
+        _MXFP4_RHT_SIGN = torch.ones(_MXFP4_RHT_G, device=device, dtype=torch.float32)
+    return _MXFP4_RHT_SIGN
 
 # ---------------------------------------------------------------------------
 # Tuned hipBLASLt GEMM solutions
@@ -383,11 +401,16 @@ def quantize_input(
     tensor_id=None,
     backward=False,
     is_weight=False,
+    use_sr=False,
 ) -> Optional[FP8Descriptor]:
     """Quantize input tensor according to scaling_type (all via AITER).
 
     Returns an :class:`~lumen.quantize.descriptor.FP8Descriptor` bundling ``data`` and
     ``scale``, or ``None`` when ``scaling_type == "none"`` (BF16 passthrough).
+
+    Args:
+        use_sr: For MXFP4 only — use stochastic rounding (True for gradients,
+            False/RTN for weights and activations per NVFP4 paper §4.4).
 
     Scale tensor shapes by mode:
     - per-tensor: ``(1,)``
@@ -398,6 +421,9 @@ def quantize_input(
           — 1×block per-group quantization along the K axis
         * weight (``is_weight=True``): ``(ceil(M/block_size), ceil(N/block_size))``
           — block×block 2D tile quantization (DeepSeek-V3 / Jet-RL scheme)
+    - mxfp4:
+        * activation / gradient (``is_weight=False``): 1×32 block scales
+        * weight (``is_weight=True``): 32×32 2D block scales (chain-rule consistent)
     - mxfp8: ``(scales_shape,)``
     """
     if scaling_type == "none":
@@ -465,6 +491,23 @@ def quantize_input(
             x_2d, block_size=mxfp8_block, axis=-1, float8_dtype_pt=fp8_dtype
         )
         return FP8Descriptor(data=x_fp8, scale=x_scale, fp8_dtype=fp8_dtype)
+
+    if scaling_type == "mxfp4":
+        from lumen.ops.quantize.ops import convert_to_mxfp4, convert_to_mxfp4_2d
+        from lumen.ops.quantize.padding import pad_to_block
+
+        mxfp4_block = 32
+        x_2d, _orig_m = pad_to_block(x_2d, mxfp4_block, dim=0)
+        x_2d, _orig_n = pad_to_block(x_2d, mxfp4_block, dim=-1)
+        if is_weight:
+            x_fp4, x_scale = convert_to_mxfp4_2d(
+                x_2d, block_size=mxfp4_block, use_sr=use_sr,
+            )
+        else:
+            x_fp4, x_scale = convert_to_mxfp4(
+                x_2d, block_size=mxfp4_block, axis=-1, use_sr=use_sr,
+            )
+        return FP8Descriptor(data=x_fp4, scale=x_scale, fp8_dtype=None)
 
     raise ValueError(f"Unknown scaling_type={scaling_type!r}")
 
@@ -877,6 +920,65 @@ def gemm_mxfp8(a_fp8, w_fp8, scale_a, scale_w):
     return try_backends(backends, op_name="gemm_mxfp8")
 
 
+def _expand_2d_scale_to_1d(scale, data_shape, block_size=32):
+    """Expand 2D block scales (M//b, K//b) → 1D per-row block scales (M, K//b).
+
+    AITER's gemm_afp4wfp4 expects 1D scales (one per block along K for each row).
+    2D scales replicate each tile scale across the block_size rows it covers
+    (NVFP4 paper §4.3: "2D block scales are replicated for each of the 1×16 blocks").
+    """
+    if scale.dim() == 1 or (scale.dim() == 2 and scale.shape[0] == data_shape[0]):
+        return scale
+    sm, sn = scale.shape
+    M = data_shape[0]
+    if sm == M // block_size:
+        return scale.unsqueeze(1).expand(sm, block_size, sn).reshape(M, sn)
+    return scale
+
+
+def _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w):
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
+
+    # Expand 2D weight scales to 1D if needed
+    sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
+    sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+    return gemm_afp4wfp4(a_fp4, w_fp4, sa, sw, dtype=torch.bfloat16)
+
+
+def _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w):
+    """Dequant both operands to BF16, do BF16 GEMM (TN layout)."""
+    from lumen.ops.quantize.ops import convert_from_mxfp4, convert_from_mxfp4_2d
+
+    K_packed_a = a_fp4.shape[1]
+    block_size = (K_packed_a * 2) // scale_a.shape[-1]
+
+    # Use 2D dequant for 2D scales, 1D dequant for 1D scales
+    if scale_a.dim() == 2 and scale_a.shape[0] < a_fp4.shape[0]:
+        a_bf16 = convert_from_mxfp4_2d(a_fp4, scale_a, output_dtype=torch.bfloat16, block_size=block_size)
+    else:
+        a_bf16 = convert_from_mxfp4(a_fp4, scale_a, output_dtype=torch.bfloat16, block_size=block_size)
+
+    K_packed_w = w_fp4.shape[1]
+    block_size_w = (K_packed_w * 2) // scale_w.shape[-1]
+    if scale_w.dim() == 2 and scale_w.shape[0] < w_fp4.shape[0]:
+        w_bf16 = convert_from_mxfp4_2d(w_fp4, scale_w, output_dtype=torch.bfloat16, block_size=block_size_w)
+    else:
+        w_bf16 = convert_from_mxfp4(w_fp4, scale_w, output_dtype=torch.bfloat16, block_size=block_size_w)
+
+    return gemm_bf16(a_bf16, w_bf16)
+
+
+def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
+    """MXFP4 GEMM: Y = X @ W^T with E8M0 block scales. AITER first, dequant+BF16 fallback."""
+    backends = []
+    if _probe_aiter_triton_gemm_mxfp4():
+        # AITER gemm_afp4wfp4 (TN layout, packed FP4, E8M0 scales)
+        backends.append((Backend.TRITON, lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w)))
+    # Dequant to BF16 fallback when AITER MXFP4 GEMM is not available
+    backends.append((Backend.TRITON, lambda: _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w)))
+    return try_backends(backends, op_name="gemm_mxfp4")
+
+
 def _gemm_bf16_tuned(a, w, bias):
     from aiter.tuned_gemm import gemm_a16w16
 
@@ -998,6 +1100,8 @@ def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=No
             out = gemm_blockscale(a, w, scale_a, scale_w)
     elif scaling_type == "mxfp8":
         out = gemm_mxfp8(a, w, scale_a, scale_w)
+    elif scaling_type == "mxfp4":
+        out = gemm_mxfp4_dispatch(a, w, scale_a, scale_w)
     else:
         raise ValueError(f"Unknown scaling_type={scaling_type!r}")
 
@@ -1215,6 +1319,15 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.data,
                 input_desc.scale,
             )
+        elif scaling_type == "mxfp4":
+            # MXFP4: save only activation (input) in FP4.  Weight is
+            # re-quantized from ctx.weight_ref in backward — FSDP2
+            # reshards weight params after forward, making saved FP4
+            # weight stale in multi-GPU settings.
+            ctx.save_for_backward(
+                input_desc.data,
+                input_desc.scale,
+            )
         else:
             ctx.save_for_backward(
                 input_desc.data,
@@ -1308,6 +1421,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_tensor = input_tensor.view(ctx._input_shape)
             else:
                 input_tensor, weight_fp8, weight_scale = ctx.saved_tensors
+
             weight_dequant = (weight_fp8.to(grad_output.dtype) * weight_scale).to(grad_output.dtype)
             grad_input = dispatch_gemm(
                 grad_output,
@@ -1365,7 +1479,10 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
 
-        if scaling_type in ("blockwise", "blockwise2d"):
+        if scaling_type == "mxfp4":
+            input_data, input_scale = ctx.saved_tensors
+            weight_data = weight_scale = None
+        elif scaling_type in ("blockwise", "blockwise2d"):
             weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
         else:
             input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
@@ -1572,6 +1689,141 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
             )
         # ----- end blockwise2d -----
+
+        # ----- MXFP4: full FP4 DGrad + WGrad (adapted from NVFP4 paper §4) -----
+        # Forward saved: weight_fp4 (2D 32×32 scales), input_fp4 (1D 1×32 scales)
+        # DGrad: SR-quantize grad, reuse RTN weight from forward, no RHT
+        # WGrad: RHT on both operands along reduction dim M, SR-quantize both
+        if scaling_type == "mxfp4":
+            from lumen.ops.quantize.ops import (
+                convert_from_mxfp4,
+                convert_from_mxfp4_2d,
+                convert_to_mxfp4,
+                hadamard_transform,
+                transpose_packed_fp4,
+            )
+
+            grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
+            M, N_out = grad_flat.shape
+            K_in = input_data.shape[-1] * 2  # input_data is packed (M, K//2)
+            mxfp4_block = 32
+
+            _aligned = (M % mxfp4_block == 0 and N_out % mxfp4_block == 0 and K_in % mxfp4_block == 0)
+
+            if _aligned:
+                try:
+                    # --- DGrad: dX = dY @ W^T ---
+                    # Re-quantize weight from ctx.weight_ref (BF16 master) instead
+                    # of using saved FP4 weight_data.  FSDP2 reshards weights after
+                    # forward, so saved FP4 tensors reference stale data in
+                    # multi-GPU settings.  ctx.weight_ref is all-gathered by FSDP2
+                    # before backward, so it is always valid.
+                    from lumen.ops.quantize.padding import pad_to_block
+                    from lumen.ops.quantize.ops import convert_to_mxfp4_2d
+                    g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
+                    g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
+                    g_fp4, g_scale = convert_to_mxfp4(
+                        g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
+                    )
+
+                    w_ref = ctx.weight_ref
+                    w_fp4_bwd, w_scale_bwd = convert_to_mxfp4_2d(
+                        w_ref.contiguous(), block_size=mxfp4_block, use_sr=False,
+                    )
+                    w_fp4_t = transpose_packed_fp4(w_fp4_bwd)
+                    w_scale_t = w_scale_bwd.t().contiguous()
+
+                    grad_input = gemm_mxfp4_dispatch(g_fp4, w_fp4_t, g_scale, w_scale_t)
+
+                    # --- WGrad: dW = (dY^T·H) @ (X^T·H)^T with Hadamard ---
+                    rht_g = _MXFP4_RHT_G
+                    _rht_ok = (M % rht_g == 0)
+
+                    input_bf16 = convert_from_mxfp4(
+                        input_data, input_scale,
+                        output_dtype=torch.bfloat16, block_size=mxfp4_block,
+                    )
+
+                    grad_t = grad_flat.t().contiguous()
+                    input_t = input_bf16.t().contiguous()
+
+                    if _rht_ok:
+                        sign_m = _get_mxfp4_rht_sign(grad_flat.device)
+                        grad_t_rht = hadamard_transform(grad_t, sign_m, g=rht_g)
+                        input_t_rht = hadamard_transform(input_t, sign_m, g=rht_g)
+                    else:
+                        grad_t_rht = grad_t
+                        input_t_rht = input_t
+
+                    grad_t_fp4, grad_t_scale = convert_to_mxfp4(
+                        grad_t_rht, block_size=mxfp4_block, axis=-1, use_sr=True,
+                    )
+                    input_t_fp4, input_t_scale = convert_to_mxfp4(
+                        input_t_rht, block_size=mxfp4_block, axis=-1, use_sr=True,
+                    )
+
+                    def _compute_wgrad():
+                        return gemm_mxfp4_dispatch(
+                            grad_t_fp4, input_t_fp4,
+                            grad_t_scale, input_t_scale,
+                        )
+
+                except (AssertionError, RuntimeError) as e:
+                    _logger.warning("mxfp4 backward: kernel rejected (%s); BF16 fallback", e)
+                    _aligned = False
+
+            if not _aligned:
+                # BF16 fallback: use weight_ref directly, dequant activation
+                w_ref = ctx.weight_ref
+                input_bf16 = convert_from_mxfp4(
+                    input_data, input_scale,
+                    output_dtype=torch.bfloat16, block_size=mxfp4_block,
+                )
+                grad_input = dispatch_gemm(
+                    grad_flat, w_ref.t().contiguous(), None, None, "none",
+                )
+
+                def _compute_wgrad():
+                    return dispatch_gemm(
+                        grad_flat.t().contiguous(), input_bf16.t().contiguous(),
+                        None, None, "none",
+                    )
+
+            grad_input = grad_input.view(*grad_output.shape[:-1], K_in)
+
+            mgr = ctx.scaling_manager
+            if ctx.delay_wgrad and ctx.deferred_wgrad is not None:
+                w_ref = ctx.weight_ref
+                gaf = ctx.gradient_accumulation_fusion
+                _mgr = mgr
+
+                def _wgrad_fn():
+                    gw = _compute_wgrad()
+                    if _mgr is not None:
+                        gw = _mgr.quantize_grad(gw)
+                    if gaf and hasattr(w_ref, "main_grad"):
+                        w_ref.main_grad.add_(gw)
+                    elif w_ref.grad is not None:
+                        w_ref.grad.add_(gw)
+                    else:
+                        w_ref.grad = gw
+
+                ctx.deferred_wgrad.defer(_wgrad_fn)
+                grad_weight = None
+            else:
+                grad_weight = _compute_wgrad()
+                if mgr is not None:
+                    grad_weight = mgr.quantize_grad(grad_weight)
+                if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
+                    ctx.weight_ref.main_grad.add_(grad_weight)
+                    grad_weight = None
+
+            grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
+            return (
+                grad_input, grad_weight, grad_bias,
+                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
+            )
+        # ----- end mxfp4 -----
 
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
 
@@ -2004,7 +2256,7 @@ def quantized_linear(
         scaling_manager: A :class:`~lumen.quantize.ScalingManager`.
         backend: Legacy parameter (ignored, auto-fallback is always used).
         scaling_type: One of ``"delayed"``, ``"dynamic"``, ``"per_token"``,
-            ``"blockwise"``, ``"blockwise2d"``, ``"mxfp8"``, ``"none"``.
+            ``"blockwise"``, ``"blockwise2d"``, ``"mxfp8"``, ``"mxfp4"``, ``"none"``.
         fp8_dtype: Target FP8 dtype.  ``None`` auto-detects based on GPU
             architecture (``float8_e4m3fnuz`` on gfx942, ``float8_e4m3fn``
             on gfx950+).
