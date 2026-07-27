@@ -8,7 +8,10 @@ WORKDIR /workspace
 #   libopenmpi-dev — MPI (mori bootstrap)
 #   libibverbs-dev, rdma-core — RDMA verbs + mlx5 provider (mori transport)
 #   libpci-dev     — PCI topology detection
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Base image ships an internal AMD artifactory source that 404s outside AMD network.
+# ROCm is already installed in the base layer; only Ubuntu packages are needed here.
+RUN rm -f /etc/apt/sources.list.d/rocm.list && \
+    apt-get update && apt-get install -y --no-install-recommends \
         build-essential git ninja-build cmake \
         libopenmpi-dev libibverbs-dev rdma-core libpci-dev && \
     rm -rf /var/lib/apt/lists/*
@@ -24,11 +27,11 @@ RUN cd /workspace/Lumen/third_party/aiter && \
     PREBUILD_KERNELS=1 pip install -e .
 
 # mori — SDMA communication library (editable from third_party)
-# Must init mori's own submodules (spdlog, msgpack-c) before cmake build.
+# Nested submodules (spdlog, msgpack-c) are checked out on the host and
+# copied via COPY; no git metadata is available inside the build context.
 RUN cd /workspace/Lumen/third_party/mori && \
-    git submodule update --init --recursive && \
     pip install setuptools-scm && \
-    pip install -e .
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MORI=0.1.0 pip install -e .
 
 # torchao (quantization reference)
 RUN pip install torchao>=0.8
