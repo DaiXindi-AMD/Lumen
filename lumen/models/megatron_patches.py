@@ -683,9 +683,6 @@ def _post_eval_rewarm():
 # ── 10. Fused residual-add + RMSNorm + optional Norm+Quant bypass ───────────
 
 _FUSED_RESIDUAL_NORM = os.environ.get("LUMEN_FUSED_RESIDUAL_NORM", "0") == "1"
-_FUSED_NQG = os.environ.get("LUMEN_FUSED_NORM_QUANT_GEMM", "0") == "1"
-
-
 def install_fused_residual_norm():
     """Replace ``TransformerLayer._forward_attention`` and ``_forward_mlp``
     with Lumen-optimised versions that:
@@ -694,16 +691,8 @@ def install_fused_residual_norm():
        ``hidden_dropout=0`` and cross-attention is ``IdentityOp``, defers the
        self-attention BDA add to ``_forward_mlp`` and fuses it with RMSNorm
        using ``lumen.ops.fused_residual_norm``.
-
-    2. **Norm+Quant bypass** (``LUMEN_FUSED_NORM_QUANT_GEMM=1``): Before each
-       layernorm call, attempts to fuse RMSNorm + FP8 quantization via
-       ``lumen.ops.fused_norm_quant.fused_norm_quant_for_linear``, passing the
-       pre-quantized FP8 activation to the downstream linear via thread-local
-       to skip ``quantize_input()``.
-
-    Both optimisations are independent and can be enabled separately.
     """
-    if not _FUSED_RESIDUAL_NORM and not _FUSED_NQG:
+    if not _FUSED_RESIDUAL_NORM:
         return
 
     try:
@@ -720,13 +709,6 @@ def install_fused_residual_norm():
     _orig_init = _OrigTL.__init__
     _orig_fwd_attn = _OrigTL._forward_attention
     _orig_fwd_mlp = _OrigTL._forward_mlp
-
-    def _try_nqg(hidden_states, norm_module, linear_module):
-        """Try fused norm+quant. Returns (norm_out, True) or (None, False)."""
-        if not _FUSED_NQG:
-            return None, False
-        from lumen.ops.fused_norm_quant import fused_norm_quant_for_linear
-        return fused_norm_quant_for_linear(hidden_states, norm_module, linear_module)
 
     def _patched_init(self, *args, **kwargs):
         _orig_init(self, *args, **kwargs)
@@ -769,14 +751,7 @@ def install_fused_residual_norm():
         self._lumen_deferred_bda = None
 
     def _do_input_layernorm(self, hidden_states):
-        """input_layernorm with optional NQG fusion."""
-        if not self.recompute_input_layernorm:
-            _nqg_linear = getattr(getattr(self, 'self_attention', None), 'linear_qkv', None)
-            if _nqg_linear is not None:
-                _nqg_out, _nqg_ok = _try_nqg(hidden_states, self.input_layernorm, _nqg_linear)
-                if _nqg_ok:
-                    return _nqg_out
-
+        """input_layernorm (optionally checkpointed)."""
         if self.recompute_input_layernorm:
             from megatron.core import tensor_parallel
             self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -786,14 +761,7 @@ def install_fused_residual_norm():
         return self.input_layernorm(hidden_states)
 
     def _do_pre_mlp_layernorm(self, hidden_states):
-        """pre_mlp_layernorm with optional NQG fusion."""
-        if not self.recompute_pre_mlp_layernorm:
-            _nqg_fc1 = getattr(getattr(self, 'mlp', None), 'linear_fc1', None)
-            if _nqg_fc1 is not None:
-                _nqg_out, _nqg_ok = _try_nqg(hidden_states, self.pre_mlp_layernorm, _nqg_fc1)
-                if _nqg_ok:
-                    return _nqg_out
-
+        """pre_mlp_layernorm (optionally checkpointed)."""
         if self.recompute_pre_mlp_layernorm:
             from megatron.core import tensor_parallel
             self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
@@ -894,17 +862,6 @@ def install_fused_residual_norm():
             return hidden_states, context
 
         self._lumen_deferred_bda = None
-        if _FUSED_NQG and not self.recompute_input_layernorm:
-            _nqg_linear = getattr(getattr(self, 'self_attention', None), 'linear_qkv', None)
-            if _nqg_linear is not None:
-                _nqg_out, _nqg_ok = _try_nqg(hidden_states, self.input_layernorm, _nqg_linear)
-                if _nqg_ok:
-                    _saved_fwd = self.input_layernorm.forward
-                    self.input_layernorm.forward = lambda x, _r=_nqg_out: _r
-                    try:
-                        return _orig_fwd_attn(self, hidden_states, *args, **kwargs)
-                    finally:
-                        self.input_layernorm.forward = _saved_fwd
         return _orig_fwd_attn(self, hidden_states, *args, **kwargs)
 
     def _patched_fwd_mlp(self, hidden_states, inference_context=None):
@@ -1057,6 +1014,134 @@ def install_split_along_dim():
         pass
 
 
+# ── DistributedOptimizer _foreach_copy_ patch ────────────────────────────
+
+def install_optimizer_patches():
+    """Batch per-param copy loops in DistributedOptimizer with _foreach_copy_.
+
+    Replaces two methods that iterate over hundreds of BF16 params one by one:
+      _copy_model_grads_to_main_grads  : N BF16→FP32 grad copies → 1 batched call
+      _copy_main_params_to_model_params: N FP32→BF16 param copies → 1 batched call
+
+    FP32 param groups keep original per-param assignment (no allocation overhead).
+    Idempotent; safe to call multiple times.
+    """
+    try:
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+    except ImportError:
+        return
+
+    if getattr(DistributedOptimizer, "_lumen_foreach_copy_patched", False):
+        return
+
+    import torch
+    from megatron.core.fp8_utils import is_float8tensor, quantize_param_shard
+
+    def _patched_copy_grads_to_main(self):
+        if self.is_stub_optimizer:
+            return
+        if self.ddp_config.use_megatron_fsdp:
+            return
+
+        # BF16 model params → FP32 main grads, batched with _foreach_copy_
+        def copy_float16_grads(model_groups, shard_main_groups):
+            bf16_srcs, fp32_dsts = [], []
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    if (
+                        shard_main_param.grad is None
+                        or shard_main_param.grad.shape != shard_model_grad.shape
+                        or shard_main_param.grad.dtype != torch.float32
+                    ):
+                        shard_main_param.grad = torch.empty(
+                            shard_model_grad.shape,
+                            dtype=torch.float32,
+                            device=shard_model_grad.device,
+                        )
+                    bf16_srcs.append(shard_model_grad)
+                    fp32_dsts.append(shard_main_param.grad)
+            if bf16_srcs:
+                torch._foreach_copy_(fp32_dsts, bf16_srcs)
+
+        # FP32 model params → FP32 main grads, original per-param assignment
+        def copy_fp32_grads(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    shard_main_param.grad = shard_model_grad.float()
+
+        # Precision-aware optimizer uses decoupled_grad instead of grad
+        def copy_decoupled_grads(model_groups, shard_main_groups):
+            for model_group, shard_main_group in zip(model_groups, shard_main_groups):
+                for model_param, shard_main_param in zip(model_group, shard_main_group):
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    param_range = param_range_map["param"]
+                    assert param_range.size == shard_main_param.nelement()
+                    shard_model_grad = model_param.main_grad.view(-1)[
+                        param_range.start: param_range.end
+                    ]
+                    shard_main_param.decoupled_grad = shard_model_grad
+
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            copy_decoupled_grads(self.model_float16_groups, self.shard_float16_groups)
+            copy_decoupled_grads(self.model_fp32_groups, self.shard_fp32_groups)
+        else:
+            copy_float16_grads(self.model_float16_groups, self.shard_fp32_from_float16_groups)
+            copy_fp32_grads(self.model_fp32_groups, self.shard_fp32_groups)
+
+    def _patched_copy_main_to_model(self):
+        if self.is_stub_optimizer:
+            return
+        if self.ddp_config.use_megatron_fsdp:
+            for model_chunk in self.model_chunks:
+                model_chunk.param_and_grad_buffer.copy_main_weights_to_model_weights()
+            return
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            return
+
+        quantize_param_shard(
+            *self._get_fp8_params_and_shard_fp32_from_fp8(), self.data_parallel_group
+        )
+
+        # FP32 main params → BF16 model buffers, batched with _foreach_copy_
+        def copy_group_params(shard_main_groups, model_groups):
+            fp32_srcs, model_dsts = [], []
+            for shard_main_group, model_group in zip(shard_main_groups, model_groups):
+                for shard_main_param, model_param in zip(shard_main_group, model_group):
+                    if is_float8tensor(model_param):
+                        continue
+                    param_range_map = self._get_model_param_range_map(model_param)
+                    world_range = param_range_map["gbuf_world_in_bucket"]
+                    assert world_range.size == shard_main_param.nelement()
+                    gbuf_index, _, bucket_id = self.model_param_gbuf_map[model_param]
+                    model_param_buffer = self.buffers[gbuf_index].buckets[bucket_id].param_data
+                    shard_model_param = model_param_buffer.view(-1)[
+                        world_range.start: world_range.end
+                    ]
+                    fp32_srcs.append(shard_main_param)
+                    model_dsts.append(shard_model_param)
+            if fp32_srcs:
+                torch._foreach_copy_(model_dsts, fp32_srcs)
+
+        copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
+        copy_group_params(self.shard_fp32_groups, self.model_fp32_groups)
+
+    DistributedOptimizer._copy_model_grads_to_main_grads = _patched_copy_grads_to_main
+    DistributedOptimizer._copy_main_params_to_model_params = _patched_copy_main_to_model
+    DistributedOptimizer._lumen_foreach_copy_patched = True
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def install_all():
@@ -1077,6 +1162,7 @@ def install_all():
     install_eval_recompute()
     install_post_eval_cache_clear()
     install_fused_residual_norm()
+    install_optimizer_patches()
     # install_split_along_dim()  # disabled — adds forward overhead
 
     # SDMA DP gradient all-reduce (replaces NCCL when --use-sdma is set)

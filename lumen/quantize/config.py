@@ -206,6 +206,14 @@ class QuantConfig:
     # is cached once per frozen weight). Only affects blockwise/blockwise2d.
     bpreshuffle_gemm: bool = False
 
+    # Quantize the output/vocab-projection layer (``lm_head`` / ``output_layer``).
+    # Default OFF: with a large vocab (e.g. Qwen3 151936) and long sequences the
+    # forward output has M×N > 2^31 elements, which overflows the int32 pointer
+    # arithmetic in AITER's Triton FP8 GEMM kernels (gemm_a8w8 / blockscale) and
+    # faults with "Write access to a read-only page". BF16 GEMM (hipBLASLt, int64
+    # addressing) is unaffected, so the output layer stays BF16 by default.
+    quantize_output_layer: bool = False
+
     # Keep the first and last N transformer layers in BF16 (unpatched) even
     # during FP8 training.
     first_last_layers_bf16: bool = False

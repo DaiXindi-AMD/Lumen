@@ -24,6 +24,7 @@ Usage::
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field, fields, replace
 from typing import Optional
 
@@ -58,6 +59,7 @@ _ARG_MAP: dict[str, tuple[str, ...]] = {
     "cache_frozen_weight": ("linear_fp8_cache_frozen_weight",),
     "bpreshuffle_gemm": ("linear_fp8_bpreshuffle",),
     "quantize_grad": ("grad_quant_type",),
+    "quantize_output_layer": ("linear_fp8_quantize_output_layer", "quantize_output_layer"),
     "first_last_layers_bf16": ("first_last_layers_bf16",),
     "num_layers_at_start_in_bf16": ("num_layers_at_start_in_bf16",),
     "num_layers_at_end_in_bf16": ("num_layers_at_end_in_bf16",),
@@ -119,6 +121,7 @@ class LumenConfig:
     cache_frozen_weight: bool = False
     bpreshuffle_gemm: bool = False
     quantize_grad: Optional[str] = None
+    quantize_output_layer: bool = False
     first_last_layers_bf16: bool = False
     num_layers_at_start_in_bf16: int = 1
     num_layers_at_end_in_bf16: int = 1
@@ -188,6 +191,7 @@ class LumenConfig:
             cache_frozen_weight=self.cache_frozen_weight,
             bpreshuffle_gemm=self.bpreshuffle_gemm,
             quantize_grad=self.quantize_grad,
+            quantize_output_layer=self.quantize_output_layer,
             first_last_layers_bf16=self.first_last_layers_bf16,
             num_layers_at_start_in_bf16=self.num_layers_at_start_in_bf16,
             num_layers_at_end_in_bf16=self.num_layers_at_end_in_bf16,
@@ -544,12 +548,21 @@ class LumenConfig:
             else:
                 _rank0_print("> WARNING: fp8_checkpoint requires FP8 quantization")
 
-        if self.fp8_param_gather:
+        # LUMEN_WEIGHT_QUANT_ONCE registers weights for the FP8 param cache so the
+        # weight is quantized (cast+transpose+amax) once per optimizer step and
+        # reused across micro-batches, rather than re-quantized every forward.
+        # Invalidation is driven by the optimizer post-step hook
+        # (mark_fp8_params_stale), NOT tensor._version — see
+        # register_fp8_param_optimizer_hook. This does NOT enable FP8 DP gather
+        # (that is a separate forward-comm decision gated on fp8_param_gather).
+        _weight_quant_once = os.environ.get("LUMEN_WEIGHT_QUANT_ONCE", "0") == "1"
+        if self.fp8_param_gather or _weight_quant_once:
             if manager is not None:
                 manager.enable_fp8_params(model)
-                _rank0_print(f"> FP8 param gather enabled ({manager.num_fp8_params} params)")
+                _tag = "FP8 param gather" if self.fp8_param_gather else "per-step weight quant"
+                _rank0_print(f"> {_tag} enabled ({manager.num_fp8_params} params)")
             else:
-                _rank0_print("> WARNING: fp8_param_gather requires FP8 quantization")
+                _rank0_print("> WARNING: fp8 param cache requires FP8 quantization")
 
         if self.fp8_weight_cache:
             if manager is not None:

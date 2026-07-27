@@ -18,23 +18,32 @@ from typing import Optional, Tuple
 import torch
 import triton
 from aiter.ops.quant import static_per_tensor_quant
-from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
-    quant_fp8_blockwise_for_act_grad_kernel,
-    quant_fp8_blockwise_kernel,
-    quant_fp8_blockwise_segment_m_kernel,
-)
+try:
+    from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
+        quant_fp8_blockwise_for_act_grad_kernel,
+        quant_fp8_blockwise_kernel,
+        quant_fp8_blockwise_segment_m_kernel,
+    )
+except (ImportError, ModuleNotFoundError):
+    quant_fp8_blockwise_for_act_grad_kernel = None  # type: ignore[assignment]
+    quant_fp8_blockwise_kernel = None  # type: ignore[assignment]
+    quant_fp8_blockwise_segment_m_kernel = None  # type: ignore[assignment]
 try:
     from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
         requant_fp8_row_to_col_kernel,
     )
     _HAVE_REQUANT_ROW_TO_COL = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     requant_fp8_row_to_col_kernel = None  # type: ignore[assignment]
     _HAVE_REQUANT_ROW_TO_COL = False
-from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
-    _convert_from_mxfp8_kernel,
-    _convert_to_mxfp8_kernel,
-)
+try:
+    from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
+        _convert_from_mxfp8_kernel,
+        _convert_to_mxfp8_kernel,
+    )
+except (ImportError, ModuleNotFoundError):
+    _convert_from_mxfp8_kernel = None  # type: ignore[assignment]
+    _convert_to_mxfp8_kernel = None  # type: ignore[assignment]
 from torch.library import triton_op, wrap_triton
 
 logger = logging.getLogger(__name__)
