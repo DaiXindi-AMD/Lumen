@@ -31,29 +31,35 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
-from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
-    DEBUG,
-    FIXED_BLOCK_M,
-    FIXED_BLOCK_N,
-    USE_FP8E5M2_BWD,
-    _bwd_kernel_dkdv,
-    _bwd_kernel_dq,
-    _bwd_preprocess_use_o,
-    attn_fwd,
-    get_padded_head_dim,
-    get_shape_from_layout,
-    get_strides_from_layout,
-    get_tl_f8_bwd_dtype,
-    is_cdna4,
-    philox_offset,
-    philox_seed,
-)
-from aiter.ops.triton._triton_kernels.attention.mxfp8_attention_kernel import (
-    _bwd_kernel_dkdv_mxfp8,
-    _bwd_kernel_dq_mxfp8,
-    _bwd_preprocess_use_o_mxfp8,
-    attn_fwd_mxfp8,
-)
+try:
+    from aiter.ops.triton._triton_kernels.attention.fp8_attention_kernel import (
+        DEBUG,
+        FIXED_BLOCK_M,
+        FIXED_BLOCK_N,
+        USE_FP8E5M2_BWD,
+        _bwd_kernel_dkdv,
+        _bwd_kernel_dq,
+        _bwd_preprocess_use_o,
+        attn_fwd,
+        get_padded_head_dim,
+        get_shape_from_layout,
+        get_strides_from_layout,
+        get_tl_f8_bwd_dtype,
+        is_cdna4,
+        philox_offset,
+        philox_seed,
+    )
+except (ImportError, ModuleNotFoundError):
+    attn_fwd = None  # type: ignore[assignment]
+try:
+    from aiter.ops.triton._triton_kernels.attention.mxfp8_attention_kernel import (
+        _bwd_kernel_dkdv_mxfp8,
+        _bwd_kernel_dq_mxfp8,
+        _bwd_preprocess_use_o_mxfp8,
+        attn_fwd_mxfp8,
+    )
+except (ImportError, ModuleNotFoundError):
+    attn_fwd_mxfp8 = None  # type: ignore[assignment]
 from torch._library import wrap_triton
 
 from lumen.core.float8 import float8_e4m3, float8_e5m2
