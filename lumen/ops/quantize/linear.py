@@ -1330,21 +1330,21 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.scale,
             )
         elif scaling_type == "mxfp4":
-            # MXFP4: save both activation and weight in FP4.  The FP4
-            # tensors are freshly allocated by quantize_input (not views
-            # of the BF16 param), so they survive FSDP2 resharding.
-            # Pre-transpose weight for DGrad to move work out of backward.
+            # MXFP4: save activation FP4 + pre-transposed weight FP4 for
+            # backward.  The FP4 tensors are freshly allocated by
+            # quantize_input (not views of the BF16 param), so they
+            # survive FSDP2 resharding.  We pre-transpose the weight here
+            # to move work off the backward critical path, and save the
+            # transposed form (not the original) since DGrad only needs W^T.
             from lumen.ops.quantize.ops import transpose_packed_fp4
             w_fp4_t = transpose_packed_fp4(weight_desc.data)
             w_scale_t = weight_desc.scale.t().contiguous()
             ctx.save_for_backward(
                 input_desc.data,
                 input_desc.scale,
-                weight_desc.data,
-                weight_desc.scale,
+                w_fp4_t,
+                w_scale_t,
             )
-            ctx._mxfp4_w_fp4_t = w_fp4_t
-            ctx._mxfp4_w_scale_t = w_scale_t
         else:
             ctx.save_for_backward(
                 input_desc.data,
@@ -1497,6 +1497,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
 
         if scaling_type == "mxfp4":
+            # Saved: (input_fp4, input_scale, w_fp4_transposed, w_scale_transposed)
             input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
         elif scaling_type in ("blockwise", "blockwise2d"):
             weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
@@ -1745,10 +1746,9 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
                     )
 
-                    w_fp4_t = ctx._mxfp4_w_fp4_t
-                    w_scale_t = ctx._mxfp4_w_scale_t
-
-                    grad_input = gemm_mxfp4_dispatch(g_fp4, w_fp4_t, g_scale, w_scale_t)
+                    # weight_data / weight_scale are already the pre-transposed
+                    # forms saved in forward (W^T packed, scales^T).
+                    grad_input = gemm_mxfp4_dispatch(g_fp4, weight_data, g_scale, weight_scale)
 
                     # --- WGrad: dW = fused_HQ(dY^T) @ fused_HQ(X^T)^T ---
                     rht_g = _MXFP4_RHT_G
