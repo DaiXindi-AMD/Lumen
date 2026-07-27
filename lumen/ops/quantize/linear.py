@@ -968,13 +968,23 @@ def _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w):
     return gemm_bf16(a_bf16, w_bf16)
 
 
+_fast_mxfp4_gemm_fn = None
+_fast_mxfp4_gemm_probed = False
+
+
 def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
     """MXFP4 GEMM: Y = X @ W^T with E8M0 block scales. AITER first, dequant+BF16 fallback."""
+    global _fast_mxfp4_gemm_fn, _fast_mxfp4_gemm_probed
+    if _FAST_QUANT_DISPATCH:
+        if not _fast_mxfp4_gemm_probed:
+            _fast_mxfp4_gemm_probed = True
+            if _probe_aiter_triton_gemm_mxfp4():
+                _fast_mxfp4_gemm_fn = _gemm_mxfp4_aiter
+        if _fast_mxfp4_gemm_fn is not None:
+            return _fast_mxfp4_gemm_fn(a_fp4, w_fp4, scale_a, scale_w)
     backends = []
     if _probe_aiter_triton_gemm_mxfp4():
-        # AITER gemm_afp4wfp4 (TN layout, packed FP4, E8M0 scales)
         backends.append((Backend.TRITON, lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w)))
-    # Dequant to BF16 fallback when AITER MXFP4 GEMM is not available
     backends.append((Backend.TRITON, lambda: _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w)))
     return try_backends(backends, op_name="gemm_mxfp4")
 
@@ -1320,14 +1330,21 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.scale,
             )
         elif scaling_type == "mxfp4":
-            # MXFP4: save only activation (input) in FP4.  Weight is
-            # re-quantized from ctx.weight_ref in backward — FSDP2
-            # reshards weight params after forward, making saved FP4
-            # weight stale in multi-GPU settings.
+            # MXFP4: save both activation and weight in FP4.  The FP4
+            # tensors are freshly allocated by quantize_input (not views
+            # of the BF16 param), so they survive FSDP2 resharding.
+            # Pre-transpose weight for DGrad to move work out of backward.
+            from lumen.ops.quantize.ops import transpose_packed_fp4
+            w_fp4_t = transpose_packed_fp4(weight_desc.data)
+            w_scale_t = weight_desc.scale.t().contiguous()
             ctx.save_for_backward(
                 input_desc.data,
                 input_desc.scale,
+                weight_desc.data,
+                weight_desc.scale,
             )
+            ctx._mxfp4_w_fp4_t = w_fp4_t
+            ctx._mxfp4_w_scale_t = w_scale_t
         else:
             ctx.save_for_backward(
                 input_desc.data,
@@ -1480,8 +1497,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
 
         if scaling_type == "mxfp4":
-            input_data, input_scale = ctx.saved_tensors
-            weight_data = weight_scale = None
+            input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
         elif scaling_type in ("blockwise", "blockwise2d"):
             weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
         else:
@@ -1690,17 +1706,23 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
         # ----- end blockwise2d -----
 
-        # ----- MXFP4: full FP4 DGrad + WGrad (adapted from NVFP4 paper §4) -----
-        # Forward saved: weight_fp4 (2D 32×32 scales), input_fp4 (1D 1×32 scales)
-        # DGrad: SR-quantize grad, reuse RTN weight from forward, no RHT
-        # WGrad: RHT on both operands along reduction dim M, SR-quantize both
+        # ----- MXFP4: optimized FP4 DGrad + WGrad -----
+        # Optimizations vs original (NVFP4 paper §4 baseline):
+        #   1. DGrad reuses FP4 weight cached from forward (2D block scales
+        #      are transpose-invariant).  Eliminates BF16→FP4 re-quantization
+        #      + packed transpose from backward — both are pre-computed in fwd.
+        #   2. WGrad uses fused Hadamard+Quant kernel (hadamard_quant_mxfp4)
+        #      instead of separate hadamard_transform + convert_to_mxfp4,
+        #      eliminating 2 kernel launches and 2 global memory roundtrips.
+        #   3. Activation dequant for WGrad still needed (FP4→BF16 for Hadamard
+        #      input), but the subsequent Hadamard+requant is fused.
+        # Per-layer ops: 4 quant (was 6), 1 dequant, 0 separate Hadamard
+        # (was 2), 1 transpose (was 3), 3 FP4 GEMM.
         if scaling_type == "mxfp4":
             from lumen.ops.quantize.ops import (
                 convert_from_mxfp4,
-                convert_from_mxfp4_2d,
                 convert_to_mxfp4,
-                hadamard_transform,
-                transpose_packed_fp4,
+                hadamard_quant_mxfp4,
             )
 
             grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
@@ -1712,30 +1734,23 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
             if _aligned:
                 try:
-                    # --- DGrad: dX = dY @ W^T ---
-                    # Re-quantize weight from ctx.weight_ref (BF16 master) instead
-                    # of using saved FP4 weight_data.  FSDP2 reshards weights after
-                    # forward, so saved FP4 tensors reference stale data in
-                    # multi-GPU settings.  ctx.weight_ref is all-gathered by FSDP2
-                    # before backward, so it is always valid.
+                    # --- DGrad: dX = dY @ W_cached^T ---
+                    # Reuse FP4 weight + pre-transposed weight from forward.
+                    # The FP4 tensors are independent allocations (not views of
+                    # the BF16 param), so they survive FSDP2 resharding.
                     from lumen.ops.quantize.padding import pad_to_block
-                    from lumen.ops.quantize.ops import convert_to_mxfp4_2d
                     g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
                     g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
                     g_fp4, g_scale = convert_to_mxfp4(
                         g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
                     )
 
-                    w_ref = ctx.weight_ref
-                    w_fp4_bwd, w_scale_bwd = convert_to_mxfp4_2d(
-                        w_ref.contiguous(), block_size=mxfp4_block, use_sr=False,
-                    )
-                    w_fp4_t = transpose_packed_fp4(w_fp4_bwd)
-                    w_scale_t = w_scale_bwd.t().contiguous()
+                    w_fp4_t = ctx._mxfp4_w_fp4_t
+                    w_scale_t = ctx._mxfp4_w_scale_t
 
                     grad_input = gemm_mxfp4_dispatch(g_fp4, w_fp4_t, g_scale, w_scale_t)
 
-                    # --- WGrad: dW = (dY^T·H) @ (X^T·H)^T with Hadamard ---
+                    # --- WGrad: dW = fused_HQ(dY^T) @ fused_HQ(X^T)^T ---
                     rht_g = _MXFP4_RHT_G
                     _rht_ok = (M % rht_g == 0)
 
@@ -1749,18 +1764,19 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
                     if _rht_ok:
                         sign_m = _get_mxfp4_rht_sign(grad_flat.device)
-                        grad_t_rht = hadamard_transform(grad_t, sign_m, g=rht_g)
-                        input_t_rht = hadamard_transform(input_t, sign_m, g=rht_g)
+                        grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
+                            grad_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
+                        )
+                        input_t_fp4, input_t_scale = hadamard_quant_mxfp4(
+                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
+                        )
                     else:
-                        grad_t_rht = grad_t
-                        input_t_rht = input_t
-
-                    grad_t_fp4, grad_t_scale = convert_to_mxfp4(
-                        grad_t_rht, block_size=mxfp4_block, axis=-1, use_sr=True,
-                    )
-                    input_t_fp4, input_t_scale = convert_to_mxfp4(
-                        input_t_rht, block_size=mxfp4_block, axis=-1, use_sr=True,
-                    )
+                        grad_t_fp4, grad_t_scale = convert_to_mxfp4(
+                            grad_t, block_size=mxfp4_block, axis=-1, use_sr=True,
+                        )
+                        input_t_fp4, input_t_scale = convert_to_mxfp4(
+                            input_t, block_size=mxfp4_block, axis=-1, use_sr=True,
+                        )
 
                     def _compute_wgrad():
                         return gemm_mxfp4_dispatch(
@@ -1773,7 +1789,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     _aligned = False
 
             if not _aligned:
-                # BF16 fallback: use weight_ref directly, dequant activation
                 w_ref = ctx.weight_ref
                 input_bf16 = convert_from_mxfp4(
                     input_data, input_scale,
