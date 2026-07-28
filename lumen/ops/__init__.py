@@ -9,7 +9,6 @@ _SUBMODULES = (
     "gemm",
     "sdma",
     "mlp",
-    "fused_norm_quant",
     "fused_residual_norm",
 )
 

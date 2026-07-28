@@ -199,6 +199,19 @@ def _get_megatron_linear_types():
 
 _LAYER_INDEX_RE = re.compile(r"layers\.(\d+)\b")
 
+# Module leaf names of the vocab-projection (output) layer across HF / Megatron.
+_OUTPUT_LAYER_NAMES = ("lm_head", "output_layer")
+
+
+def _is_output_layer(name: str) -> bool:
+    """True if *name* is the model's output/vocab-projection layer.
+
+    Matched by the module path's leaf (``...lm_head`` or ``...output_layer``)
+    so both HuggingFace (``lm_head``) and Megatron (``output_layer``) hit.
+    """
+    leaf = name.rsplit(".", 1)[-1]
+    return leaf in _OUTPUT_LAYER_NAMES
+
 
 def _build_bf16_skip_prefixes(
     model: nn.Module,
@@ -302,7 +315,7 @@ def _patch_linear_layers(
                 skipped += 1
                 continue
 
-            if config.first_last_layers_bf16 and name.endswith("lm_head"):
+            if not config.quantize_output_layer and _is_output_layer(name):
                 skipped += 1
                 continue
 
@@ -365,26 +378,6 @@ def _patch_linear_layers(
     )
 
 
-# ---------------------------------------------------------------------------
-# Thread-local pre-quantized activation bypass for fused norm+quant
-# ---------------------------------------------------------------------------
-# When lumen.ops.fused_norm_quant produces an FP8 activation *before* the
-# linear's quant_forward() runs, the FP8 tensor + scale are stored here so
-# quant_forward() can skip its own quantize_input() call.
-
-_nqg_tls = threading.local()
-
-
-def _set_pre_quantized_activation(fp8_data, scale):
-    """Store pre-quantized FP8 activation for the next quant_forward() call."""
-    _nqg_tls.pre_quant = (fp8_data, scale)
-
-
-def _pop_pre_quantized_activation():
-    """Pop pre-quantized FP8 activation (returns None if not set)."""
-    result = getattr(_nqg_tls, "pre_quant", None)
-    _nqg_tls.pre_quant = None
-    return result
 
 
 def _maybe_cache_frozen_weight(module, scaling_type, fp8_dtype, block_size):
@@ -566,8 +559,6 @@ def _replace_forward(
             _wcache = getattr(module, "_fp8_weight_data", None)
             _wscale = getattr(module, "_fp8_weight_scale", None)
 
-            pre_quant = _pop_pre_quantized_activation()
-
             if seq_parallel and not is_row_parallel:
                 from megatron.core.tensor_parallel.mappings import (
                     gather_from_sequence_parallel_region,
@@ -599,7 +590,6 @@ def _replace_forward(
                 fp8_weight_scale=_wscale,
                 pre_quantized_weight=_get_pre_quant_weight(),
                 activation_tensor_id=_act_tensor_id,
-                pre_quantized_input=pre_quant,
             )
 
             if is_row_parallel and seq_parallel:

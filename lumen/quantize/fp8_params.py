@@ -157,12 +157,16 @@ def _dequantize_gathered_fp8_chunk(
 ) -> torch.Tensor:
     """Dequantize one gathered FP8 chunk using its per-rank scales."""
     world_size = per_rank_scales.numel()
-    gathered_rank_chunks = fp8_chunk.chunk(world_size, dim=0)
-    dequant_chunks = [
-        dequantize_param_from_fp8(gathered_rank_chunks[rank], per_rank_scales[rank], target_dtype)
-        for rank in range(world_size)
-    ]
-    return torch.cat(dequant_chunks, dim=0)
+    # Pre-allocate full output to avoid N intermediate BF16 tensors + torch.cat.
+    out = torch.empty(fp8_chunk.shape, dtype=target_dtype, device=fp8_chunk.device)
+    rows_per_rank = fp8_chunk.shape[0] // world_size
+    for rank in range(world_size):
+        row_s = rank * rows_per_rank
+        row_e = row_s + rows_per_rank
+        out[row_s:row_e].copy_(
+            fp8_chunk[row_s:row_e].to(torch.float32).div_(per_rank_scales[rank])
+        )
+    return out
 
 
 def fp8_allgather_weight(
@@ -224,7 +228,7 @@ def fp8_allgather_weight(
 
         dequantized_full_chunks.append(_dequantize_gathered_fp8_chunk(fp8_full_chunk, all_scales, target_dtype))
 
-    return torch.cat(dequantized_full_chunks, dim=0)
+    return dequantized_full_chunks[0] if len(dequantized_full_chunks) == 1 else torch.cat(dequantized_full_chunks, dim=0)
 
 
 def fp8_allgather_weight_pipelined(
@@ -326,7 +330,10 @@ def fp8_allgather_weight_pipelined(
         _do_dequant(weight_idx, chunk_idx)
 
     compute_stream.wait_stream(comm_stream)
-    return [torch.cat(weight_chunks, dim=0) for weight_chunks in results]
+    return [
+        weight_chunks[0] if len(weight_chunks) == 1 else torch.cat(weight_chunks, dim=0)
+        for weight_chunks in results
+    ]
 
 
 class FP8ParamManager:

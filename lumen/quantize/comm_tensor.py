@@ -62,14 +62,18 @@ class FP8CommTensor(torch.Tensor):
     ) -> torch.Tensor:
         fp8_gathered, scales_gathered = all_gather_outputs
         world_size = scales_gathered.numel()
-        chunks = fp8_gathered.chunk(world_size, dim=0)
-        dequant_chunks = [
-            (chunk.to(torch.float32) / scales_gathered[i]).to(param_dtype) for i, chunk in enumerate(chunks)
-        ]
-        result = torch.cat(dequant_chunks, dim=0)
-        if out is not None:
-            out.copy_(result)
-            return out
+        rows_per_rank = fp8_gathered.shape[0] // world_size
+        # Write each rank's dequant directly into pre-allocated output;
+        # avoids N intermediate BF16 tensors + torch.cat (+ an extra copy when out!=None).
+        result = out if out is not None else torch.empty(
+            fp8_gathered.shape, dtype=param_dtype, device=fp8_gathered.device
+        )
+        for i in range(world_size):
+            row_s = i * rows_per_rank
+            row_e = row_s + rows_per_rank
+            result[row_s:row_e].copy_(
+                fp8_gathered[row_s:row_e].to(torch.float32).div_(scales_gathered[i])
+            )
         return result
 
     _FSDP2_SAFE_OPS = {

@@ -265,3 +265,66 @@ All patches are idempotent and skip themselves if already applied.
 ## Reference Logs
 
 See [`results/`](results/) for full training logs from LLaMA2-70B SFT runs on MI300X/MI355X GPUs across different quantization configurations and MLPerf comparisons.
+
+## Megatron Pretraining (Llama2-7B, 8×MI325X)
+
+A self-contained pretraining launcher that runs Llama2-7B in either BF16 or FP8
+delayed/hybrid, using the Megatron backend with all validated Lumen fusion
+optimizations enabled. It generates mock data internally, so no dataset
+download is required for a quick perf/functional run.
+
+### Launch
+
+```bash
+# FP8 delayed/hybrid (default) — 50 steps on 8 GPUs
+bash examples/llama2/run_pretrain_llama2_7b.sh
+
+# BF16
+PRECISION=bf16 bash examples/llama2/run_pretrain_llama2_7b.sh
+
+# Override common knobs (defaults shown)
+PRECISION=fp8 MBS=4 GBS=256 SEQ_LEN=4096 TRAIN_STEPS=50 \
+    bash examples/llama2/run_pretrain_llama2_7b.sh
+```
+
+### Environment overrides
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PRECISION` | `fp8` | `fp8` (delayed/hybrid) or `bf16` |
+| `IMAGE` | `lumen:dev` | Docker image |
+| `MBS` / `GBS` | `4` / `256` | micro / global batch size |
+| `SEQ_LEN` | `4096` | sequence length |
+| `TRAIN_STEPS` | `50` | training iterations |
+| `TOKENIZER_DIR` | `examples/llama2/tokenizer` | HuggingFace tokenizer dir |
+| `RESULTS_DIR` | `examples/llama2/results` | logs + mock data output |
+
+FP8 mode enables the validated forward optimizations (fused quant+amax, fused
+cast-transpose, fused SwiGLU/norm quant, transpose cache, weight-quant-once,
+etc.) plus `--linear-fp8 --fp8-format hybrid --linear-fp8-scaling delayed`.
+BF16 keeps only the precision-agnostic fusions (SwiGLU, residual-norm).
+
+### Model config
+
+32 layers · hidden 4096 · FFN 11008 · 32 heads (no GQA) · RoPE base 1e4 · RMSNorm · SwiGLU.
+
+### Reference results (50 steps, steady-state step time)
+
+| Precision | Log | step time |
+|-----------|-----|-----------|
+| BF16 | [`results/llama2_7b_pretrain_bf16.log`](results/llama2_7b_pretrain_bf16.log) | ~11.6 s |
+| FP8 delayed | [`results/llama2_7b_pretrain_fp8_delayed.log`](results/llama2_7b_pretrain_fp8_delayed.log) | ~8.0 s |
+
+### Lumen vs TransformerEngine (8×MI325X)
+
+Same config (MBS=4, GBS=256, seq=4096, TP=1, PP=1), steady-state step time and
+peak allocated memory:
+
+| Precision | Framework | step time | peak memory |
+|-----------|-----------|-----------|-------------|
+| BF16 | TransformerEngine | ~11.24 s | 110.9 GB |
+| BF16 | Lumen | ~11.52 s | 112.6 GB |
+| BF16 | Δ | +2.5% | +1.5% |
+| FP8 delayed | TransformerEngine | ~8.14 s | 111.6 GB |
+| FP8 delayed | Lumen | ~8.19 s | 113.5 GB |
+| FP8 delayed | Δ | +0.5% | +1.7% |

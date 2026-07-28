@@ -133,3 +133,65 @@ change only kernel selection / scheduling, not the math). Logs:
 | `results/qwen3_fsdp_train_bf16_lora_8b.log` | BF16 reference (~1.73 s/step) |
 | `results/qwen3_fsdp1_train_fp8_blockwise2d_lora_8b.log` | FSDP1 FP8 baseline (~2.78 s/step) |
 | `results/qwen3_fsdp2_train_fp8_blockwise2d_best_lora_8b.log` | FSDP2 fully optimized — RMSNorm kernel + gfx942 GEMM tune + zero-copy RoPE (~568 ms/step) |
+
+## Megatron Pretraining (Qwen3-8B, 8×MI325X)
+
+`run_pretrain_qwen3_8b.sh` is a self-contained launcher that runs Qwen3-8B in
+either BF16 or FP8 delayed/hybrid with all validated Lumen fusion
+optimizations, using mock data (no dataset download needed).
+
+### Launch
+
+```bash
+# FP8 delayed/hybrid (default) — 50 steps on 8 GPUs
+bash examples/qwen3/run_pretrain_qwen3_8b.sh
+
+# BF16
+PRECISION=bf16 bash examples/qwen3/run_pretrain_qwen3_8b.sh
+
+# Override common knobs (defaults shown)
+PRECISION=fp8 MBS=2 GBS=128 SEQ_LEN=8192 TRAIN_STEPS=50 \
+    bash examples/qwen3/run_pretrain_qwen3_8b.sh
+```
+
+### Environment overrides
+
+| Variable | Default | Notes |
+|----------|---------|-------|
+| `PRECISION` | `fp8` | `fp8` (delayed/hybrid) or `bf16` |
+| `IMAGE` | `lumen:dev` | Docker image |
+| `MBS` / `GBS` | `2` / `128` | micro / global batch size |
+| `SEQ_LEN` | `8192` | sequence length |
+| `TRAIN_STEPS` | `50` | training iterations |
+| `TOKENIZER_DIR` | `examples/qwen3/tokenizer` | HuggingFace tokenizer dir |
+| `RESULTS_DIR` | `examples/qwen3/results` | logs + mock data output |
+
+FP8 mode enables the validated forward optimizations (fused quant+amax, fused
+cast-transpose, fused SwiGLU/norm quant, transpose cache, weight-quant-once,
+etc.) plus `--linear-fp8 --fp8-format hybrid --linear-fp8-scaling delayed`.
+BF16 keeps only the precision-agnostic fusions (SwiGLU, residual-norm).
+
+### Model config
+
+36 layers · hidden 4096 · FFN 12288 · 32 heads · GQA 8 KV groups · kv-channels 128 · RoPE base 1e6 · RMSNorm · SwiGLU.
+
+### Reference results (50 steps, steady-state step time)
+
+| Precision | Log | step time |
+|-----------|-----|-----------|
+| BF16 | [`results/qwen3_8b_pretrain_bf16.log`](results/qwen3_8b_pretrain_bf16.log) | ~14.6 s |
+| FP8 delayed | [`results/qwen3_8b_pretrain_fp8_delayed.log`](results/qwen3_8b_pretrain_fp8_delayed.log) | ~10.3 s |
+
+### Lumen vs TransformerEngine (8×MI325X)
+
+Same config (MBS=2, GBS=128, seq=8192, TP=1, PP=1), steady-state step time and
+peak allocated memory:
+
+| Precision | Framework | step time | peak memory |
+|-----------|-----------|-----------|-------------|
+| BF16 | TransformerEngine | ~15.54 s | 133.8 GB |
+| BF16 | Lumen | ~14.90 s | 138.5 GB |
+| BF16 | Δ | −4.1% | +3.5% |
+| FP8 delayed | TransformerEngine | ~11.60 s | 137.8 GB |
+| FP8 delayed | Lumen | ~10.44 s | 138.2 GB |
+| FP8 delayed | Δ | −10.0% | +0.3% |

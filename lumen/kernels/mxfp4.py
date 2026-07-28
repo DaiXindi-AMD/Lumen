@@ -22,6 +22,10 @@ gfx950 ISA instructions used:
   - ``v_cvt_scalef32_sr_pk_fp4_bf16``: 2×BF16 → packed FP4 byte (SR)
 
 ASM SR is unbiased without pre-scaling — no correction factors needed.
+
+Fused Hadamard + Quant kernel:
+  - ``_fused_hadamard_quant_mxfp4_kernel``: BF16 → Hadamard rotate (in-register) → FP4 quantize → write
+    Eliminates one global memory roundtrip vs separate hadamard + quant kernels.
 """
 
 import math
@@ -452,3 +456,120 @@ def _hadamard_transform_kernel(
     x = x * (1.0 / tl.sqrt(float(G)))
 
     tl.store(out_ptr + rm[:, None] * stride_om + rn[None, :] * stride_on, x, mask=mask)
+
+
+# ---------------------------------------------------------------------------
+# Hadamard butterfly subroutine (in-register, no memory traffic)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _hadamard16_butterfly(x, ROWS: tl.constexpr):
+    """In-register Hadamard-16 butterfly for x of shape (ROWS, 16).
+
+    Hardcoded for G=16 (log2(16)=4 stages). Avoids the constexpr reshape
+    issues of a generic loop by unrolling all 4 stages explicitly.
+    Returns (ROWS, 16) normalized.
+    """
+    # Stage 0: h=1, groups=8 -> (ROWS, 8, 2, 1)
+    x_r = tl.reshape(x, (ROWS, 8, 2, 1))
+    x_p = tl.permute(x_r, (0, 1, 3, 2))
+    top, bot = tl.split(x_p)
+    x = tl.reshape(tl.permute(tl.join(top + bot, top - bot), (0, 1, 3, 2)), (ROWS, 16))
+
+    # Stage 1: h=2, groups=4 -> (ROWS, 4, 2, 2)
+    x_r = tl.reshape(x, (ROWS, 4, 2, 2))
+    x_p = tl.permute(x_r, (0, 1, 3, 2))
+    top, bot = tl.split(x_p)
+    x = tl.reshape(tl.permute(tl.join(top + bot, top - bot), (0, 1, 3, 2)), (ROWS, 16))
+
+    # Stage 2: h=4, groups=2 -> (ROWS, 2, 2, 4)
+    x_r = tl.reshape(x, (ROWS, 2, 2, 4))
+    x_p = tl.permute(x_r, (0, 1, 3, 2))
+    top, bot = tl.split(x_p)
+    x = tl.reshape(tl.permute(tl.join(top + bot, top - bot), (0, 1, 3, 2)), (ROWS, 16))
+
+    # Stage 3: h=8, groups=1 -> (ROWS, 1, 2, 8)
+    x_r = tl.reshape(x, (ROWS, 1, 2, 8))
+    x_p = tl.permute(x_r, (0, 1, 3, 2))
+    top, bot = tl.split(x_p)
+    x = tl.reshape(tl.permute(tl.join(top + bot, top - bot), (0, 1, 3, 2)), (ROWS, 16))
+
+    return x * 0.25  # 1/sqrt(16) = 0.25
+
+
+# ---------------------------------------------------------------------------
+# Fused Hadamard + MXFP4 Quantization kernel
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fused_hadamard_quant_mxfp4_kernel(
+    x_ptr, y_ptr, s_ptr, sign_ptr,
+    stride_xm, stride_xn,
+    stride_ym, stride_yn,
+    stride_sm, stride_sn,
+    philox_seed, philox_offset,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_SR: tl.constexpr,
+    USE_ASM: tl.constexpr,
+):
+    """BF16 → Hadamard-16 rotate (in-register butterfly) → packed MXFP4 + E8M0 scales.
+
+    Fuses hadamard_transform + convert_to_mxfp4 into a single kernel,
+    eliminating one global memory roundtrip. The Hadamard rotation uses
+    an O(N log N) butterfly algorithm entirely in registers.
+    Hardcoded for G=16.
+    """
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    G: tl.constexpr = 16
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    HALF_BLOCK_N: tl.constexpr = BLOCK_N // 2
+    NUM_GROUPS: tl.constexpr = BLOCK_N // G
+    ROWS: tl.constexpr = BLOCK_M * NUM_GROUPS
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_xn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    offs_x = offs_m[:, None] * stride_xm + offs_xn[None, :] * stride_xn
+    x = tl.load(x_ptr + offs_x).to(tl.float32)
+
+    # --- Hadamard-16 butterfly in registers (zero memory traffic) ---
+    sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
+    x = x.reshape(ROWS, G)
+    x = x * sign[None, :]
+    x = _hadamard16_butterfly(x, ROWS=ROWS)
+    x = x.reshape(BLOCK_M, BLOCK_N)
+
+    # --- FP4 quantization in registers ---
+    scales = _calculate_fp4_scales(
+        x,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+    )
+
+    y = _pack_fp4(
+        x, scales,
+        philox_seed, philox_offset,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+        USE_SR=USE_SR,
+        USE_ASM=USE_ASM,
+    )
+
+    # --- Write packed FP4 + scales (single write, no intermediate BF16) ---
+    offs_yn = pid_n * HALF_BLOCK_N + tl.arange(0, HALF_BLOCK_N)
+    offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
+    tl.store(y_ptr + offs_y, y)
+
+    offs_sn = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)
+    offs_s = offs_m[:, None] * stride_sm + offs_sn[None, :] * stride_sn
+    tl.store(s_ptr + offs_s, scales)

@@ -1187,7 +1187,12 @@ def install_fp8_param_gather_hook() -> None:
     def _setup_with_fp8_hook(*args, **kwargs):
         model, optimizer, scheduler = current_setup(*args, **kwargs)
         train_args = get_args()
-        if getattr(train_args, "lumen_fp8_param_gather", False) and model:
+        # Register the optimizer post-step hook whenever the FP8 param cache is
+        # active — either for FP8 DP gather, or for per-step weight quantization
+        # (LUMEN_WEIGHT_QUANT_ONCE). The hook fires mark_fp8_params_stale each
+        # optimizer step, the reliable per-step invalidation signal.
+        _weight_quant_once = os.environ.get("LUMEN_WEIGHT_QUANT_ONCE", "0") == "1"
+        if (getattr(train_args, "lumen_fp8_param_gather", False) or _weight_quant_once) and model:
             target = model[0] if isinstance(model, list) else model
             register_fp8_param_optimizer_hook(target, optimizer)
         return model, optimizer, scheduler
