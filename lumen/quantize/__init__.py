@@ -30,6 +30,7 @@ Usage::
 
 import functools
 import logging
+import os as _os
 import re
 import threading
 from typing import Optional, Set
@@ -515,7 +516,11 @@ def _replace_forward(
                 w._lumen_frozen = True
             elif getattr(module, "_lumen_frozen", False):
                 w._lumen_frozen = True
-            if _wcache is None and scaling_type == "mxfp4":
+            if (
+                _wcache is None
+                and scaling_type == "mxfp4"
+                and _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") != "1"
+            ):
                 _mc = getattr(module, "_mxfp4_w_cache", None)
                 if _mc is not None:
                     _wcache, _wscale = _mc
