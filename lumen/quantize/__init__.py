@@ -511,15 +511,22 @@ def _replace_forward(
             _wcache = getattr(module, "_fp8_weight_data", None)
             _wscale = getattr(module, "_fp8_weight_scale", None)
             if isinstance(w, Blockwise2DFP8Gathered):
-                # FSDP2 all-gathered frozen FP8 base: feed its FP8 data + 2D scale
-                # straight to the GEMM (no per-step re-quant), reusing the verified
-                # blockwise2d cache backward path. Frozen → WGrad is skipped.
                 _wcache, _wscale = w._fp8, w._scale
                 w._lumen_frozen = True
             elif getattr(module, "_lumen_frozen", False):
-                # thread the patch-time frozen fact onto the live weight tensor so the
-                # autograd Function can skip its WGrad (FSDP may swap the param view).
                 w._lumen_frozen = True
+            if _wcache is None and scaling_type == "mxfp4":
+                _mc = getattr(module, "_mxfp4_w_cache", None)
+                if _mc is not None:
+                    _wcache, _wscale = _mc
+                else:
+                    from lumen.ops.quantize.linear import quantize_input as _qi
+                    _wd = _qi(
+                        w.contiguous(), "mxfp4", fp8_dtype, block_size,
+                        None, None, is_weight=True,
+                    )
+                    _wcache, _wscale = _wd.data, _wd.scale
+                    module._mxfp4_w_cache = (_wcache, _wscale)
             return quantized_linear(
                 input_tensor,
                 w,
@@ -794,6 +801,25 @@ def register_fp8_weight_optimizer_hooks(
                 fp8_data = (w.data.float() * (1.0 / scale)).clamp(-fp8_max_val, fp8_max_val).to(fp8_dt)
                 m._fp8_weight_data.copy_(fp8_data)
                 m._fp8_weight_scale.copy_(scale)
+
+    optimizer.register_step_post_hook(_post_step)
+
+
+def register_mxfp4_weight_optimizer_hooks(
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+) -> None:
+    """Register a post-step hook to invalidate MXFP4 weight caches.
+
+    MXFP4 weight quantization (RTN, deterministic) is cached on each module
+    across micro-batches within a gradient accumulation step. After
+    ``optimizer.step()`` updates BF16 master weights, this hook clears the
+    cache so the next forward re-quantizes from the updated weights.
+    """
+    def _post_step(opt, args, kwargs):
+        for m in model.modules():
+            if hasattr(m, "_mxfp4_w_cache"):
+                del m._mxfp4_w_cache
 
     optimizer.register_step_post_hook(_post_step)
 

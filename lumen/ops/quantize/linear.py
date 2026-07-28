@@ -1330,12 +1330,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.scale,
             )
         elif scaling_type == "mxfp4":
-            # MXFP4: save activation FP4 + pre-transposed weight FP4 for
-            # backward.  The FP4 tensors are freshly allocated by
-            # quantize_input (not views of the BF16 param), so they
-            # survive FSDP2 resharding.  We pre-transpose the weight here
-            # to move work off the backward critical path, and save the
-            # transposed form (not the original) since DGrad only needs W^T.
             from lumen.ops.quantize.ops import transpose_packed_fp4
             w_fp4_t = transpose_packed_fp4(weight_desc.data)
             w_scale_t = weight_desc.scale.t().contiguous()
