@@ -165,6 +165,9 @@ def main():
     p.add_argument("--tensorboard-dir", type=str, default="auto",
                    help="TensorBoard log dir. 'auto' generates ./runs/<mode>_<model>_<MMDD_HHMM>. 'none' disables.")
     p.add_argument("--num-workers", type=int, default=2)
+    p.add_argument("--wandb", action="store_true", help="Log to Weights & Biases")
+    p.add_argument("--wandb-project", type=str, default="lumen-mxfp4")
+    p.add_argument("--wandb-name", type=str, default=None)
     args = p.parse_args()
 
     if args.tensorboard_dir == "auto":
@@ -285,6 +288,35 @@ def main():
         tb_writer = SummaryWriter(log_dir=args.tensorboard_dir)
         rank0(f"> TensorBoard logging to {args.tensorboard_dir}")
 
+    # --- W&B ---
+    wandb_run = None
+    if args.wandb:
+        import torch.multiprocessing as mp
+        if mp.get_start_method(allow_none=True) != "spawn":
+            try:
+                mp.set_start_method("spawn", force=True)
+            except RuntimeError:
+                pass
+    if global_rank == 0 and args.wandb:
+        import wandb
+        model_short = args.model.split("/")[-1]
+        run_name = args.wandb_name or f"{args.mode}_{model_short}_{args.max_steps}steps"
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=run_name,
+            config={
+                "model": args.model, "mode": args.mode, "dataset": args.dataset,
+                "seq_length": args.seq_length, "micro_batch_size": args.micro_batch_size,
+                "ga": args.gradient_accumulation_steps, "lr": args.lr,
+                "lr_warmup_steps": args.lr_warmup_steps, "max_grad_norm": args.max_grad_norm,
+                "weight_decay": args.weight_decay, "max_steps": args.max_steps,
+                "seed": args.seed, "world_size": world_size,
+                "fsdp_version": args.fsdp_version, "sharding": args.sharding,
+                "param_count_M": param_count,
+            },
+        )
+        rank0(f"> W&B logging to {wandb_run.url}")
+
     # --- Helpers ---
     def compute_loss(batch):
         ids = batch["input_ids"][:, :-1].to(local_rank)
@@ -349,15 +381,23 @@ def main():
                 tb_writer.add_scalar("train/lr", lr, step)
                 tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
                 tb_writer.add_scalar("gpu/peak_memory_gb", mem_gb, step)
+            if wandb_run:
+                wandb_run.log({"train/loss": train_loss, "train/lr": lr,
+                               "train/step_time_ms": step_time_ms,
+                               "gpu/peak_memory_gb": mem_gb}, step=step)
 
         if step % args.eval_interval == 0:
             val_loss = validate()
             rank0(f"  step {step}/{args.max_steps} | val_loss {val_loss:.4f}")
             if tb_writer:
                 tb_writer.add_scalar("val/loss", val_loss, step)
+            if wandb_run:
+                wandb_run.log({"val/loss": val_loss}, step=step)
 
     if tb_writer:
         tb_writer.close()
+    if wandb_run:
+        wandb_run.finish()
     rank0(f"> Training complete after {args.max_steps} steps.")
 
 
