@@ -156,19 +156,57 @@ FSDP2 当前在 forward 前 all-gather 完整的 BF16 权重到每张卡，然�
 
 ---
 
+## 追加优化：预转置缓存 + 融合 dequant+transpose kernel
+
+### 优化 A：预转置缓存
+
+在 module 级权重缓存中，除了 FP4 权重，也缓存其预转置形式 `(w_fp4_t, w_scale_t)`。这样 `QuantizedLinearFunction.forward` 中的 `transpose_packed_fp4` 被完全跳过（包括 gradient checkpointing 重算时的 forward 调用）。
+
+### 优化 B：融合 dequant+transpose Triton kernel
+
+WGrad 中 `convert_from_mxfp4(input_data, input_scale)` 写出 BF16 (M, K)，然后 `.t().contiguous()` 再读写为 (K, M)。新 kernel `_dequant_transpose_mxfp4_kernel` 直接读 packed FP4 (M, K/2) + E8M0 scales，在单个 kernel launch 中 dequant + 写入 transposed BF16 (K, M)，省掉一次 BF16 全矩阵读写。
+
+kernel 实现（`lumen/kernels/mxfp4.py`）：
+- `_fp4_e2m1_decode`：4-bit FP4 E2M1 code → float32 的 LUT 解码
+- `_dequant_transpose_mxfp4_kernel`：读 packed FP4 → unpack nibbles → LUT dequant → expand scales → `tl.trans` → 写 BF16
+
+---
+
+## 完整 A/B 性能对比
+
+**Qwen3-8B, GA=4, 100 步, 8×MI350X FSDP2, C4**
+
+| 指标 | 无优化 | 权重缓存 | 全部优化 |
+|------|--------|---------|---------|
+| **中位步时 (ms)** | **2622** | **2330** | **1983** |
+| 均值步时 (ms) | 2651 | 2391 | 2063 |
+| 最快步时 (ms) | 2402 | 2120 | 1782 |
+| 峰值显存 (GB) | 15.3 | 17.5 | 20.3 |
+| 最终 loss | 7.4141 | 7.4062 | 7.3828 |
+
+| 相对基线 | 无优化 | 权重缓存 | 全部优化 |
+|---------|--------|---------|---------|
+| vs 无优化 | — | **-11.1%** | **-24.4%** |
+| vs 权重缓存 | — | — | **-14.9%** |
+
+**每 micro-batch 时间**：656 ms → 583 ms → **496 ms**（-24.4%）
+
+---
+
 ## 代码变更
 
-| 文件 | 变更 |
-|------|------|
-| `lumen/quantize/__init__.py` | +24 行：`quant_forward` 中 MXFP4 权重缓存逻辑 + `register_mxfp4_weight_optimizer_hooks` |
-| `lumen/ops/quantize/linear.py` | -4 行：移除多余的 `_mxfp4_wt` 缓存逻辑（缓存现在在 module 层面） |
-| `examples/qwen3/pretrain_qwen3_mxfp4.py` | +3 行：注册 optimizer hook |
+| 文件 | 变更 | 说明 |
+|------|------|------|
+| `lumen/quantize/__init__.py` | +30 行 | 权重缓存 + 预转置缓存 + optimizer hook |
+| `lumen/ops/quantize/linear.py` | +10/-8 行 | 使用缓存 transpose + 融合 dequant_transpose |
+| `lumen/ops/quantize/ops.py` | +37 行 | `dequant_transpose_mxfp4` wrapper |
+| `lumen/kernels/mxfp4.py` | +90 行 | `_fp4_e2m1_decode` + `_dequant_transpose_mxfp4_kernel` |
+| `examples/qwen3/pretrain_qwen3_mxfp4.py` | +3 行 | 注册 optimizer hook |
 
 ---
 
 ## 后续 TODO
 
-1. **GA>1 性能测试**：在 8B GA=4 上量化缓存的具体时间节省
-2. **Gradient Checkpointing 交互**：验证 grad ckpt recompute 时缓存被正确使用
-3. **方案 3 (FP4 all-gather)**：独立 feature branch，实现 `Blockwise2DMXFP4Param`
-4. **MXFP4 Megatron 接入**：`LumenSpecProvider` + TP/PP 后方案 2 自动解决
+1. **方案 3 (FP4 all-gather)**：独立 feature branch，实现 `Blockwise2DMXFP4Param`
+2. **MXFP4 Megatron 接入**：`LumenSpecProvider` + TP/PP 后方案 2 自动解决
+3. **显存优化**：全部优化使用 20.3 GB（+5 GB vs 无优化），可考虑按需释放转置缓存
