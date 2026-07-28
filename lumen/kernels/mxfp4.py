@@ -573,3 +573,95 @@ def _fused_hadamard_quant_mxfp4_kernel(
     offs_sn = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)
     offs_s = offs_m[:, None] * stride_sm + offs_sn[None, :] * stride_sn
     tl.store(s_ptr + offs_s, scales)
+
+
+# ---------------------------------------------------------------------------
+# Fused dequant + transpose: packed FP4 (M, K/2) → BF16 (K, M)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _fp4_e2m1_decode(code):
+    """Decode a 4-bit FP4 E2M1 code to float32. bits[3]=sign, bits[2:0]=magnitude."""
+    magnitude = code & 0x07
+    sign = (code >> 3).to(tl.float32)
+    val = tl.where(magnitude == 0, 0.0,
+          tl.where(magnitude == 1, 0.5,
+          tl.where(magnitude == 2, 1.0,
+          tl.where(magnitude == 3, 1.5,
+          tl.where(magnitude == 4, 2.0,
+          tl.where(magnitude == 5, 3.0,
+          tl.where(magnitude == 6, 4.0,
+                   6.0)))))))
+    return tl.where(sign > 0.5, -val, val)
+
+
+@triton.jit
+def _dequant_transpose_mxfp4_kernel(
+    fp4_ptr, scale_ptr, out_ptr,
+    M, K: tl.constexpr,
+    stride_fm, stride_fk,
+    stride_sm, stride_sk,
+    stride_ok, stride_om,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+):
+    """Fused dequant + transpose: read packed FP4 (M, K/2) + 1D scales → write BF16 (K, M).
+
+    Combines convert_from_mxfp4 and .t().contiguous() into a single kernel,
+    eliminating one full BF16 (M, K) intermediate write.
+    """
+    pid_m = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    HALF_BLOCK_K: tl.constexpr = BLOCK_K // 2
+    SCALE_BLOCK_K: tl.constexpr = BLOCK_K // QUANT_BLOCK_SIZE
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rk_packed = pid_k * HALF_BLOCK_K + tl.arange(0, HALF_BLOCK_K)
+
+    mask_fp4 = (rm[:, None] < M) & (rk_packed[None, :] < (K // 2))
+    packed = tl.load(
+        fp4_ptr + rm[:, None] * stride_fm + rk_packed[None, :] * stride_fk,
+        mask=mask_fp4, other=0,
+    ).to(tl.uint8)
+
+    even = packed & 0x0F
+    odd = (packed >> 4) & 0x0F
+
+    vals_even = _fp4_e2m1_decode(even)
+    vals_odd = _fp4_e2m1_decode(odd)
+
+    # Interleave: (BLOCK_M, BLOCK_K)
+    vals = tl.reshape(tl.join(vals_even, vals_odd), (BLOCK_M, BLOCK_K))
+
+    # Load and expand 1D scales: (M, K/block_size)
+    rk_scale = pid_k * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)
+    mask_scale = (rm[:, None] < M) & (rk_scale[None, :] < (K // QUANT_BLOCK_SIZE))
+    scale_raw = tl.load(
+        scale_ptr + rm[:, None] * stride_sm + rk_scale[None, :] * stride_sk,
+        mask=mask_scale, other=127,
+    ).to(tl.int32)
+    # E8M0 → float: 2^(stored_exp - 127)
+    scale_f32 = ((scale_raw.to(tl.uint32)) << 23).to(tl.float32, bitcast=True)
+
+    # Expand scales: (BLOCK_M, SCALE_BLOCK_K) → (BLOCK_M, BLOCK_K)
+    scale_expanded = (
+        scale_f32
+        .reshape(BLOCK_M, SCALE_BLOCK_K, 1)
+        .broadcast_to(BLOCK_M, SCALE_BLOCK_K, QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_M, BLOCK_K)
+    )
+
+    result = (vals * scale_expanded).to(tl.bfloat16)
+
+    # Write in transposed layout: out[k, m] = result[m, k]
+    rk_full = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    mask_out = (rk_full[:, None] < K) & (rm[None, :] < M)
+    result_t = tl.trans(result)  # (BLOCK_K, BLOCK_M)
+    tl.store(
+        out_ptr + rk_full[:, None] * stride_ok + rm[None, :] * stride_om,
+        result_t,
+        mask=mask_out,
+    )

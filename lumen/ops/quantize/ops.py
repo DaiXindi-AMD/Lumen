@@ -888,3 +888,40 @@ def hadamard_quant_mxfp4(
     out_shape = (*orig_shape[:-1], N // 2)
     scale_shape = (*orig_shape[:-1], N // block_size)
     return fp4_packed.view(out_shape), scales_e8m0.view(scale_shape)
+
+
+def dequant_transpose_mxfp4(
+    data_fp4: torch.Tensor,
+    scales: torch.Tensor,
+    block_size: int = 32,
+) -> torch.Tensor:
+    """Fused dequant + transpose: packed FP4 (M, K/2) + 1D scales → BF16 (K, M).
+
+    Equivalent to ``convert_from_mxfp4(data, scales).t().contiguous()`` but
+    eliminates one full BF16 (M, K) intermediate write.
+    """
+    from lumen.kernels.mxfp4 import _dequant_transpose_mxfp4_kernel
+
+    orig_packed_shape = data_fp4.shape
+    data_flat = data_fp4.reshape(-1, orig_packed_shape[-1])
+    scales_flat = scales.reshape(-1, scales.shape[-1])
+    M, K_packed = data_flat.shape
+    K = K_packed * 2
+
+    output = torch.empty((K, M), dtype=torch.bfloat16, device=data_fp4.device)
+
+    BLOCK_M = min(32, M)
+    BLOCK_K = min(64, K)
+    BLOCK_K = max(BLOCK_K, block_size)
+    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
+
+    _dequant_transpose_mxfp4_kernel[grid](
+        data_flat, scales_flat, output,
+        M, K,
+        data_flat.stride(0), data_flat.stride(1),
+        scales_flat.stride(0), scales_flat.stride(1),
+        output.stride(0), output.stride(1),
+        BLOCK_M=BLOCK_M, BLOCK_K=BLOCK_K,
+        QUANT_BLOCK_SIZE=block_size,
+    )
+    return output

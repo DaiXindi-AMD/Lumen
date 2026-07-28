@@ -523,14 +523,18 @@ def _replace_forward(
             ):
                 _mc = getattr(module, "_mxfp4_w_cache", None)
                 if _mc is not None:
-                    _wcache, _wscale = _mc
+                    _wcache, _wscale = _mc[:2]
                 else:
                     from lumen.ops.quantize.linear import quantize_input as _qi
+                    from lumen.ops.quantize.ops import transpose_packed_fp4 as _tp
                     _wd = _qi(
                         w.contiguous(), "mxfp4", fp8_dtype, block_size,
                         None, None, is_weight=True,
                     )
                     _wcache, _wscale = _wd.data, _wd.scale
+                    _wt = _tp(_wcache)
+                    _wst = _wscale.t().contiguous()
+                    _wcache._mxfp4_wt_cached = (_wt, _wst)
                     module._mxfp4_w_cache = (_wcache, _wscale)
             return quantized_linear(
                 input_tensor,
