@@ -9,7 +9,13 @@ import torch.utils._pytree as pytree
 
 from lumen.quantize.fp8_params import quantize_param_to_fp8
 
-__all__ = ["FP8CommTensor", "Blockwise2DFP8Param", "Blockwise2DFP8Gathered"]
+__all__ = [
+    "FP8CommTensor",
+    "Blockwise2DFP8Param",
+    "Blockwise2DFP8Gathered",
+    "MXFP4CommTensor",
+    "MXFP4Gathered",
+]
 
 
 class FP8CommTensor(torch.Tensor):
@@ -279,6 +285,166 @@ class Blockwise2DFP8Param(torch.Tensor):
                 and t.dtype == source._tensor.dtype
             ):
                 return Blockwise2DFP8Param(t, source._fp8_dtype, source._block_size)
+            return t
+
+        return pytree.tree_map(_wrap, result)
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 FSDP2 all-gather: BF16 shard → FP4 on wire → FP4 gathered view
+# ---------------------------------------------------------------------------
+
+
+class MXFP4Gathered(torch.Tensor):
+    """All-gathered MXFP4 weight: packed FP4 (N, K/2) + 2D E8M0 scales (N/32, K/32).
+
+    Returned by :meth:`MXFP4CommTensor.fsdp_post_all_gather`.  The patched
+    Linear forward detects this type and feeds ``(_fp4, _scale)`` as
+    ``fp8_weight_cache / fp8_weight_scale`` — no re-quantization.
+    """
+
+    @staticmethod
+    def __new__(cls, fp4_data, scale, orig_dtype, block_size=32):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, fp4_data.shape, dtype=orig_dtype, device=fp4_data.device, requires_grad=False,
+        )
+
+    def __init__(self, fp4_data, scale, orig_dtype, block_size=32):
+        self._fp4 = fp4_data
+        self._scale = scale
+        self._orig_dtype = orig_dtype
+        self._block_size = block_size
+
+    def __repr__(self):
+        return (
+            f"MXFP4Gathered(shape={list(self.shape)}, fp4={list(self._fp4.shape)}, "
+            f"scale={list(self._scale.shape)})"
+        )
+
+    def __tensor_flatten__(self):
+        return ["_fp4", "_scale"], {"orig_dtype": self._orig_dtype, "block_size": self._block_size}
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner, meta, outer_size, outer_stride):
+        return cls(inner["_fp4"], inner["_scale"], meta["orig_dtype"], meta["block_size"])
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        kwargs = kwargs or {}
+
+        def _unwrap(x):
+            return x._fp4 if isinstance(x, MXFP4Gathered) else x
+
+        source = next(
+            (a for a in pytree.tree_leaves(args) if isinstance(a, MXFP4Gathered)),
+            None,
+        )
+        result = func(*pytree.tree_map(_unwrap, args), **pytree.tree_map(_unwrap, kwargs))
+        if (
+            source is not None
+            and isinstance(result, torch.Tensor)
+            and not isinstance(result, MXFP4Gathered)
+            and result.shape == source._fp4.shape
+        ):
+            return MXFP4Gathered(result, source._scale, source._orig_dtype, source._block_size)
+        return result
+
+
+class MXFP4CommTensor(torch.Tensor):
+    """FSDP2 parameter wrapper holding pre-quantized packed MXFP4 data.
+
+    The inner tensor is uint8 packed FP4 (N, K/2), already quantized before
+    FSDP2 sharding.  FSDP2 shards and all-gathers this uint8 data directly
+    — 4x less communication than BF16 (0.5 byte/element vs 2 bytes).
+
+    After all-gather, ``fsdp_post_all_gather`` returns an :class:`MXFP4Gathered`
+    that the patched Linear forward consumes directly.
+
+    Only for **frozen** weights: trainable weights need BF16 for gradients.
+    """
+
+    _block_size: int
+
+    @staticmethod
+    def __new__(cls, fp4_data: torch.Tensor, scale: torch.Tensor, block_size: int = 32):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            fp4_data.shape,
+            dtype=fp4_data.dtype,
+            device=fp4_data.device,
+            requires_grad=False,
+        )
+
+    def __init__(self, fp4_data: torch.Tensor, scale: torch.Tensor, block_size: int = 32):
+        self._tensor = fp4_data  # packed uint8 (N, K/2)
+        self._scale = scale      # E8M0 uint8 (N/32, K/32)
+        self._block_size = block_size
+
+    def __repr__(self):
+        return f"MXFP4CommTensor(shape={list(self.shape)}, dtype={self._tensor.dtype})"
+
+    def __tensor_flatten__(self):
+        return ["_tensor", "_scale"], {"block_size": self._block_size}
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, metadata, outer_size, outer_stride):
+        return cls(inner_tensors["_tensor"], inner_tensors["_scale"], metadata["block_size"])
+
+    def fsdp_pre_all_gather(self, mesh) -> tuple[tuple[torch.Tensor, ...], dict]:
+        return (self._tensor.contiguous(), self._scale.contiguous()), {"block_size": self._block_size}
+
+    def fsdp_post_all_gather(
+        self,
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: dict,
+        param_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+    ):
+        fp4_full, scale_full = all_gather_outputs
+        if out is not None:
+            assert isinstance(out, MXFP4Gathered)
+            if out._fp4.data_ptr() != fp4_full.data_ptr():
+                out._fp4.copy_(fp4_full)
+            if out._scale.data_ptr() != scale_full.data_ptr():
+                out._scale.copy_(scale_full)
+            return
+        result = MXFP4Gathered(
+            fp4_full, scale_full, param_dtype, metadata["block_size"],
+        )
+        return result, (fp4_full, scale_full)
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        kwargs = kwargs or {}
+
+        def _unwrap(x):
+            return x._tensor if isinstance(x, MXFP4CommTensor) else x
+
+        source = next(
+            (a for a in pytree.tree_leaves(args) if isinstance(a, MXFP4CommTensor)),
+            None,
+        )
+        result = func(*pytree.tree_map(_unwrap, args), **pytree.tree_map(_unwrap, kwargs))
+        if source is None:
+            return result
+
+        def _wrap(t):
+            if (
+                isinstance(t, torch.Tensor)
+                and not isinstance(t, MXFP4CommTensor)
+                and t.dtype == source._tensor.dtype
+            ):
+                # Scale is sharded along dim-0 in lockstep with the FP4 data.
+                # Compute the scale shard that matches this data shard.
+                bs = source._block_size
+                sN = t.shape[0]
+                scale_sN = sN // bs if sN >= bs else 1
+                scale_sK = source._scale.shape[1] if source._scale.dim() == 2 else source._scale.shape[0]
+                s = source._scale
+                if s.shape[0] != scale_sN:
+                    s = s[:scale_sN]
+                return MXFP4CommTensor(t, s, source._block_size)
             return t
 
         return pytree.tree_map(_wrap, result)

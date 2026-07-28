@@ -48,7 +48,7 @@ from lumen.ops.quantize import (
     quant_fp8_tensorwise_impl,
     quantized_linear,
 )
-from lumen.quantize.comm_tensor import Blockwise2DFP8Gathered, FP8CommTensor
+from lumen.quantize.comm_tensor import Blockwise2DFP8Gathered, FP8CommTensor, MXFP4Gathered
 from lumen.quantize.config import (
     AmaxAlgo,
     QuantConfig,
@@ -514,6 +514,8 @@ def _replace_forward(
             if isinstance(w, Blockwise2DFP8Gathered):
                 _wcache, _wscale = w._fp8, w._scale
                 w._lumen_frozen = True
+            elif isinstance(w, MXFP4Gathered):
+                _wcache, _wscale = w._fp4, w._scale
             elif getattr(module, "_lumen_frozen", False):
                 w._lumen_frozen = True
             if (
