@@ -245,7 +245,7 @@ def main():
         apply_fsdp2(model, Namespace(
             linear_fp8=use_quant, sharding_strategy=args.sharding,
             fsdp_fp8_param_storage=False,
-            fsdp_mxfp4_comm=False,
+            fsdp_mxfp4_comm=(args.mode == "mxfp4"),
         ))
         rank0(f"> FSDP2 ready (sharding={args.sharding})")
     else:

@@ -529,24 +529,19 @@ def _wrap_params_as_mxfp4_comm(
 ) -> int:
     """Wrap each MXFP4-patched weight in an MXFP4CommTensor for FP4 all-gather.
 
-    MXFP4 packed format stores 2 elements per byte, so FSDP2's all-gather
-    extension cannot change the sharded tensor's element count. We work
-    around this by storing the **pre-quantized FP4** form as the inner
-    tensor (uint8, N×K/2) and keeping the BF16 master outside.
+    The wrapper holds the BF16 master weight. FSDP2 shards it like any BF16
+    param. During all-gather, the local shard is quantized to packed MXFP4
+    (4x less bytes on the wire), then dequantized back to BF16 after gather.
+    Optimizer and gradients see normal BF16 — only communication is compressed.
 
-    Currently only supports **frozen** weights (requires_grad=False) because
-    trainable weights need BF16 gradients and optimizer states that FSDP2
-    must shard.  For trainable MXFP4 weights, use the cross-micro-batch
-    weight cache (register_mxfp4_weight_optimizer_hooks) instead.
+    Works for both trainable and frozen weights.
 
     Alignment: ``N % (block_size × world_size) == 0`` and ``K % block_size == 0``.
     """
-    from lumen.ops.quantize.ops import convert_to_mxfp4_2d
     from lumen.quantize.comm_tensor import MXFP4CommTensor
 
     count = 0
     skipped = 0
-    not_frozen = 0
     for module in model.modules():
         if not getattr(module, "_quant_enabled", False):
             continue
@@ -555,28 +550,18 @@ def _wrap_params_as_mxfp4_comm(
         w = getattr(module, "weight", None)
         if w is None or not isinstance(w, nn.Parameter) or w.dim() != 2:
             continue
-        if w.requires_grad:
-            not_frozen += 1
-            continue
         if isinstance(w, MXFP4CommTensor):
             continue
         if w.shape[0] % (block_size * world_size) or w.shape[1] % block_size:
             skipped += 1
             continue
-        fp4, scale = convert_to_mxfp4_2d(w.data.float(), block_size=block_size)
         module.weight = nn.Parameter(
-            MXFP4CommTensor(fp4, scale, block_size), requires_grad=False,
+            MXFP4CommTensor(w.data, block_size), requires_grad=w.requires_grad,
         )
-        module._lumen_frozen = True
         count += 1
     if skipped:
         _rank0_print(
             f"> MXFP4CommTensor: skipped {skipped} weights (alignment) — kept BF16"
-        )
-    if not_frozen:
-        _rank0_print(
-            f"> MXFP4CommTensor: skipped {not_frozen} trainable weights — "
-            f"FP4 all-gather requires frozen weights (use weight cache for trainable)"
         )
     return count
 
