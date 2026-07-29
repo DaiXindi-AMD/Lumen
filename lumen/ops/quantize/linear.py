@@ -1764,15 +1764,16 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
                             grad_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
                         )
+                        # Activation uses RTN per NVFP4 §4.4: SR only on gradients.
                         input_t_fp4, input_t_scale = hadamard_quant_mxfp4(
-                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
+                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=False,
                         )
                     else:
                         grad_t_fp4, grad_t_scale = convert_to_mxfp4(
                             grad_t, block_size=mxfp4_block, axis=-1, use_sr=True,
                         )
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t, block_size=mxfp4_block, axis=-1, use_sr=True,
+                            input_t, block_size=mxfp4_block, axis=-1, use_sr=False,
                         )
 
                     def _compute_wgrad():
