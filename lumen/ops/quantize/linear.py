@@ -2098,8 +2098,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
                             grad_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
                         )
+                        # NVFP4 §4.4 / E.3: stochastic rounding belongs on the
+                        # gradient only. On activations it buys little and can
+                        # diverge, so the activation stays round-to-nearest.
                         input_t_fp4, input_t_scale = hadamard_quant_mxfp4(
-                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
+                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=False,
                         )
                     else:
                         # convert_to_mxfp4 can route to AITER's quant, which wants
@@ -2108,7 +2111,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                             grad_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
                         )
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
+                            input_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=False,
                         )
 
                     def _compute_wgrad():
