@@ -232,6 +232,42 @@ def _probe_aiter_triton_gemm_mxfp4():
 
 
 @functools.lru_cache(maxsize=1)
+def _probe_aiter_triton_gemm_mxfp4_preshuffle():
+    """Check if AITER Triton MXFP4 GEMM with shuffled operand layout is available.
+
+    Needs both the kernel and the shuffle helpers that build its layout.
+    """
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle as _  # noqa: F401
+        from aiter.ops.triton.utils.shuffle import (  # noqa: F401
+            shuffle_scale_gemm as _s,
+            shuffle_weight as _w,
+        )
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_aiter_gemm_mxfp4_asm():
+    """Check if AITER's prebuilt A4W4 ASM/CK MXFP4 GEMM is available.
+
+    Needs the dispatcher, the tuned-config table it picks kernels from, and the
+    two layout helpers that build the operand layout those kernels read.
+    """
+    try:
+        from aiter import gemm_a4w4 as _  # noqa: F401
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config as _c  # noqa: F401
+        from aiter.ops.shuffle import shuffle_weight as _w  # noqa: F401
+        from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm as _s  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def _probe_aiter_triton_rope_cached():
     """Check if AITER Triton cached RoPE (SBHD layout) is available."""
     try:

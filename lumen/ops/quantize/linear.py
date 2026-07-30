@@ -47,8 +47,11 @@ from lumen.ops.dispatch import (
     _probe_aiter_triton_quant,
     _probe_aiter_tuned_gemm_bf16,
     _probe_aiter_triton_gemm_mxfp4,
+    _probe_aiter_triton_gemm_mxfp4_preshuffle,
+    _probe_aiter_gemm_mxfp4_asm,
     try_backends,
 )
+from lumen.ops.quantize import mxfp4_autotune
 from lumen.quantize.config import _get_float8_e4m3
 from lumen.quantize.descriptor import FP8Descriptor
 
@@ -945,6 +948,206 @@ def _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w):
     return gemm_afp4wfp4(a_fp4, w_fp4, sa, sw, dtype=torch.bfloat16)
 
 
+# AITER's scale-shuffle tiling is architecture specific; the pairs come from
+# aiter/ops/triton/utils/shuffle.py::shuffle_scale_gemm, whose defaults target
+# gfx1250. Passing the wrong pair silently produces a mislaid scale tensor.
+_MXFP4_SCALE_SHUFFLE_TILING = {
+    "gfx950": (32, 8),
+    "gfx1250": (16, 4),
+}
+
+# The B operand shuffle emits (N // 16) tiles, so N must be a multiple of 16.
+_MXFP4_SHUFFLE_N_MULTIPLE = 16
+
+# Measured on gfx950 (MI350X): the shuffled-layout kernel overtakes the plain one
+# once the packed FP4 weight passes ~16 MiB, where the GEMM turns weight-streaming
+# bound and coalesced tile reads start to pay for the shuffle prologue. Below that
+# the plain kernel is faster -- Llama-8B qkv_proj and o_proj both sit under it.
+_MXFP4_PRESHUFFLE_MIN_WEIGHT_BYTES = 16 * 1024 * 1024
+
+_MXFP4_PRESHUFFLE_ENV = os.environ.get("LUMEN_MXFP4_PRESHUFFLE")
+
+
+def _mxfp4_preshuffle_supported(a_fp4, w_fp4):
+    """True when the shuffled-layout kernel can run this shape at all."""
+    return (
+        w_fp4.shape[0] % _MXFP4_SHUFFLE_N_MULTIPLE == 0
+        and a_fp4.shape[0] >= 32
+    )
+
+
+def _mxfp4_preshuffle_eligible(a_fp4, w_fp4):
+    """True when the shuffled-layout MXFP4 GEMM should beat the plain one.
+
+    The static policy, used when autotune is off. With autotune on, only
+    ``_mxfp4_preshuffle_supported`` matters and the winner is measured.
+    """
+    if _MXFP4_PRESHUFFLE_ENV is not None:
+        if _MXFP4_PRESHUFFLE_ENV != "1":
+            return False
+    elif w_fp4.numel() < _MXFP4_PRESHUFFLE_MIN_WEIGHT_BYTES:
+        return False
+    return _mxfp4_preshuffle_supported(a_fp4, w_fp4)
+
+
+def _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w):
+    """MXFP4 GEMM via AITER's shuffled-layout Triton kernel.
+
+    Same math as ``_gemm_mxfp4_aiter``; the B operand and both scale tensors are
+    rewritten into the tiled layout the kernel reads coalesced.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+
+    arch = get_arch()
+    tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
+    if tiling is None:
+        raise NotImplementedError(f"MXFP4 scale shuffle tiling unknown for {arch}")
+    preshuffle_factor, scale_kwidth = tiling
+
+    sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
+    sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+
+    w_shuf = shuffle_weight(w_fp4, layout=(16, 16)).reshape(
+        w_fp4.shape[0] // _MXFP4_SHUFFLE_N_MULTIPLE,
+        w_fp4.shape[1] * _MXFP4_SHUFFLE_N_MULTIPLE,
+    )
+    sa_shuf = shuffle_scale_gemm(
+        sa, arch=arch, preshuffle_factor=preshuffle_factor, scale_kwidth=scale_kwidth
+    )
+    sw_shuf = shuffle_scale_gemm(
+        sw, arch=arch, preshuffle_factor=preshuffle_factor, scale_kwidth=scale_kwidth
+    )
+    return gemm_afp4wfp4_preshuffle(
+        a_fp4, w_shuf, sa_shuf, sw_shuf, torch.bfloat16
+    )
+
+
+# aiter.gemm_a4w4 raises on gfx942, and on gfx1250 it forks to the F4GEMM preload
+# kernels, which want their own operand layout. Only gfx950 is validated here.
+_MXFP4_ASM_ARCHS = ("gfx950",)
+
+# Scale padding the ASM/CK kernels index against, matching what TransformerEngine's
+# MXFP4 quantizer allocates: rows up to 256, K/32 columns up to 8.
+_MXFP4_ASM_SCALE_ROW_MULTIPLE = 256
+_MXFP4_ASM_SCALE_COL_MULTIPLE = 8
+
+# Measured on gfx950 (MI350X) at M=8192, sweeping N. Like the preshuffle kernel,
+# the ASM path has to amortise a layout prologue -- here a weight shuffle plus a
+# pad+swizzle of both scale tensors -- so it only pays off on large weights.
+# Where the crossover sits depends on whether the CPU gets to run ahead: timing
+# each call with a sync (benchmarks/bench_utils.cuda_timer) exposes the prologue's
+# launch chain and puts it between 24 MiB (plain still 3% ahead, within noise) and
+# 28 MiB (ASM 3.2x ahead); letting the queue stay full moves it down to ~10 MiB.
+# Gate on the pessimistic bracket, since a training step that is launch-bound
+# cannot hide the difference. LUMEN_MXFP4_ASM=1 skips the check.
+_MXFP4_ASM_MIN_WEIGHT_BYTES = 26 * 1024 * 1024
+
+_MXFP4_ASM_ENV = os.environ.get("LUMEN_MXFP4_ASM")
+
+
+@functools.lru_cache(maxsize=256)
+def _mxfp4_asm_tuned(M, N, K):
+    """True when AITER has a tuned A4W4 kernel for this shape.
+
+    Without one, ``gemm_a4w4`` falls back to a default kernel choice that is not
+    validated for correctness: at (64, 64, 128) it silently returns garbage
+    (0.6 dB against the plain Triton kernel). Every tuned shape measured is
+    bit-exact, so a tuned hit is the gate -- and it also keeps us on the shapes
+    AMD actually benchmarked, which are the ones the ASM path wins on.
+    """
+    try:
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
+
+        return get_GEMM_config(M, N, K) is not None
+    except Exception:
+        return False
+
+
+def _mxfp4_asm_supported(a_fp4, w_fp4):
+    """True when the prebuilt A4W4 ASM/CK kernels can correctly run this shape."""
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() not in _MXFP4_ASM_ARCHS:
+        return False
+    # shuffle_weight(layout=(16, 16)) tiles both dims of the packed weight by 16.
+    if w_fp4.shape[0] % 16 != 0 or w_fp4.shape[1] % 16 != 0:
+        return False
+    return _mxfp4_asm_tuned(a_fp4.shape[0], w_fp4.shape[0], a_fp4.shape[1] * 2)
+
+
+def _mxfp4_asm_eligible(a_fp4, w_fp4):
+    """True when the A4W4 ASM/CK kernels should also be worth their prologue.
+
+    The static policy, used when autotune is off. With autotune on, only
+    ``_mxfp4_asm_supported`` matters and the winner is measured — which is the
+    point, because this threshold was fitted to one model's shapes and excludes
+    Qwen3-8B's 24 MiB MLP weights by 2 MiB.
+    """
+    if _MXFP4_ASM_ENV is not None:
+        if _MXFP4_ASM_ENV != "1":
+            return False
+    elif w_fp4.numel() < _MXFP4_ASM_MIN_WEIGHT_BYTES:
+        return False
+    return _mxfp4_asm_supported(a_fp4, w_fp4)
+
+
+def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
+    """Pad an E8M0 scale tensor and rewrite it into the order the ASM kernels read.
+
+    The kernels walk a ``(rows_pad, k32_pad)`` buffer through a permuted flat
+    offset, so the swizzle has to keep that shape -- handing them
+    ``shuffle_scale_gemm``'s natural ``(rows_pad // 32, k32_pad * 32)`` view makes
+    the ASM kernel read out of bounds.
+    """
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+
+    rows, cols = scale.shape
+    rows_pad = -(-rows // _MXFP4_ASM_SCALE_ROW_MULTIPLE) * _MXFP4_ASM_SCALE_ROW_MULTIPLE
+    cols_pad = -(-cols // _MXFP4_ASM_SCALE_COL_MULTIPLE) * _MXFP4_ASM_SCALE_COL_MULTIPLE
+    padded = torch.zeros((rows_pad, cols_pad), dtype=scale.dtype, device=scale.device)
+    padded[:rows, :cols] = scale
+
+    preshuffle_factor, scale_kwidth = tiling
+    shuffled = shuffle_scale_gemm(
+        padded,
+        arch=arch,
+        preshuffle_factor=preshuffle_factor,
+        scale_kwidth=scale_kwidth,
+    )
+    return shuffled.reshape(rows_pad, cols_pad).contiguous()
+
+
+def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
+    """MXFP4 GEMM via AITER's prebuilt A4W4 ASM/CK kernels.
+
+    Same math as ``_gemm_mxfp4_aiter``. Lumen only builds the operand layout;
+    ``aiter.gemm_a4w4`` owns the tuned-config lookup that picks between the ASM
+    and CK kernels, and slices the row-padded output back to M.
+    """
+    import aiter
+    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    arch = get_arch()
+    tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
+    if tiling is None:
+        raise NotImplementedError(f"MXFP4 scale shuffle tiling unknown for {arch}")
+
+    sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
+    sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+
+    return aiter.gemm_a4w4(
+        a_fp4,
+        shuffle_weight(w_fp4, layout=(16, 16)),
+        _pad_and_swizzle_mxfp4_scale(sa, arch, tiling),
+        _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
+        dtype=torch.bfloat16,
+    )
+
+
 def _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w):
     """Dequant both operands to BF16, do BF16 GEMM (TN layout)."""
     from lumen.ops.quantize.ops import convert_from_mxfp4, convert_from_mxfp4_2d
@@ -972,19 +1175,97 @@ _fast_mxfp4_gemm_fn = None
 _fast_mxfp4_gemm_probed = False
 
 
+_fast_mxfp4_preshuffle_ok = False
+_fast_mxfp4_asm_ok = False
+
+_MXFP4_BACKENDS = {
+    "asm": lambda a, w, sa, sw: _gemm_mxfp4_aiter_asm(a, w, sa, sw),
+    "shuffled": lambda a, w, sa, sw: _gemm_mxfp4_aiter_preshuffle(a, w, sa, sw),
+    "plain": lambda a, w, sa, sw: _gemm_mxfp4_aiter(a, w, sa, sw),
+}
+
+
+def _mxfp4_probe_backends():
+    """Work out once which optional MXFP4 backends this install can reach.
+
+    Returns whether the plain AITER kernel is available at all; without it there
+    is nothing to dispatch to and the caller falls back to dequant + BF16.
+    """
+    global _fast_mxfp4_gemm_fn, _fast_mxfp4_gemm_probed
+    global _fast_mxfp4_preshuffle_ok, _fast_mxfp4_asm_ok
+    if not _fast_mxfp4_gemm_probed:
+        _fast_mxfp4_gemm_probed = True
+        if _probe_aiter_triton_gemm_mxfp4():
+            _fast_mxfp4_gemm_fn = _gemm_mxfp4_aiter
+        _fast_mxfp4_preshuffle_ok = _probe_aiter_triton_gemm_mxfp4_preshuffle()
+        _fast_mxfp4_asm_ok = _probe_aiter_gemm_mxfp4_asm()
+    return _fast_mxfp4_gemm_fn is not None
+
+
+def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
+    """Name of the MXFP4 backend to run for these operands.
+
+    Autotune measures the backends that can legally run the shape and remembers
+    the winner; the static byte thresholds are only the fallback. All three
+    backends are bit-for-bit identical, so this choice is purely about speed.
+    """
+    _mxfp4_probe_backends()
+    key = (a_fp4.shape[0], w_fp4.shape[0], a_fp4.shape[1] * 2)
+    name = mxfp4_autotune.cached(key)
+    if name is not None:
+        return name
+
+    asm_ok = _fast_mxfp4_asm_ok and _mxfp4_asm_supported(a_fp4, w_fp4)
+    shuf_ok = _fast_mxfp4_preshuffle_ok and _mxfp4_preshuffle_supported(a_fp4, w_fp4)
+
+    candidates = []
+    if asm_ok:
+        candidates.append(("asm", lambda: _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w)))
+    if shuf_ok:
+        candidates.append(
+            ("shuffled", lambda: _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w))
+        )
+    candidates.append(("plain", lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w)))
+
+    if asm_ok and _mxfp4_asm_eligible(a_fp4, w_fp4):
+        static = "asm"
+    elif shuf_ok and _mxfp4_preshuffle_eligible(a_fp4, w_fp4):
+        static = "shuffled"
+    else:
+        static = "plain"
+
+    name = mxfp4_autotune.pick_backend(key, candidates, fallback=static)
+    mxfp4_autotune.record_shape(key, tuned=asm_ok, backend=name)
+    return name
+
+
+_MXFP4_BACKEND_KIND = {
+    # Prebuilt ASM/CK kernels with a tuned kernel+splitK per shape: fastest path
+    # on gfx950, and the one TransformerEngine's MXFP4 linear lands on.
+    "asm": Backend.ASM,
+    "shuffled": Backend.TRITON,
+    "plain": Backend.TRITON,
+}
+
+
 def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
     """MXFP4 GEMM: Y = X @ W^T with E8M0 block scales. AITER first, dequant+BF16 fallback."""
-    global _fast_mxfp4_gemm_fn, _fast_mxfp4_gemm_probed
-    if _FAST_QUANT_DISPATCH:
-        if not _fast_mxfp4_gemm_probed:
-            _fast_mxfp4_gemm_probed = True
-            if _probe_aiter_triton_gemm_mxfp4():
-                _fast_mxfp4_gemm_fn = _gemm_mxfp4_aiter
-        if _fast_mxfp4_gemm_fn is not None:
-            return _fast_mxfp4_gemm_fn(a_fp4, w_fp4, scale_a, scale_w)
-    backends = []
-    if _probe_aiter_triton_gemm_mxfp4():
-        backends.append((Backend.TRITON, lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w)))
+    if _mxfp4_probe_backends():
+        name = _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w)
+        if _FAST_QUANT_DISPATCH:
+            return _MXFP4_BACKENDS[name](a_fp4, w_fp4, scale_a, scale_w)
+        # Same choice, but keep the other kernels behind it so a backend that
+        # rejects these operands at runtime degrades instead of raising.
+        order = [name] + [n for n in ("asm", "shuffled", "plain") if n != name]
+        backends = [
+            (
+                _MXFP4_BACKEND_KIND[n],
+                (lambda fn=_MXFP4_BACKENDS[n]: fn(a_fp4, w_fp4, scale_a, scale_w)),
+            )
+            for n in order
+        ]
+    else:
+        backends = []
     backends.append((Backend.TRITON, lambda: _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w)))
     return try_backends(backends, op_name="gemm_mxfp4")
 

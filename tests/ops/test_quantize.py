@@ -3,6 +3,10 @@
 
 """Tests for Lumen quantization ops, comparing against torchao reference implementation."""
 
+import csv
+import json
+import os
+
 import pytest
 import torch
 import triton
@@ -29,12 +33,29 @@ from lumen.ops.quantize import (
     convert_to_mxfp4_dual_axis,
     convert_to_mxfp8,
     dequant_fp8_tensorwise_impl,
+    hadamard_quant_mxfp4,
     hadamard_transform,
     quant_fp8_blockwise_impl,
     quant_fp8_tensorwise_impl,
     transpose_packed_fp4,
 )
-from lumen.ops.quantize.linear import _expand_2d_scale_to_1d, gemm_mxfp4_dispatch
+from lumen.ops.quantize import mxfp4_autotune
+from lumen.ops.quantize.linear import (
+    _MXFP4_ASM_ARCHS,
+    _MXFP4_SCALE_SHUFFLE_TILING,
+    _expand_2d_scale_to_1d,
+    _gemm_mxfp4_aiter,
+    _gemm_mxfp4_aiter_asm,
+    _gemm_mxfp4_aiter_preshuffle,
+    _mxfp4_asm_eligible,
+    _mxfp4_asm_supported,
+    _mxfp4_asm_tuned,
+    _mxfp4_choose_backend,
+    _mxfp4_preshuffle_eligible,
+    _mxfp4_preshuffle_supported,
+    _pad_and_swizzle_mxfp4_scale,
+    gemm_mxfp4_dispatch,
+)
 
 # ---------------------------------------------------------------------------
 # Tensorwise FP8
@@ -818,6 +839,363 @@ def test_mxfp4_gemm_vs_torchao_gemm(M, K, N):
 
     # Lumen dequant-matmul vs torchAO dequant-matmul (cross-framework, bitwise)
     torch.testing.assert_close(y_lumen_deq.cpu(), y_torchao, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [(2048, 28672, 4096), (2048, 4096, 14336)],
+    ids=["gate_up", "down_proj"],
+)
+def test_mxfp4_preshuffle_gemm_matches_plain(M, N, K):
+    """Shuffled-layout MXFP4 GEMM must be numerically identical to the plain one.
+
+    The shuffled kernel only rearranges how the B operand and the scales are laid
+    out in memory, so both kernels consume the same values and must agree to
+    within GEMM reduction-order noise.
+    """
+    _require_mxfp4_dtype()
+    if os.environ.get("LUMEN_MXFP4_PRESHUFFLE") is not None:
+        pytest.skip("LUMEN_MXFP4_PRESHUFFLE overrides the policy this test pins down")
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
+
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    a_fp4, a_scales = convert_to_mxfp4(
+        a_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+    )
+    w_fp4, w_scales = convert_to_mxfp4_2d(
+        w_hp, block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+    )
+
+    assert _mxfp4_preshuffle_eligible(a_fp4, w_fp4), "shape should select the shuffled path"
+
+    try:
+        y_plain = _gemm_mxfp4_aiter(a_fp4, w_fp4, a_scales, w_scales)
+        y_shuf = _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError, NotImplementedError) as e:
+        pytest.skip(f"AITER MXFP4 GEMM unavailable: {e}")
+
+    # Bit-exact, not merely close: the autotuner is free to swap backends between
+    # runs, so anything less would make results depend on a timing measurement.
+    torch.testing.assert_close(y_shuf, y_plain, atol=0, rtol=0)
+
+    y_dispatch = gemm_mxfp4_dispatch(a_fp4, w_fp4, a_scales, w_scales)
+    torch.testing.assert_close(y_dispatch, y_shuf, atol=0, rtol=0)
+
+
+def test_mxfp4_preshuffle_eligibility():
+    """Only large, 16-row-aligned weights should take the shuffle prologue."""
+    _require_mxfp4_dtype()
+    if os.environ.get("LUMEN_MXFP4_PRESHUFFLE") is not None:
+        pytest.skip("LUMEN_MXFP4_PRESHUFFLE overrides the policy this test pins down")
+
+    def _operands(M, N, K):
+        a = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
+        w = torch.empty((N, K // 2), dtype=torch.uint8, device="cuda")
+        return a, w
+
+    # Llama-8B attention projections are below the weight-size threshold.
+    assert not _mxfp4_preshuffle_eligible(*_operands(2048, 4096, 4096))
+    assert not _mxfp4_preshuffle_eligible(*_operands(2048, 6144, 4096))
+
+    # MLP projections are above it.
+    assert _mxfp4_preshuffle_eligible(*_operands(2048, 28672, 4096))
+    assert _mxfp4_preshuffle_eligible(*_operands(2048, 4096, 14336))
+
+    # N must tile by 16, and the kernel needs M >= 32.
+    assert not _mxfp4_preshuffle_eligible(*_operands(2048, 28680, 4096))
+    assert not _mxfp4_preshuffle_eligible(*_operands(16, 28672, 4096))
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [(2048, 28672, 4096), (2048, 4096, 14336), (2048, 6144, 4096)],
+    ids=["gate_up", "down_proj", "qkv_proj"],
+)
+def test_mxfp4_asm_gemm_matches_plain(M, N, K):
+    """The A4W4 ASM/CK kernels must agree with the plain Triton MXFP4 GEMM.
+
+    Lumen only rewrites the operand layout for these kernels -- the B tiling and
+    the padded, swizzled scales -- so both paths consume the same values. A wrong
+    layout does not raise, it just mislays scales, which is exactly what this
+    catches.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(41)
+    torch.cuda.manual_seed(41)
+
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+
+    a_fp4, a_scales = convert_to_mxfp4(
+        a_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+    )
+    w_fp4, w_scales = convert_to_mxfp4_2d(
+        w_hp, block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+    )
+
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() not in _MXFP4_ASM_ARCHS or not _mxfp4_asm_tuned(M, N, K):
+        pytest.skip(f"no tuned A4W4 kernel for {M}x{N}x{K} on {get_arch()}")
+
+    try:
+        y_plain = _gemm_mxfp4_aiter(a_fp4, w_fp4, a_scales, w_scales)
+        y_asm = _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError, NotImplementedError) as e:
+        pytest.skip(f"AITER A4W4 MXFP4 GEMM unavailable: {e}")
+
+    assert y_asm.shape == (M, N), f"ASM output should be sliced back to M, got {y_asm.shape}"
+    # Bit-exact, not merely close: the autotuner is free to swap backends between
+    # runs, so anything less would make results depend on a timing measurement.
+    torch.testing.assert_close(y_asm, y_plain, atol=0, rtol=0)
+
+    y_dispatch = gemm_mxfp4_dispatch(a_fp4, w_fp4, a_scales, w_scales)
+    torch.testing.assert_close(y_dispatch, y_asm, atol=0, rtol=0)
+
+
+def test_mxfp4_asm_eligibility():
+    """Only large, 16-tileable, tuned shapes should take the ASM layout prologue."""
+    _require_mxfp4_dtype()
+    if os.environ.get("LUMEN_MXFP4_ASM") is not None:
+        pytest.skip("LUMEN_MXFP4_ASM overrides the policy this test pins down")
+
+    def _operands(M, N, K):
+        a = torch.empty((M, K // 2), dtype=torch.uint8, device="cuda")
+        w = torch.empty((N, K // 2), dtype=torch.uint8, device="cuda")
+        return a, w
+
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() not in _MXFP4_ASM_ARCHS:
+        assert not _mxfp4_asm_eligible(*_operands(2048, 28672, 4096))
+        pytest.skip(f"A4W4 ASM path is gfx950-only, running on {get_arch()}")
+
+    # Llama-8B MLP projections clear the weight-size threshold.
+    assert _mxfp4_asm_eligible(*_operands(2048, 28672, 4096))  # 56 MiB
+    assert _mxfp4_asm_eligible(*_operands(2048, 4096, 14336))  # 28 MiB
+
+    # The attention projections do not: the layout prologue is not amortised.
+    assert not _mxfp4_asm_eligible(*_operands(2048, 6144, 4096))  # 12 MiB
+    assert not _mxfp4_asm_eligible(*_operands(2048, 4096, 4096))  # 8 MiB
+
+    # N must tile by 16, and so must the packed K dim (K by 32).
+    assert not _mxfp4_asm_eligible(*_operands(2048, 28680, 4096))
+    assert not _mxfp4_asm_eligible(*_operands(2048, 28672, 4080))
+
+    # Untuned shapes must not reach the ASM path: aiter's default kernel choice
+    # returns garbage there (see _mxfp4_asm_tuned).
+    assert not _mxfp4_asm_tuned(64, 64, 128)
+    assert not _mxfp4_asm_eligible(*_operands(64, 64, 128))
+
+
+@pytest.mark.parametrize(
+    "rows,cols", [(2048, 128), (300, 128), (2048, 448)],
+    ids=["aligned", "odd_rows", "wide_k"],
+)
+def test_mxfp4_asm_scale_pad_and_swizzle_roundtrip(rows, cols):
+    """Padded+swizzled scales must round-trip, and keep the shape ASM indexes.
+
+    ``shuffle_scale_gemm`` natively returns ``(rows // 32, cols * 32)``; handing
+    that view to the ASM kernel reads out of bounds, so the helper has to fold it
+    back to the padded 2D shape.
+    """
+    _require_mxfp4_dtype()
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
+
+    arch = get_arch()
+    tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
+    if arch != "gfx950" or tiling is None:
+        pytest.skip(f"scale swizzle round-trip is gfx950-only, running on {arch}")
+
+    scale = torch.randint(100, 200, (rows, cols), dtype=torch.uint8, device="cuda")
+    swizzled = _pad_and_swizzle_mxfp4_scale(scale, arch, tiling)
+
+    rows_pad = -(-rows // 256) * 256
+    cols_pad = -(-cols // 8) * 8
+    assert swizzled.shape == (rows_pad, cols_pad)
+    assert swizzled.is_contiguous()
+
+    recovered = unshuffle_scale_gemm(
+        swizzled.reshape(rows_pad // 32, cols_pad * 32), arch=arch
+    )
+    torch.testing.assert_close(recovered[:rows, :cols], scale, atol=0, rtol=0)
+    # Padding must be zero-filled, not stale memory.
+    assert recovered[rows:].eq(0).all()
+    assert recovered[:, cols:].eq(0).all()
+
+
+def test_mxfp4_backends_are_interchangeable():
+    """Every available backend must be bit-identical, or autotune is unsafe.
+
+    Autotune picks a backend from a timing measurement, so if two backends
+    disagreed by even one ULP the numerics of a run would depend on which one
+    happened to be faster that day.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(19)
+    torch.cuda.manual_seed(19)
+
+    # Non-square, and small enough to stay quick, but still 16-tileable.
+    M, N, K = 2048, 4096, 14336
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    a_fp4, a_scales = convert_to_mxfp4(a_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+    w_fp4, w_scales = convert_to_mxfp4(w_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+
+    try:
+        ref = _gemm_mxfp4_aiter(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"AITER MXFP4 GEMM unavailable: {e}")
+
+    checked = 0
+    if _mxfp4_preshuffle_supported(a_fp4, w_fp4):
+        torch.testing.assert_close(
+            _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, a_scales, w_scales),
+            ref, atol=0, rtol=0,
+        )
+        checked += 1
+    if _mxfp4_asm_supported(a_fp4, w_fp4):
+        torch.testing.assert_close(
+            _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_scales, w_scales),
+            ref, atol=0, rtol=0,
+        )
+        checked += 1
+    assert checked, "no alternative backend was available to compare against"
+
+
+def test_mxfp4_autotune_picks_and_caches():
+    """Autotune must return a legal backend and reuse it on later calls."""
+    _require_mxfp4_dtype()
+    if not mxfp4_autotune.AUTOTUNE_ENABLED:
+        pytest.skip("LUMEN_MXFP4_AUTOTUNE=0 disables the path this test covers")
+
+    torch.manual_seed(23)
+    M, N, K = 2048, 4096, 14336
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    a_fp4, a_scales = convert_to_mxfp4(a_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+    w_fp4, w_scales = convert_to_mxfp4(w_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+
+    mxfp4_autotune.clear()
+    key = (M, N, K)
+    assert mxfp4_autotune.cached(key) is None
+
+    try:
+        chosen = _mxfp4_choose_backend(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"AITER MXFP4 GEMM unavailable: {e}")
+
+    assert chosen in ("asm", "shuffled", "plain")
+    assert mxfp4_autotune.cached(key) == chosen
+    # Second call must not re-measure.
+    assert _mxfp4_choose_backend(a_fp4, w_fp4, a_scales, w_scales) == chosen
+    mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_cache_roundtrip(tmp_path):
+    """A persisted decision is reused, and one from another GPU is not."""
+    cache = tmp_path / "autotune.json"
+    key = (8192, 12288, 4096)
+
+    mxfp4_autotune.clear()
+    original_path = mxfp4_autotune._CACHE_PATH
+    mxfp4_autotune._CACHE_PATH = str(cache)
+    try:
+        cache.write_text(json.dumps({
+            "arch": mxfp4_autotune._arch(),
+            "choices": {"8192,12288,4096": "asm"},
+        }))
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) == "asm"
+
+        # A cache measured elsewhere says nothing about this GPU.
+        mxfp4_autotune.clear()
+        cache.write_text(json.dumps({
+            "arch": "gfx000-not-a-real-arch",
+            "choices": {"8192,12288,4096": "asm"},
+        }))
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune._CACHE_PATH = original_path
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_configure_wires_tuned_table_and_cache(tmp_path):
+    """configure() sets both env knobs, defers to ones already set, and merges."""
+    cache = tmp_path / "autotune.json"
+    tuned = tmp_path / "tuned.csv"
+    tuned.write_text("gfx,cu_num,M,N,K,kernelId,splitK,us,kernelName,tflops,bw,errRatio\n")
+
+    original_env = os.environ.get(mxfp4_autotune.AITER_TUNED_CONFIG_ENV)
+    original_cache = mxfp4_autotune._CACHE_PATH
+    os.environ.pop(mxfp4_autotune.AITER_TUNED_CONFIG_ENV, None)
+    mxfp4_autotune._CACHE_PATH = ""
+    mxfp4_autotune.clear()
+    try:
+        applied = mxfp4_autotune.configure(
+            tuned_config=str(tuned), autotune_cache=str(cache)
+        )
+        assert str(tuned) in applied["tuned_config"]
+        assert applied["autotune_cache"] == str(cache)
+        # AITER's own table has to stay in the list; the two cover different shapes.
+        assert applied["tuned_config"].count(":") >= 1
+
+        # A second call must not stomp what is already configured.
+        other = tmp_path / "other.csv"
+        other.write_text("gfx\n")
+        again = mxfp4_autotune.configure(tuned_config=str(other))
+        assert str(other) not in again["tuned_config"]
+
+        # A path that does not exist is reported, not silently written in.
+        os.environ.pop(mxfp4_autotune.AITER_TUNED_CONFIG_ENV, None)
+        missing = mxfp4_autotune.configure(tuned_config=str(tmp_path / "nope.csv"))
+        assert missing["tuned_config"] == ""
+    finally:
+        if original_env is None:
+            os.environ.pop(mxfp4_autotune.AITER_TUNED_CONFIG_ENV, None)
+        else:
+            os.environ[mxfp4_autotune.AITER_TUNED_CONFIG_ENV] = original_env
+        mxfp4_autotune._CACHE_PATH = original_cache
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_shape_log_records_all_three_gemms(tmp_path):
+    """The collector must see fprop, dgrad and wgrad from a single linear.
+
+    This is what makes tuning generalise: the backward shapes permute the dims
+    (a wgrad's M is the output width, its K is the token count) and are easy to
+    derive wrongly by hand.
+    """
+    _require_mxfp4_dtype()
+    from lumen.ops.quantize.linear import quantized_linear
+
+    log = tmp_path / "shapes.csv"
+    mxfp4_autotune.clear()
+    original = mxfp4_autotune._SHAPE_LOG_PATH
+    mxfp4_autotune._SHAPE_LOG_PATH = str(log)
+    try:
+        M, N, K = 1024, 768, 512
+        x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        quantized_linear(x, w, scaling_type="mxfp4").sum().backward()
+        mxfp4_autotune._save_shape_log()
+
+        seen = {
+            (int(r["M"]), int(r["N"]), int(r["K"]))
+            for r in csv.DictReader(log.open())
+        }
+    finally:
+        mxfp4_autotune._SHAPE_LOG_PATH = original
+        mxfp4_autotune.clear()
+
+    assert (M, N, K) in seen, f"fprop shape missing from {seen}"
+    assert (M, K, N) in seen, f"dgrad shape missing from {seen}"
+    assert (N, K, M) in seen, f"wgrad shape missing from {seen}"
 
 
 @pytest.mark.parametrize(

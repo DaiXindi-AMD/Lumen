@@ -184,6 +184,25 @@ class AlpacaDataset(Dataset):
         return {"input_ids": torch.LongTensor(ids), "loss_mask": torch.LongTensor(mask)}
 
 
+_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+
+
+def _configure_mxfp4_dispatch():
+    """Hand Lumen the Qwen3 tuned A4W4 table before the first MXFP4 GEMM.
+
+    Widens which shapes can reach the prebuilt ASM kernels. Every MXFP4 backend
+    is bit-identical, so this affects speed only. Skipped if the environment
+    variable is already set.
+    """
+    from lumen.ops.quantize import mxfp4_autotune
+
+    applied = mxfp4_autotune.configure(
+        tuned_config=os.path.join(_CONFIG_DIR, "a4w4_blockscale_tuned_gemm.csv"),
+        autotune_cache=os.environ.get("LUMEN_MXFP4_AUTOTUNE_CACHE") or None,
+    )
+    rank0(f"> MXFP4 tuned config: {applied['tuned_config'] or '(aiter default)'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model-name-or-path", required=True)
@@ -270,6 +289,7 @@ def main():
     # ---- Lumen LoRA (+ optional quantised linears) ----
     # mode=bf16 -> LoRA only; fp8_blockwise2d -> FP8 128×128; mxfp4 -> MXFP4 32×32.
     if args.mode == "mxfp4":
+        _configure_mxfp4_dispatch()
         use_fp8, fmt, scaling, blk = True, "mxfp4", "blockwise", 32
     elif args.mode == "fp8_blockwise2d":
         use_fp8, fmt, scaling, blk = True, "fp8_e4m3", args.fp8_scaling, 128

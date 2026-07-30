@@ -136,6 +136,30 @@ def build_dataloaders(args, tokenizer, global_rank, world_size):
 # Main
 # ---------------------------------------------------------------------------
 
+_CONFIG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "configs")
+
+
+def _configure_mxfp4_dispatch(args):
+    """Hand Lumen the Qwen3 tuned A4W4 table and a place to keep autotune results.
+
+    The table only widens which shapes can reach the prebuilt ASM kernels; every
+    MXFP4 backend produces bit-identical output, so this changes speed and nothing
+    else. The autotune cache mainly buys reproducibility: a few shapes sit close
+    enough to the switch margin that two processes can otherwise rank the backends
+    differently.
+
+    Both are skipped if the corresponding environment variable is already set.
+    """
+    from lumen.ops.quantize import mxfp4_autotune
+
+    applied = mxfp4_autotune.configure(
+        tuned_config=os.path.join(_CONFIG_DIR, "a4w4_blockscale_tuned_gemm.csv"),
+        autotune_cache=args.mxfp4_autotune_cache or None,
+    )
+    rank0(f"> MXFP4 tuned config: {applied['tuned_config'] or '(aiter default)'}")
+    rank0(f"> MXFP4 autotune cache: {applied['autotune_cache'] or '(not persisted)'}")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B",
@@ -154,6 +178,9 @@ def main():
     p.add_argument("--sharding", choices=["full_shard", "shard_grad_op"], default="full_shard")
     p.add_argument("--fsdp-version", type=int, choices=[1, 2], default=2)
     p.add_argument("--aiter-attn", action="store_true")
+    p.add_argument("--mxfp4-autotune-cache", type=str, default="",
+                   help="JSON file to persist which GEMM backend won per shape, so "
+                        "the choice is reproducible across runs (mxfp4 mode only)")
     p.add_argument("--lumen-norm", action="store_true")
     p.add_argument("--fuse-rope", action="store_true")
     p.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false")
@@ -209,6 +236,7 @@ def main():
 
     # --- Lumen quantization ---
     if args.mode == "mxfp4":
+        _configure_mxfp4_dispatch(args)
         use_quant, fmt, scaling, blk = True, "mxfp4", "blockwise", 32
     elif args.mode == "fp8_blockwise2d":
         use_quant, fmt, scaling, blk = True, "fp8_e4m3", "blockwise2d", 128
