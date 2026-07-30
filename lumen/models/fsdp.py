@@ -524,6 +524,48 @@ def _wrap_frozen_base_as_blockwise2d_fp8(
     return count
 
 
+def _wrap_params_as_mxfp4_comm(
+    model: nn.Module, block_size: int = 32, world_size: int = 1
+) -> int:
+    """Wrap each MXFP4-patched weight in an MXFP4CommTensor for FP4 all-gather.
+
+    The wrapper holds the BF16 master weight. FSDP2 shards it like any BF16
+    param. During all-gather, the local shard is quantized to packed MXFP4
+    (4x less bytes on the wire), then dequantized back to BF16 after gather.
+    Optimizer and gradients see normal BF16 — only communication is compressed.
+
+    Works for both trainable and frozen weights.
+
+    Alignment: ``N % (block_size × world_size) == 0`` and ``K % block_size == 0``.
+    """
+    from lumen.quantize.comm_tensor import MXFP4CommTensor
+
+    count = 0
+    skipped = 0
+    for module in model.modules():
+        if not getattr(module, "_quant_enabled", False):
+            continue
+        if getattr(module, "_quant_scaling_type", None) != "mxfp4":
+            continue
+        w = getattr(module, "weight", None)
+        if w is None or not isinstance(w, nn.Parameter) or w.dim() != 2:
+            continue
+        if isinstance(w, MXFP4CommTensor):
+            continue
+        if w.shape[0] % (block_size * world_size) or w.shape[1] % block_size:
+            skipped += 1
+            continue
+        module.weight = nn.Parameter(
+            MXFP4CommTensor(w.data, block_size), requires_grad=w.requires_grad,
+        )
+        count += 1
+    if skipped:
+        _rank0_print(
+            f"> MXFP4CommTensor: skipped {skipped} weights (alignment) — kept BF16"
+        )
+    return count
+
+
 def apply_fsdp2(
     model: nn.Module,
     args,
@@ -563,13 +605,12 @@ def apply_fsdp2(
     world_size = dist.get_world_size(dp_group) if dp_group is not None else dist.get_world_size()
     mesh = init_device_mesh("cuda", (world_size,))
 
-    if getattr(args, "fsdp_fp8_param_storage", False):
-        # param_dtype MUST stay None here: a non-None param_dtype makes FSDP2 cast
-        # every param (incl. the frozen FP8 Blockwise2DFP8Param) to that dtype before
-        # sharding, which collapses the FP8 subclass to a plain BF16 DTensor and
-        # bypasses its all-gather extension (the scale is then never applied). With
-        # param_dtype=None each param keeps its own dtype — FP8 base stays FP8 (its
-        # extension drives the all-gather), LoRA adapters stay BF16.
+    _use_mxfp4_comm = getattr(args, "fsdp_mxfp4_comm", False)
+
+    if _use_mxfp4_comm:
+        # Same as fsdp_fp8_param_storage: param_dtype=None preserves subclass
+        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32)
+    elif getattr(args, "fsdp_fp8_param_storage", False):
         mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32)
     elif getattr(args, "linear_fp8", False):
         mp_policy = MixedPrecisionPolicy(
@@ -595,6 +636,10 @@ def apply_fsdp2(
         fp8_dtype = _get_float8_e4m3()
         n_stored = _wrap_frozen_base_as_blockwise2d_fp8(model, fp8_dtype, world_size=world_size)
         _rank0_print(f"> Blockwise2DFP8Param storage: {n_stored} frozen base weights")
+
+    if _use_mxfp4_comm:
+        n_mxfp4 = _wrap_params_as_mxfp4_comm(model, block_size=32, world_size=world_size)
+        _rank0_print(f"> MXFP4CommTensor wrapping: {n_mxfp4} weights (4x comm reduction)")
 
     sharded_layers = False
     for module in model.modules():

@@ -1657,15 +1657,14 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_desc.scale,
             )
         elif scaling_type == "mxfp4":
-            # MXFP4: save activation FP4 + pre-transposed weight FP4 for
-            # backward.  The FP4 tensors are freshly allocated by
-            # quantize_input (not views of the BF16 param), so they
-            # survive FSDP2 resharding.  We pre-transpose the weight here
-            # to move work off the backward critical path, and save the
-            # transposed form (not the original) since DGrad only needs W^T.
-            from lumen.ops.quantize.ops import transpose_packed_fp4
-            w_fp4_t = transpose_packed_fp4(weight_desc.data)
-            w_scale_t = weight_desc.scale.t().contiguous()
+            # Reuse pre-transposed weight from module cache if available.
+            _wt_cached = getattr(weight_desc.data, "_mxfp4_wt_cached", None)
+            if _wt_cached is not None:
+                w_fp4_t, w_scale_t = _wt_cached
+            else:
+                from lumen.ops.quantize.ops import transpose_packed_fp4
+                w_fp4_t = transpose_packed_fp4(weight_desc.data)
+                w_scale_t = weight_desc.scale.t().contiguous()
             ctx.save_for_backward(
                 input_desc.data,
                 input_desc.scale,
@@ -2050,6 +2049,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             from lumen.ops.quantize.ops import (
                 convert_from_mxfp4,
                 convert_to_mxfp4,
+                dequant_transpose_mxfp4,
                 hadamard_quant_mxfp4,
             )
 
@@ -2081,17 +2081,15 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     rht_g = _MXFP4_RHT_G
                     _rht_ok = (M % rht_g == 0)
 
-                    input_bf16 = convert_from_mxfp4(
-                        input_data, input_scale,
-                        output_dtype=torch.bfloat16, block_size=mxfp4_block,
-                    )
-
-                    # Left as views: hadamard_quant_mxfp4 indexes through both
-                    # strides, so it can read the transpose directly. Materialising
-                    # these two was ~85 ms of every Qwen3-8B step, more than all
-                    # the MXFP4 GEMMs put together.
+                    # Left as a view: hadamard_quant_mxfp4 indexes through both
+                    # strides, so it reads the transpose directly and the
+                    # (N_out, M) copy never happens.
                     grad_t = grad_flat.t()
-                    input_t = input_bf16.t()
+                    # Fused, so no separate BF16 (M, K) dequant buffer is written.
+                    # It also lands dense, which the non-RHT quantizer below needs.
+                    input_t = dequant_transpose_mxfp4(
+                        input_data, input_scale, block_size=mxfp4_block,
+                    )
 
                     if _rht_ok:
                         sign_m = _get_mxfp4_rht_sign(grad_flat.device)
@@ -2111,7 +2109,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                             grad_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
                         )
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=False,
+                            input_t, block_size=mxfp4_block, axis=-1, use_sr=False,
                         )
 
                     def _compute_wgrad():

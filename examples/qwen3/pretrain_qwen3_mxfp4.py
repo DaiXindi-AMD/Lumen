@@ -288,6 +288,7 @@ def main():
         apply_fsdp2(model, Namespace(
             linear_fp8=use_quant, sharding_strategy=args.sharding,
             fsdp_fp8_param_storage=False,
+            fsdp_mxfp4_comm=(args.mode == "mxfp4"),
         ))
         rank0(f"> FSDP2 ready (sharding={args.sharding})")
     else:
@@ -308,6 +309,10 @@ def main():
 
     # --- Optimizer + scheduler ---
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95), eps=1e-8, weight_decay=args.weight_decay)
+    if args.mode == "mxfp4":
+        from lumen.quantize import register_mxfp4_weight_optimizer_hooks
+        register_mxfp4_weight_optimizer_hooks(model, opt)
+        rank0("> MXFP4 weight cache enabled (invalidated on opt.step)")
     def lr_lambda(step):
         w, T = args.lr_warmup_steps, args.max_steps
         if step < w:
