@@ -959,6 +959,45 @@ _MXFP4_SCALE_SHUFFLE_TILING = {
 # The B operand shuffle emits (N // 16) tiles, so N must be a multiple of 16.
 _MXFP4_SHUFFLE_N_MULTIPLE = 16
 
+# Below this the shuffle is launch-bound, so the vectorized form in
+# ``_shuffle_mxfp4_weight`` has nothing to win and measures ~2us slower on
+# gfx950. Above it the gap grows the other way (24us vs 42us at 12 MiB).
+_MXFP4_WIDE_SHUFFLE_MIN_BYTES = 4 << 20
+
+
+def _shuffle_mxfp4_weight(w_fp4, arch=None):
+    """AITER's ``layout=(16, 16)`` B-operand shuffle, over wider elements.
+
+    The permutation leaves the innermost 16 bytes contiguous in both source and
+    destination, so it is really a transpose of 16-byte units. AITER expresses
+    it over a uint8 view, which moves one byte per element and stalls near
+    1.2 TB/s; viewing the same bytes as int64 lets the copy vectorize and runs
+    at 2.1-3.5 TB/s on the large weights. Bit-exact with AITER either way.
+
+    Falls back to AITER for gfx1250 (which uses a different WMMA layout), for
+    unaligned or non-contiguous operands, and for small weights.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    dtype = w_fp4.dtype
+    w = w_fp4
+    if hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2:
+        w = w.view(torch.uint8)
+    if (
+        arch == "gfx1250"
+        or w.ndim != 2
+        or not w.is_contiguous()
+        or w.numel() < _MXFP4_WIDE_SHUFFLE_MIN_BYTES
+        or w.shape[0] % _MXFP4_SHUFFLE_N_MULTIPLE
+        or w.shape[1] % 32
+    ):
+        return shuffle_weight(w_fp4, layout=(16, 16))
+
+    n, kp = w.shape
+    wide = w.view(torch.int64).view(n // 16, 16, kp // 32, 2, 2)
+    wide = wide.permute(0, 2, 3, 1, 4).contiguous()
+    return wide.view(torch.uint8).view(n, kp).view(dtype)
+
 # Measured on gfx950 (MI350X): the shuffled-layout kernel overtakes the plain one
 # once the packed FP4 weight passes ~16 MiB, where the GEMM turns weight-streaming
 # bound and coalesced tile reads start to pay for the shuffle prologue. Below that
@@ -996,7 +1035,6 @@ def _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w):
     Same math as ``_gemm_mxfp4_aiter``; the B operand and both scale tensors are
     rewritten into the tiled layout the kernel reads coalesced.
     """
-    from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
     from aiter.ops.triton.utils._triton.arch_info import get_arch
     from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
@@ -1010,7 +1048,7 @@ def _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w):
     sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
     sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
 
-    w_shuf = shuffle_weight(w_fp4, layout=(16, 16)).reshape(
+    w_shuf = _shuffle_mxfp4_weight(w_fp4, arch=arch).reshape(
         w_fp4.shape[0] // _MXFP4_SHUFFLE_N_MULTIPLE,
         w_fp4.shape[1] * _MXFP4_SHUFFLE_N_MULTIPLE,
     )
@@ -1107,8 +1145,17 @@ def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
     rows, cols = scale.shape
     rows_pad = -(-rows // _MXFP4_ASM_SCALE_ROW_MULTIPLE) * _MXFP4_ASM_SCALE_ROW_MULTIPLE
     cols_pad = -(-cols // _MXFP4_ASM_SCALE_COL_MULTIPLE) * _MXFP4_ASM_SCALE_COL_MULTIPLE
-    padded = torch.zeros((rows_pad, cols_pad), dtype=scale.dtype, device=scale.device)
-    padded[:rows, :cols] = scale
+    if (rows, cols) == (rows_pad, cols_pad):
+        # Training shapes are almost always aligned already (rows is the token
+        # count or a hidden dim, cols is K/32). Allocating and filling a copy
+        # that is byte-identical to the input costs ~17us of launch overhead per
+        # scale, which is real money next to a ~250us GEMM.
+        padded = scale if scale.is_contiguous() else scale.contiguous()
+    else:
+        padded = torch.zeros(
+            (rows_pad, cols_pad), dtype=scale.dtype, device=scale.device
+        )
+        padded[:rows, :cols] = scale
 
     preshuffle_factor, scale_kwidth = tiling
     shuffled = shuffle_scale_gemm(
@@ -1128,7 +1175,6 @@ def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
     and CK kernels, and slices the row-padded output back to M.
     """
     import aiter
-    from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
     arch = get_arch()
@@ -1141,7 +1187,7 @@ def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
 
     return aiter.gemm_a4w4(
         a_fp4,
-        shuffle_weight(w_fp4, layout=(16, 16)),
+        _shuffle_mxfp4_weight(w_fp4, arch=arch),
         _pad_and_swizzle_mxfp4_scale(sa, arch, tiling),
         _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
         dtype=torch.bfloat16,

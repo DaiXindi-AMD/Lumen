@@ -53,7 +53,9 @@ from lumen.ops.quantize.linear import (
     _mxfp4_choose_backend,
     _mxfp4_preshuffle_eligible,
     _mxfp4_preshuffle_supported,
+    _MXFP4_WIDE_SHUFFLE_MIN_BYTES,
     _pad_and_swizzle_mxfp4_scale,
+    _shuffle_mxfp4_weight,
     gemm_mxfp4_dispatch,
 )
 
@@ -1065,6 +1067,84 @@ def test_mxfp4_backends_are_interchangeable():
         )
         checked += 1
     assert checked, "no alternative backend was available to compare against"
+
+
+@pytest.mark.parametrize(
+    "n,k",
+    [
+        (12288, 4096),   # above the size gate, takes the wide-view path
+        (4096, 12288),
+        (3072, 1024),    # below the gate, falls back to AITER
+        (48, 128),       # tiny, still has to agree
+    ],
+)
+def test_mxfp4_weight_shuffle_matches_aiter(n, k):
+    """The vectorized B-operand shuffle must be byte-identical to AITER's.
+
+    It reinterprets the packed-fp4 bytes as int64 to let the copy vectorize, so
+    any mistake in the reshape would silently feed the ASM kernel a wrong but
+    plausible-looking weight layout.
+    """
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(5)
+    w = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device="cuda")
+
+    ref = shuffle_weight(w, layout=(16, 16)).view(torch.uint8)
+    got = _shuffle_mxfp4_weight(w).view(torch.uint8)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+def test_mxfp4_weight_shuffle_falls_back_when_wide_view_invalid():
+    """Non-contiguous, unaligned, and gfx1250 operands must take AITER's path."""
+    from aiter.ops.shuffle import shuffle_weight
+
+    torch.manual_seed(6)
+    n, kp = 4096, 4096  # 16 MiB, comfortably over the size gate
+    w = torch.randint(0, 256, (n, kp), dtype=torch.uint8, device="cuda")
+    ref = shuffle_weight(w, layout=(16, 16)).view(torch.uint8)
+
+    # gfx1250 uses a different WMMA layout, so the wide view would be wrong.
+    torch.testing.assert_close(
+        _shuffle_mxfp4_weight(w, arch="gfx1250").view(torch.uint8), ref, atol=0, rtol=0
+    )
+
+    non_contig = torch.randint(
+        0, 256, (n, kp * 2), dtype=torch.uint8, device="cuda"
+    )[:, :kp]
+    assert not non_contig.is_contiguous()
+    torch.testing.assert_close(
+        _shuffle_mxfp4_weight(non_contig).view(torch.uint8),
+        shuffle_weight(non_contig, layout=(16, 16)).view(torch.uint8),
+        atol=0, rtol=0,
+    )
+
+    assert n * kp >= _MXFP4_WIDE_SHUFFLE_MIN_BYTES
+
+
+def test_mxfp4_aligned_scale_swizzle_does_not_alias_input():
+    """The aligned fast path must still hand back storage of its own.
+
+    It skips the padded copy that used to guarantee a fresh buffer, so an
+    accidental view would let a caller's scale tensor be corrupted downstream.
+    """
+    _require_mxfp4_dtype()
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    arch = get_arch()
+    tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
+    if arch != "gfx950" or tiling is None:
+        pytest.skip(f"scale swizzle is gfx950-only, running on {arch}")
+
+    torch.manual_seed(7)
+    scale = torch.randint(0, 256, (512, 128), dtype=torch.uint8, device="cuda")
+    before = scale.clone()
+
+    out = _pad_and_swizzle_mxfp4_scale(scale, arch, tiling)
+    assert out.data_ptr() != scale.data_ptr()
+
+    out.fill_(0)
+    torch.testing.assert_close(scale, before, atol=0, rtol=0)
 
 
 def test_mxfp4_autotune_picks_and_caches():
