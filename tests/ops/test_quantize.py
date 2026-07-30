@@ -1103,6 +1103,36 @@ def test_hadamard_quant_reads_transpose_without_materialising(rows, cols):
     torch.testing.assert_close(got_scale, ref_scale, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("m,n,k", [(1024, 768, 512), (2048, 1024, 1024), (512, 512, 256)])
+def test_mxfp4_backward_gradients_track_the_bf16_reference(m, n, k):
+    """Both gradients must stay close to the BF16 reference.
+
+    The wgrad path feeds its two operands through different routes — the
+    gradient as a strided view of grad_flat, the activation through the fused
+    dequant+transpose kernel — and a mix-up between them still produces
+    plausibly-shaped output. Measured SNR sits near 12.9 dB (dW) and 13.7 dB
+    (dX); the floor here is well under that but far above the near-zero SNR a
+    transposed or mismatched operand would give.
+    """
+    _require_mxfp4_dtype()
+    from lumen.ops.quantize.linear import quantized_linear
+
+    torch.manual_seed(0)
+    x = (torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.05).requires_grad_(True)
+    w = (torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02).requires_grad_(True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    w_ref = w.detach().clone().requires_grad_(True)
+    grad_out = torch.randn(m, n, device="cuda", dtype=torch.bfloat16) * 0.1
+
+    quantized_linear(x, w, scaling_type="mxfp4").backward(grad_out)
+    torch.nn.functional.linear(x_ref, w_ref).backward(grad_out)
+
+    assert w.grad is not None, "backward did not populate the weight grad"
+    assert x.grad is not None, "backward did not populate the input grad"
+    assert compute_snr(w_ref.grad, w.grad) > 11.0
+    assert compute_snr(x_ref.grad, x.grad) > 11.0
+
+
 @pytest.mark.parametrize(
     "n,k",
     [

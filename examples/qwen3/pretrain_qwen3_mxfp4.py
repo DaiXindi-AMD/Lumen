@@ -178,6 +178,10 @@ def main():
     p.add_argument("--sharding", choices=["full_shard", "shard_grad_op"], default="full_shard")
     p.add_argument("--fsdp-version", type=int, choices=[1, 2], default=2)
     p.add_argument("--aiter-attn", action="store_true")
+    p.add_argument("--no-mxfp4-comm", action="store_true",
+                   help="Keep the FSDP2 all-gather in BF16 instead of FP4. The FP4 "
+                        "gather moves 4x fewer bytes but pays a dequant afterwards, "
+                        "so which side wins is worth measuring per setup.")
     p.add_argument("--mxfp4-autotune-cache", type=str, default="",
                    help="JSON file to persist which GEMM backend won per shape, so "
                         "the choice is reproducible across runs (mxfp4 mode only)")
@@ -288,7 +292,7 @@ def main():
         apply_fsdp2(model, Namespace(
             linear_fp8=use_quant, sharding_strategy=args.sharding,
             fsdp_fp8_param_storage=False,
-            fsdp_mxfp4_comm=(args.mode == "mxfp4"),
+            fsdp_mxfp4_comm=(args.mode == "mxfp4" and not args.no_mxfp4_comm),
         ))
         rank0(f"> FSDP2 ready (sharding={args.sharding})")
     else:
