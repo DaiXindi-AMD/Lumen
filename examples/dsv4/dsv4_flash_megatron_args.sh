@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
-# DSV4 Flash 4-layer Megatron model + training args (sourced by run_dsv4_pretrain_inner.sh).
+# DSV4 Flash full model (43 layers) Megatron args — sourced by run_dsv4_pretrain_full_inner.sh.
 #
-# Lumen pretrain smoke default GBS=8 (Miles GRPO smoke uses GBS=256 via rollout 32×8).
+# Ported from miles/scripts/models/deepseek-v4-flash.sh with Lumen spec module.
 
-NLAYERS=4
-DSV4_HC_MULT="${DSV4_HC_MULT:-2}"
-COMPRESS_RATIOS=(0 0 4 128)
+NLAYERS=43
+DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
+COMPRESS_RATIOS=(
+    0 0 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128
+    4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 128 4 0
+)
 LUMEN_DSV4_SPEC_MODULE="${LUMEN_DSV4_SPEC_MODULE:-lumen.models.dsv4.megatron.spec}"
 LUMEN_DSV4_SPEC_FN="${LUMEN_DSV4_SPEC_FN:-get_dsv4_spec}"
 
-MOE_LAYER_FREQ="[1,1,1,1]"
+MOE_LAYER_FREQ="[$(printf '1%.0s,' $(seq 1 "${NLAYERS}") | sed 's/,$//')]"
 
+# Lumen pretrain smoke default GBS=8 (fast iteration; override via env GBS=...).
 GBS="${GBS:-8}"
 MBS="${MBS:-1}"
-# Mock pretrain uses fixed seq_len (default 2048).
 SEQ_LEN="${SEQ_LEN:-2048}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-2048}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-1024}"
 
 DSV4_MODEL_ARGS=(
     --disable-bias-linear
@@ -29,6 +32,7 @@ DSV4_MODEL_ARGS=(
     --swiglu
     --untie-embeddings-and-output-weights
     --vocab-size 129280
+    --make-vocab-size-divisible-by 32
     --hidden-dropout 0.0
     --attention-dropout 0.0
 
@@ -80,10 +84,3 @@ DSV4_MODEL_ARGS=(
     --no-bias-swiglu-fusion
     --no-activation-func-clamp-shared-expert
 )
-
-# Parallel layout for 8×MI308X smoke (torchrun flags in run_dsv4_pretrain_inner.sh).
-TP=8
-PP=1
-CP=1
-EP=8
-ETP=1

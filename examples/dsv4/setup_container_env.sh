@@ -28,8 +28,22 @@ setup_dsv4_container_env() {
     fi
 
     if [[ -f examples/dsv4/patch_mi308x_tile_kernels.py && -n "${SITE_PKGS:-}" ]]; then
-        python3 examples/dsv4/patch_mi308x_tile_kernels.py "${SITE_PKGS}/tile_kernels" "${patch_miles}"
+        TK_PATCH="${SITE_PKGS}/tile_kernels"
+        if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
+            TK_PATCH="${TILEKERNELS_DIR}/tile_kernels"
+        fi
+        if [[ "${MHC_BACKEND:-triton}" == "tilelang" ]]; then
+            python3 examples/dsv4/patch_mi308x_tile_kernels.py "${TK_PATCH}" "${patch_miles}"
+        else
+            echo "[setup] skip MI308X tilelang MHC patches (MHC_BACKEND=${MHC_BACKEND:-triton})"
+        fi
     elif [[ -f /workspace/miles/docker/patch_mi308x_tile_kernels.py ]]; then
         python3 /workspace/miles/docker/patch_mi308x_tile_kernels.py /workspace/miles
+    fi
+
+    local datasets_dir="${MEGATRON_PATH}/megatron/core/datasets"
+    if [[ -d "${datasets_dir}" ]] && ! compgen -G "${datasets_dir}/helpers_cpp*.so" >/dev/null; then
+        echo "[setup] building Megatron helpers_cpp in ${datasets_dir} ..."
+        make -C "${datasets_dir}" -j"$(nproc)"
     fi
 }

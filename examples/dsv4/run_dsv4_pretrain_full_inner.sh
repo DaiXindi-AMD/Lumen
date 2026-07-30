@@ -1,48 +1,59 @@
 #!/usr/bin/env bash
-# Inner container entry for run_dsv4_pretrain.sh (sourced config + torchrun).
+# Inner container entry for run_dsv4_pretrain_full.sh (2-node full Flash pretrain smoke).
 set -euo pipefail
 
 cd /workspace/Lumen
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export HSA_OVERRIDE_GFX_VERSION="${HSA_OVERRIDE_GFX_VERSION:-9.4.2}"
 
 TRAIN_ITERS="${TRAIN_ITERS:-10}"
-MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8-4layer}"
+MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
 LOAD_CKPT="${LOAD_CKPT:-0}"
+NNODES="${NNODES:-2}"
+NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
+NODE_RANK="${NODE_RANK:-0}"
+MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR required}"
+MASTER_PORT="${MASTER_PORT:-29500}"
+OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
+DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 
-source examples/dsv4/dsv4_4layer_megatron_args.sh
-# DSV4_HC_MULT / GBS / MBS / SEQ_LEN come from dsv4_4layer_megatron_args.sh
+# shellcheck source=examples/dsv4/dsv4_flash_megatron_args.sh
+source examples/dsv4/dsv4_flash_megatron_args.sh
+# shellcheck source=examples/dsv4/dsv4_flash_mi300x_parallel.sh
+source examples/dsv4/dsv4_flash_mi300x_parallel.sh
 
 export LUMEN_DSV4_PRETRAIN=1
 # shellcheck source=examples/dsv4/setup_container_env.sh
 source examples/dsv4/setup_container_env.sh
 setup_dsv4_container_env /workspace/miles
 
-CKPT="/root/models/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
+CKPT="/root/models/${MODEL_NAME}_torch_dist"
 if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
-    FALLBACK="/root/models/${MODEL_NAME}_torch_dist"
+    FALLBACK="/root/models/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
     if [[ -f "${FALLBACK}/latest_checkpointed_iteration.txt" ]]; then
         echo "[prepare] using fallback checkpoint ${FALLBACK}"
         CKPT="${FALLBACK}"
     fi
 fi
+
 if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     if [[ ! -d /workspace/miles ]]; then
-        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_checkpoint.py"
+        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_full_checkpoint.py"
         exit 1
     fi
     export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
-    DSV4_HC_MULT="${DSV4_HC_MULT}" python examples/dsv4/prepare_dsv4_checkpoint.py
+    python examples/dsv4/prepare_dsv4_full_checkpoint.py
 else
-    echo "[prepare] torch_dist checkpoint already present — skipping"
+    echo "[prepare] torch_dist checkpoint already present — skipping (path=${CKPT})"
 fi
 
 LOAD_ARGS=()
 if [[ "${LOAD_CKPT}" == "1" && -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     LOAD_ARGS=(--load "${CKPT}" --no-load-optim --no-load-rng)
-    echo "[pretrain] loading checkpoint ${CKPT} (dsv4-hc-mult=${DSV4_HC_MULT})"
+    echo "[pretrain-full] loading checkpoint ${CKPT}"
 else
-    echo "[pretrain] training from random init (LOAD_CKPT=${LOAD_CKPT})"
+    echo "[pretrain-full] training from random init (LOAD_CKPT=${LOAD_CKPT})"
 fi
 
 RECOMPUTE_ARGS=()
@@ -54,9 +65,17 @@ if [[ "${DSV4_ENABLE_RECOMPUTE:-1}" == "1" ]]; then
     )
 fi
 
-echo "[pretrain] launching torchrun (native Megatron, no Ray) ..."
-echo "[pretrain] batch: GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN} (hc_mult=${DSV4_HC_MULT})"
-torchrun --nproc_per_node=8 --nnodes=1 \
+echo "[pretrain-full] launching torchrun ${NNODES}×${NPROC_PER_NODE} (node_rank=${NODE_RANK}) ..."
+echo "[pretrain-full] parallel: TP=${TP} PP=${PP} EP=${EP} | batch GBS=${GBS} MBS=${MBS} seq=${SEQ_LEN}"
+echo "[pretrain-full] optimizer CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+echo "[pretrain-full] CPU memory: num_workers=0, pin_cpu_grads/params=off (mock-data smoke)"
+
+torchrun \
+    --nnodes="${NNODES}" \
+    --nproc_per_node="${NPROC_PER_NODE}" \
+    --node_rank="${NODE_RANK}" \
+    --master_addr="${MASTER_ADDR}" \
+    --master_port="${MASTER_PORT}" \
     examples/dsv4/pretrain_dsv4.py \
     "${DSV4_MODEL_ARGS[@]}" \
     --transformer-impl local \
@@ -65,6 +84,8 @@ torchrun --nproc_per_node=8 --nnodes=1 \
     --freeze-e-score-correction-bias \
     --tensor-model-parallel-size "${TP}" \
     --pipeline-model-parallel-size "${PP}" \
+    --decoder-first-pipeline-num-layers "${DECODER_FIRST_PP_LAYERS}" \
+    --decoder-last-pipeline-num-layers "${DECODER_LAST_PP_LAYERS}" \
     --context-parallel-size "${CP}" \
     --expert-model-parallel-size "${EP}" \
     --expert-tensor-parallel-size "${ETP}" \
@@ -76,12 +97,19 @@ torchrun --nproc_per_node=8 --nnodes=1 \
     --max-position-embeddings "${SEQ_LEN}" \
     --train-iters "${TRAIN_ITERS}" \
     --mock-data \
+    --num-workers 0 \
+    --no-pin-cpu-grads \
+    --no-pin-cpu-params \
     --split 100,0,0 \
     --bf16 \
     --no-gradient-accumulation-fusion \
     --accumulate-allreduce-grads-in-fp32 \
     --use-distributed-optimizer \
     --optimizer adam \
+    --optimizer-cpu-offload \
+    --use-precision-aware-optimizer \
+    --overlap-cpu-optimizer-d2h-h2d \
+    --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION}" \
     --lr 1e-6 \
     --lr-decay-style constant \
     --weight-decay 0.1 \
@@ -92,8 +120,9 @@ torchrun --nproc_per_node=8 --nnodes=1 \
     --save-interval 1000000 \
     --eval-interval 1000000 \
     --eval-iters "${EVAL_ITERS:-1}" \
+    --distributed-timeout-minutes "${DISTRIBUTED_TIMEOUT_MINUTES}" \
     "${LOAD_ARGS[@]}" \
     --distributed-backend nccl
 
 echo ""
-echo "=== [done] Lumen DSV4 Megatron pretrain smoke completed ==="
+echo "=== [done] Lumen DSV4 Flash full-model pretrain smoke completed (node_rank=${NODE_RANK}) ==="

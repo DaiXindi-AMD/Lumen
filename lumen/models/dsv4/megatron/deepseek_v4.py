@@ -45,14 +45,11 @@ from lumen.models.dsv4.ops import (
     get_freqs_cis_for_cp,
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
-    sparse_attn_tilelang,
     wrapped_precompute_freqs_cis,
 )
+from lumen.models.dsv4.ops.sparse_mla_backend import get_sparse_attn_fn
 
-if os.environ.get("V4_SPARSE_MLA_BACKEND", "tilelang") == "triton":
-    from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton as _sparse_attn_fn
-else:
-    _sparse_attn_fn = sparse_attn_tilelang
+_sparse_attn_fn = get_sparse_attn_fn()
 
 
 def _enable_deepseek_v4_tf32():

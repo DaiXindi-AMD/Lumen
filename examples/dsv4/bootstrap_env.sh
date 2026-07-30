@@ -5,6 +5,8 @@ set -euo pipefail
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/bootstrap}"
 MILES_DIR="${MILES_DIR:-/workspace/miles}"
 LUMEN_DIR="${LUMEN_DIR:-/workspace/Lumen}"
+AITER_ROOT="${AITER_ROOT:-${LUMEN_DIR}/third_party/aiter}"
+TILEKERNELS_DIR="${TILEKERNELS_DIR:-}"
 WRITABLE_ROOT="${WRITABLE_ROOT:-/tmp/lumen-dsv4-runtime}"
 LUMEN_DSV4_PRETRAIN="${LUMEN_DSV4_PRETRAIN:-0}"
 
@@ -74,9 +76,19 @@ if [[ "${LUMEN_DSV4_PRETRAIN}" == "1" ]]; then
         echo "[bootstrap_env] installing backports.strenum for Miles convert helper ..."
         pip install backports.strenum -q
     fi
-    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${MEGATRON_PATH}:${SITE_PKGS}:${TILELANG_ROOT}:${PYTHONPATH:-}"
+    _PYPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}"
+    if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
+        echo "[bootstrap_env] TileKernels dev tree: ${TILEKERNELS_DIR}"
+        _PYPATH="${_PYPATH}:${TILEKERNELS_DIR}"
+    fi
+    export PYTHONPATH="${_PYPATH}:${MEGATRON_PATH}:${SITE_PKGS}:${TILELANG_ROOT}:${PYTHONPATH:-}"
 else
-    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${MEGATRON_PATH}:${SITE_PKGS}:${SGLANG_ROOT}:${TILELANG_ROOT}:${PYTHONPATH:-}"
+    _PYPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}"
+    if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
+        echo "[bootstrap_env] TileKernels dev tree: ${TILEKERNELS_DIR}"
+        _PYPATH="${_PYPATH}:${TILEKERNELS_DIR}"
+    fi
+    export PYTHONPATH="${_PYPATH}:${MEGATRON_PATH}:${SITE_PKGS}:${SGLANG_ROOT}:${TILELANG_ROOT}:${PYTHONPATH:-}"
 fi
 
 NATIVE_LIBS="${BOOTSTRAP_DIR}/native-libs"
@@ -162,4 +174,26 @@ for m in optional:
         print(f"[bootstrap_env] OK {m} (optional): {getattr(mod, '__file__', mod)}")
     except Exception as e:
         print(f"[bootstrap_env] SKIP {m} (optional): {e}")
+
+if os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower() == "triton":
+    try:
+        from aiter.ops.triton.attention.sparse_mla_dsv4_train import sparse_mla_dsv4_train
+        from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton
+
+        print(f"[bootstrap_env] OK sparse MLA triton: {sparse_mla_dsv4_train.__name__} -> {sparse_attn_triton.__name__}")
+    except Exception as e:
+        print(f"[bootstrap_env] FAIL sparse MLA triton: {e}")
+        raise SystemExit(1)
+
+_mhc_backend = os.environ.get("MHC_BACKEND", "triton").lower()
+try:
+    import tile_kernels
+
+    print(f"[bootstrap_env] tile_kernels: {tile_kernels.__file__}")
+    from lumen.models.dsv4.ops.mhc_backend import log_mhc_backend
+
+    print(f"[bootstrap_env] OK MHC backend={log_mhc_backend()} (MHC_BACKEND={_mhc_backend})")
+except Exception as e:
+    print(f"[bootstrap_env] FAIL MHC/tile_kernels: {e}")
+    raise SystemExit(1)
 PY

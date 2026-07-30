@@ -4,10 +4,11 @@ Public API (`HCHeadParams`, `DeepSeekV4HyperConnectionUtil`) preserved so that
 the Megatron-LM patch (radixark/Megatron-LM PR #28) call sites in
 ``transformer_layer.py`` and ``transformer_block.py`` keep working.
 
-Internals route ``hc_pre_raw``/``hc_post_raw``/``hc_head_raw`` to
-``tile_kernels.modeling.mhc.{mhc_pre, mhc_post, mhc_head}`` which provide
-both forward and backward kernels (the legacy in-tree implementation only had
-a no-grad forward path — see ``_HYPER_CONNECTION_MIXER_NO_GRAD = True``).
+Internals route ``hc_pre_raw``/``hc_post_raw``/``hc_head_raw`` through
+``tile_kernels.modeling.mhc.ops``, which dispatches to kernels under
+``tile_kernels/mhc/`` (Triton or TileLang per ``MHC_BACKEND``).
+
+Mount local dev tree via ``TILEKERNELS_DIR`` (see ``bootstrap_env.sh``).
 """
 
 import einops
@@ -21,8 +22,7 @@ from tile_kernels.modeling.mhc.ops import (
     mhc_pre_apply_mix,
     mhc_pre_big_fuse,
     mhc_pre_norm_fn,
-    mhc_pre_split_mixes,
-    sinkhorn_normalize,
+    mhc_pre_split_mixes_and_sinkhorn,
 )
 from torch import Tensor
 
@@ -99,15 +99,16 @@ class DeepSeekV4HyperConnectionUtil:
                 self.norm_eps,
                 fuse_grad_acc=False,
             )
-            pre_mix, post, comb = mhc_pre_split_mixes(
+            pre_mix, post, comb = mhc_pre_split_mixes_and_sinkhorn(
                 mixes,
                 hc_scale,
                 hc_base,
                 self.hc_mult,
                 _HC_POST_MULT_VALUE,
                 self.hc_eps,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+                sinkhorn_eps=self.hc_eps,
             )
-            comb = sinkhorn_normalize(comb, repeat=self.hc_sinkhorn_iters, eps=self.hc_eps)
             layer_input = mhc_pre_apply_mix(x_bf16, pre_mix)
         return layer_input.to(dtype), post, comb
 
