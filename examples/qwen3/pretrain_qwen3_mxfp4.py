@@ -438,8 +438,15 @@ def main():
                 sort_by="self_device_time_total", row_limit=30, max_name_column_width=45
             ))
             if args.profile_out:
-                prof.export_chrome_trace(args.profile_out)
-                rank0(f"> chrome trace written to {args.profile_out}")
+                # Every rank profiles, so a shared path would have them clobber
+                # each other and leave one interleaved, unreadable file.
+                out = args.profile_out
+                if world_size > 1:
+                    stem, ext = os.path.splitext(out)
+                    out = f"{stem}.rank{global_rank}{ext}"
+                prof.export_chrome_trace(out)
+                rank0(f"> chrome traces written to {out}"
+                      + (f" (and {world_size - 1} more)" if world_size > 1 else ""))
             break
 
         if step % args.eval_interval == 0:
