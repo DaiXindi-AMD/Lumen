@@ -186,6 +186,11 @@ def main():
     p.add_argument("--no-grad-checkpointing", dest="grad_checkpointing", action="store_false")
     p.set_defaults(grad_checkpointing=True)
     p.add_argument("--log-interval", type=int, default=50)
+    p.add_argument("--profile-steps", type=int, default=0,
+                   help="Profile this many steps (after a short warmup), print a "
+                        "GPU-time breakdown, and stop. 0 disables profiling.")
+    p.add_argument("--profile-out", type=str, default=None,
+                   help="Optional chrome trace path for --profile-steps.")
     p.add_argument("--eval-interval", type=int, default=500)
     p.add_argument("--val-batches", type=int, default=20)
     p.add_argument("--seed", type=int, default=1234)
@@ -338,7 +343,22 @@ def main():
     it = iter(train_loader)
     rank0(f"> Training starts: {args.max_steps} steps, batch_size={args.micro_batch_size}x{ga}x{world_size}")
 
+    prof = None
+    profile_until = 0
+    if args.profile_steps > 0:
+        from torch.profiler import ProfilerActivity, profile
+        # Skipped steps cover allocator warmup and the one-off MXFP4 autotune
+        # measurement, neither of which is representative of a steady step.
+        profile_warmup = 3
+        profile_until = profile_warmup + args.profile_steps
+        prof = profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+        )
+
     for step in range(1, args.max_steps + 1):
+        if prof is not None and step == profile_warmup + 1:
+            prof.start()
         torch.cuda.synchronize()
         t0 = time.perf_counter()
         opt.zero_grad()
@@ -372,6 +392,20 @@ def main():
                 tb_writer.add_scalar("train/lr", lr, step)
                 tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
                 tb_writer.add_scalar("gpu/peak_memory_gb", mem_gb, step)
+
+        if prof is not None and step == profile_until:
+            prof.stop()
+            rank0(prof.key_averages().table(
+                sort_by="self_device_time_total", row_limit=40, max_name_column_width=90
+            ))
+            rank0("\n>>> same data, split by operand shape:")
+            rank0(prof.key_averages(group_by_input_shape=True).table(
+                sort_by="self_device_time_total", row_limit=30, max_name_column_width=45
+            ))
+            if args.profile_out:
+                prof.export_chrome_trace(args.profile_out)
+                rank0(f"> chrome trace written to {args.profile_out}")
+            break
 
         if step % args.eval_interval == 0:
             val_loss = validate()
