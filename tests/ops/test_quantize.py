@@ -1069,6 +1069,40 @@ def test_mxfp4_backends_are_interchangeable():
     assert checked, "no alternative backend was available to compare against"
 
 
+@pytest.mark.parametrize("rows,cols", [(2048, 3072), (1024, 4096), (512, 1024)])
+def test_hadamard_quant_reads_transpose_without_materialising(rows, cols):
+    """Quantizing x^T as a view must equal quantizing a materialised x^T.
+
+    The wgrad path relies on this to skip two large .contiguous() copies. It
+    holds only because stochastic rounding draws from tile-local indices and a
+    fixed philox offset rather than from the address, so the strided read sees
+    the same random stream. If that ever changes this test catches it, since a
+    silently different gradient is far worse than a slow one.
+    """
+    _require_mxfp4_dtype()
+    from lumen.ops.quantize.linear import _get_mxfp4_rht_sign
+
+    torch.manual_seed(13)
+    x = torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16)
+    sign = _get_mxfp4_rht_sign(x.device)
+    seed, offset = 4242, 99
+
+    view_t = x.t()
+    assert not view_t.is_contiguous()
+
+    got_fp4, got_scale = hadamard_quant_mxfp4(
+        view_t, sign, block_size=MXFP4_BLOCK_SIZE, g=16, use_sr=True,
+        philox_seed=seed, philox_offset=offset,
+    )
+    ref_fp4, ref_scale = hadamard_quant_mxfp4(
+        view_t.contiguous(), sign, block_size=MXFP4_BLOCK_SIZE, g=16, use_sr=True,
+        philox_seed=seed, philox_offset=offset,
+    )
+
+    torch.testing.assert_close(got_fp4, ref_fp4, atol=0, rtol=0)
+    torch.testing.assert_close(got_scale, ref_scale, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "n,k",
     [

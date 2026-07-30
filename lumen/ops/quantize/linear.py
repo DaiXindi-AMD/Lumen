@@ -2086,8 +2086,12 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         output_dtype=torch.bfloat16, block_size=mxfp4_block,
                     )
 
-                    grad_t = grad_flat.t().contiguous()
-                    input_t = input_bf16.t().contiguous()
+                    # Left as views: hadamard_quant_mxfp4 indexes through both
+                    # strides, so it can read the transpose directly. Materialising
+                    # these two was ~85 ms of every Qwen3-8B step, more than all
+                    # the MXFP4 GEMMs put together.
+                    grad_t = grad_flat.t()
+                    input_t = input_bf16.t()
 
                     if _rht_ok:
                         sign_m = _get_mxfp4_rht_sign(grad_flat.device)
@@ -2098,11 +2102,13 @@ class QuantizedLinearFunction(torch.autograd.Function):
                             input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
                         )
                     else:
+                        # convert_to_mxfp4 can route to AITER's quant, which wants
+                        # a dense operand.
                         grad_t_fp4, grad_t_scale = convert_to_mxfp4(
-                            grad_t, block_size=mxfp4_block, axis=-1, use_sr=True,
+                            grad_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
                         )
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t, block_size=mxfp4_block, axis=-1, use_sr=True,
+                            input_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
                         )
 
                     def _compute_wgrad():

@@ -853,7 +853,11 @@ def hadamard_quant_mxfp4(
     assert x.shape[-1] % block_size == 0
 
     orig_shape = x.shape
-    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
+    # Deliberately not .contiguous(): the kernel addresses x through both
+    # strides, so a transposed view works as-is. Callers wanting x^T would
+    # otherwise have to materialise it, which on Qwen3-8B's wgrad path cost
+    # more GPU time than the wgrad GEMM itself.
+    x_2d = x.reshape(-1, orig_shape[-1])
     M, N = x_2d.shape
 
     use_asm = is_cdna4()
