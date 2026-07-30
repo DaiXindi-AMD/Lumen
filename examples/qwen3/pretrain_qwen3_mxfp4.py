@@ -197,6 +197,16 @@ def main():
     p.add_argument("--tensorboard-dir", type=str, default="auto",
                    help="TensorBoard log dir. 'auto' generates ./runs/<mode>_<model>_<MMDD_HHMM>. 'none' disables.")
     p.add_argument("--num-workers", type=int, default=2)
+    # --- Weights & Biases (optional; runs alongside TensorBoard) ---
+    p.add_argument("--wandb-project", type=str, default=None,
+                   help="W&B project name. If set, metrics are also logged to wandb.")
+    p.add_argument("--wandb-name", type=str, default=None,
+                   help="W&B run name. Defaults to the TensorBoard dir basename.")
+    p.add_argument("--wandb-entity", type=str, default=None,
+                   help="W&B entity (team/user). Defaults to your logged-in default.")
+    p.add_argument("--wandb-mode", type=str, default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="W&B mode. 'offline' logs locally (sync later); 'disabled' is a no-op.")
     args = p.parse_args()
 
     if args.tensorboard_dir == "auto":
@@ -313,6 +323,30 @@ def main():
         tb_writer = SummaryWriter(log_dir=args.tensorboard_dir)
         rank0(f"> TensorBoard logging to {args.tensorboard_dir}")
 
+    # --- Weights & Biases (rank 0 only) ---
+    wb_run = None
+    if global_rank == 0 and args.wandb_project:
+        import wandb
+        run_name = args.wandb_name
+        if run_name is None and args.tensorboard_dir:
+            run_name = os.path.basename(args.tensorboard_dir.rstrip("/"))
+        wb_run = wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            mode=args.wandb_mode,
+            config=vars(args),
+        )
+        rank0(f"> W&B logging to project '{args.wandb_project}' as run '{run_name}'")
+
+    def log_metrics(metrics: dict, step: int):
+        """Log a flat {name: value} dict to TensorBoard and/or W&B."""
+        if tb_writer:
+            for k, v in metrics.items():
+                tb_writer.add_scalar(k, v, step)
+        if wb_run:
+            wb_run.log(metrics, step=step)
+
     # --- Helpers ---
     def compute_loss(batch):
         ids = batch["input_ids"][:, :-1].to(local_rank)
@@ -387,11 +421,12 @@ def main():
             lr = sched.get_last_lr()[0]
             mem_gb = torch.cuda.max_memory_allocated(local_rank) / (1024 ** 3)
             rank0(f"  step {step}/{args.max_steps} | loss {train_loss:.4f} | lr {lr:.2e} | step_time_ms {step_time_ms:.1f} | mem {mem_gb:.1f}GB")
-            if tb_writer:
-                tb_writer.add_scalar("train/loss", train_loss, step)
-                tb_writer.add_scalar("train/lr", lr, step)
-                tb_writer.add_scalar("train/step_time_ms", step_time_ms, step)
-                tb_writer.add_scalar("gpu/peak_memory_gb", mem_gb, step)
+            log_metrics({
+                "train/loss": train_loss,
+                "train/lr": lr,
+                "train/step_time_ms": step_time_ms,
+                "gpu/peak_memory_gb": mem_gb,
+            }, step)
 
         if prof is not None and step == profile_until:
             prof.stop()
@@ -410,11 +445,12 @@ def main():
         if step % args.eval_interval == 0:
             val_loss = validate()
             rank0(f"  step {step}/{args.max_steps} | val_loss {val_loss:.4f}")
-            if tb_writer:
-                tb_writer.add_scalar("val/loss", val_loss, step)
+            log_metrics({"val/loss": val_loss}, step)
 
     if tb_writer:
         tb_writer.close()
+    if wb_run:
+        wb_run.finish()
     rank0(f"> Training complete after {args.max_steps} steps.")
 
 
