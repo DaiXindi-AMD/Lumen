@@ -11,3 +11,7 @@ outputs/2026-*/
 tunableop_results*.csv
 data/
 *.parquet
+wandb/
+runs/
+train_*.log
+.claude/worktrees/
