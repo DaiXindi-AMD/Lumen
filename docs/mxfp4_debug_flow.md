@@ -1,10 +1,15 @@
 # MXFP4 8B 训练调试全流程
 
 **Author**: Dai, Xindi
-**Date**: 2026-07-22
+**Date**: 2026-07-22（正文）；2026-07-30（补记）
 **Branch**: `feature/mxfp4`
 
 本文记录 MXFP4 从 0.6B 验证到 8B 收敛的完整 debug 过程，包括遇到的三个 bug、排查逻辑和最终修复。
+
+> **阅读提示**：正文是 07-22 当时的现场记录，**行号和当时的判断都按原样保留**。
+> 其中 Bug #2 的根因判断后来被推翻，见文末「补记」。当前代码的设计以
+> [`mxfp4_training_report.md`](mxfp4_training_report.md) 为准，性能以
+> [`mxfp4_optimization_report.md`](mxfp4_optimization_report.md) 为准。
 
 ---
 
@@ -26,7 +31,7 @@
 
 **0.6B BF16 vs MXFP4 对比（C4, 10k 步）**:
 - val_loss 差距 +0.045（0.7%），两条曲线几乎重合
-- MXFP4 median step time 478ms vs BF16 229ms（2.09× 慢）
+- MXFP4 median step time 478ms vs BF16 229ms（2.09× 慢；这是当时未优化的数字，见文末补记）
 - 确认了 gfx950 ASM 路径 (`is_cdna4()=True`) 和 AITER native FP4 GEMM 都在工作
 
 ---
@@ -111,4 +116,40 @@
 | #2 FSDP2 NaN | `save_for_backward` 的 FP4 weight 被 FSDP2 reshard 后失效 | backward 从 `ctx.weight_ref` (BF16) 重新量化 | 多卡训练 step 1 即 NaN |
 | #3 Late spike | FP4 dynamic range overflow + 末尾层敏感 | H16 + 确定性 Hadamard + 末 15% 层 BF16 | 8B 训练 step ~1275-3600 崩溃 |
 
-**当前状态**: 8B MXFP4 预训练 5000 步稳定收敛（val_loss 5.74），无 NaN，无发散。
+**当时状态**: 8B MXFP4 预训练 5000 步稳定收敛（val_loss 5.74），无 NaN，无发散。
+
+---
+
+## 补记（2026-07-30）
+
+### Bug #2 的根因判断是错的
+
+`8bcf2d9` 移除了 saved FP4 weight，NaN 消失，当时归因为「FSDP2 reshard 让 saved FP4
+tensor 失效」。但 `23644ea` 又把 saved FP4 weight 加回来了 —— 理由是量化 kernel 的输出是
+新分配的 tensor，不是参数的 view，FSDP2 reshard 动不到它的存储。当前 HEAD（`035431e`）
+走的就是这条路，而且是**只保存预转置形式**（`linear.py:1668-1673`），Qwen3-8B 8 卡已经跑过
+1250 步、val_loss 单调下降到 4.44。
+
+如果 reshard 失效那个解释成立，当前代码就该在 step 1 出 NaN。它没有。所以：
+
+- NaN 是真的，`8bcf2d9` 也确实治住了；
+- 但真实机制是那个 commit 里的**别的**改动 —— 它同时把非对齐 BF16 fallback 从
+  「dequant saved FP4 weight」改成了「直接用 `ctx.weight_ref`」；
+- 真实原因至今没有单独定位。
+
+以后 FP4 权重复用在新的并行配置（TP/PP、其他 sharding 策略）下出问题，从这里查。
+
+### 行号变更
+
+正文 Bug #1 里的 `lumen/quantize/__init__.py:290` 现在是 **304 行**（`scaling_type = config.recipe`），
+修复本身没变。
+
+### 后续：性能优化阶段（07-27 起）
+
+收敛稳定之后的工作全在性能上，两轮共八项改动，把 8B（seq 2048 × mbs 4 × 8 卡）从
+**比 BF16 慢 14%** 变成 **比 BF16 快 6.7%**（1061.8 → 869.4 ms，BF16 928.0 ms），
+显存从 15.30 涨到 20.90 GB。逐项实测数据、失败的尝试和方法论教训见
+[`mxfp4_optimization_report.md`](mxfp4_optimization_report.md)。
+
+其中和本文的调试史直接相关的一条：**wgrad 里两次 `.t().contiguous()` 拷贝占一步的 7.8%，
+比每层 21 个 MXFP4 GEMM 加起来还多。** 前期所有性能猜测都指向 GEMM，profile 一看不是。

@@ -401,8 +401,41 @@ End to end that is worth **1.078x** (1097.8 ms to 1018.4 ms), and `aten::copy_`
 drops from 24.6% to 17.4% of the step — about twenty times the end-to-end effect
 of all the backend-selection work above, from a much smaller change.
 
-The remaining copies are worth another look: an FSDP flat-parameter copy at
-29 ms/step and a `[4, 2048, 4096]` group at 23 ms/step are still unexplained.
+### Step 6: the copies that were left
+
+Two of the `aten::copy_` entries step 5 left unexplained have since been dealt with.
+
+**The activation dequant in wgrad.** `convert_from_mxfp4(...).t().contiguous()` wrote
+a full BF16 `(M, K)` intermediate and then copied it transposed.
+`dequant_transpose_mxfp4` reads packed FP4 `(M, K/2)` and writes BF16 `(K, M)` in one
+launch, so neither the intermediate nor the copy exists. Bit-exact with the two-op
+form (`bench_mxfp4_backward_ops.py::test_fused_dequant_transpose_is_bit_exact`).
+
+**The weight quantization repeated per micro-batch.** RTN is deterministic and the
+BF16 weight does not move within an optimizer step, so every micro-batch after the
+first was re-deriving a bit-identical FP4 weight and re-running the pre-transpose —
+and gradient checkpointing paid for it a second time. A module-level cache
+(`module._mxfp4_w_cache`, cleared by an optimizer post-step hook) collapses that to
+once per step. It costs 4.8 GB/GPU on Qwen3-8B, since every quantized layer's FP4
+weight now stays live for the whole step. Reuse is bit-exact by construction
+(`test_mxfp4_backward_optimization.py::test_weight_caching_gemm_correctness`);
+`LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` turns it off.
+
+Together with the FP4 parameter all-gather and the wgrad rounding fix, measured on
+8 GPUs at 65536 tokens/step (the configuration the model actually trains in, rather
+than step 5's single-GPU 8192):
+
+| build | median step | vs BF16 |
+|---|---|---|
+| BF16 | 928.0 ms | 1.00x |
+| MXFP4 through step 5 (`7d1841b`) | 1061.8 ms | 0.87x |
+| MXFP4 through step 6 (`035431e`) | **869.4 ms** | **1.067x** |
+
+**MXFP4 is now faster than BF16 end to end**, by 6.7%, at 20.90 GB against BF16's
+15.30. The four step-6 changes were not A/B'd individually — the machine was shared
+and isolated micro-benchmarks of the same shape varied 2x with inconsistent
+direction, so only the end-to-end medians are trustworthy. Full write-up, including
+the failed attempts, in [`mxfp4_optimization_report.md`](mxfp4_optimization_report.md).
 
 ## Tests
 
@@ -473,11 +506,12 @@ on Qwen3 it is most of the remaining headroom: 1.43x on 8B and 1.66x on 0.6B,
 against the 1.02x and 1.05x autotune delivers today. TransformerEngine's
 `cast_transpose_mxfp4_shuffled.cuh` does cast, transpose, Hadamard and shuffle in
 one HIP kernel, where the shuffle is only a different store address and costs
-nothing. Lumen's equivalent work is spread across `convert_to_mxfp4`,
-`transpose_packed_fp4`, `hadamard_quant_mxfp4` and two `.t().contiguous()` copies.
-Folding the shuffle into the quantize kernel's store address would erase the
-prologue — and would make autotune's job easy, since with a free layout the fast
-kernels win nearly everywhere.
+nothing. Lumen's equivalent work is spread across `convert_to_mxfp4_2d`,
+`transpose_packed_fp4`, `dequant_transpose_mxfp4` and `hadamard_quant_mxfp4` —
+four store paths, though the two `.t().contiguous()` copies that used to sit
+between them are gone (steps 5 and 6). Folding the shuffle into each quantize
+kernel's store address would erase the prologue — and would make autotune's job
+easy, since with a free layout the fast kernels win nearly everywhere.
 
 **Share autotune decisions across ranks.** Each rank measures independently.
 Because the backends are bit-exact this cannot diverge numerically, only in
