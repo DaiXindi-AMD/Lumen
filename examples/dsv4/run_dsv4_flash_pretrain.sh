@@ -1,34 +1,28 @@
 #!/usr/bin/env bash
-# run_dsv4_pretrain_full.sh — DSV4 Flash full model (43L) 2×8 MI300X/MI308X pretrain smoke.
+# run_dsv4_flash_pretrain.sh — DSV4 Flash full model (43L) 2×8 MI300X/MI308X pretrain smoke.
 #
 # Native Megatron + Lumen get_dsv4_spec (no Miles train.py / Ray).
 # Run on EACH node with NODE_RANK=0 (head) and NODE_RANK=1 (worker).
 #
-# Example (head p14):
-#   NODE_RANK=0 MASTER_ADDR=10.194.132.29 \
-#   MODEL_DIR=/nfs/data/leiwu/models \
+# Example (head):
+#   NODE_RANK=0 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
 #   SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-#     bash examples/dsv4/run_dsv4_pretrain_full.sh
+#     bash examples/dsv4/run_dsv4_flash_pretrain.sh
 #
-# Example (worker p38):
-#   NODE_RANK=1 MASTER_ADDR=10.194.132.29 \
-#   MODEL_DIR=/nfs/data/leiwu/models \
+# Example (worker):
+#   NODE_RANK=1 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
 #   SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-#     bash examples/dsv4/run_dsv4_pretrain_full.sh
+#     bash examples/dsv4/run_dsv4_flash_pretrain.sh
+#
+# For 4-layer single-node smoke, use run_dsv4_4layer_pretrain.sh instead.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LUMEN_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MILES_DIR="${MILES_DIR:-/home/leiwu/miles}"
-TILEKERNELS_DIR="${TILEKERNELS_DIR:-/home/leiwu/TileKernels}"
-BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/mnt/data/leiwu/lumen-dsv4-bootstrap}"
+# shellcheck source=examples/dsv4/dsv4_paths.sh
+source "${SCRIPT_DIR}/dsv4_paths.sh"
+
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
-MODEL_DIR="${MODEL_DIR:-/nfs/data/leiwu/models}"
-LOG_DIR="${LOG_DIR:-/nfs/data/leiwu/logs}"
-TVM_CACHE_DIR="${TVM_CACHE_DIR:-/nfs/data/leiwu/tvm-cache}"
-NFS_ROOT="${NFS_ROOT:-/nfs/data}"
-MEGATRON_PATH="${MEGATRON_PATH:-/nfs/data/leiwu/Megatron-LM-miles-main}"
 
 NNODES="${NNODES:-2}"
 NPROC_PER_NODE="${NPROC_PER_NODE:-8}"
@@ -56,7 +50,7 @@ V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8:-0}"
 
 TORCH_DIST="${MODEL_DIR}/${MODEL_NAME}_torch_dist"
-LOGFILE="${LOG_DIR}/lumen_dsv4_full_pretrain_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log"
+LOGFILE="${LOG_DIR}/lumen_dsv4_flash_pretrain_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log"
 
 USE_MILES_IMAGE=0
 if [[ "${IMAGE}" == miles-dsv4-mi300x* || "${IMAGE}" == rlsys/miles* ]]; then
@@ -92,14 +86,15 @@ fi
 mkdir -p "${MODEL_DIR}" "${LOG_DIR}" "${MODEL_DIR}/miopen-cache" "${TVM_CACHE_DIR}"
 
 if [[ "${NNODES}" -gt 1 ]]; then
-    # shellcheck source=examples/dsv4/preflight_multinode_launch.sh
-    source "${SCRIPT_DIR}/preflight_multinode_launch.sh"
+    # shellcheck source=examples/dsv4/preflight_dsv4_flash_multinode.sh
+    source "${SCRIPT_DIR}/preflight_dsv4_flash_multinode.sh"
     preflight_dsv4_multinode
 fi
 
 echo "════════════════════════════════════════════════"
 echo "  Lumen DSV4 Flash FULL pretrain smoke (16 GPU)"
 echo "  Image     : ${IMAGE}"
+echo "  Workspace : ${WORKSPACE_ROOT}  (data: ${DATA_ROOT})"
 echo "  Nodes     : ${NNODES}×${NPROC_PER_NODE}  node_rank=${NODE_RANK}"
 echo "  Master    : ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Parallel  : TP4 PP4 EP4 (11+11+11+10)"
@@ -220,7 +215,7 @@ fi
     "${DOCKER_MOUNTS[@]}" \
     "${DOCKER_ENV[@]}" \
     "${IMAGE}" \
-    bash /workspace/Lumen/examples/dsv4/run_dsv4_pretrain_full_inner.sh \
+    bash /workspace/Lumen/examples/dsv4/run_dsv4_flash_pretrain_inner.sh \
     2>&1 | tee "${LOGFILE}"
 
 echo ""

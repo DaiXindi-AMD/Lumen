@@ -4,7 +4,7 @@
 # Ensures head and worker use identical torchrun args before any rank enters
 # Megatron (avoids NCCL hang from LOAD_CKPT / GBS mismatch across nodes).
 #
-# Called from run_dsv4_pretrain_full.sh when NNODES > 1.
+# Called from run_dsv4_flash_pretrain.sh when NNODES > 1.
 # Set SKIP_PREFLIGHT=1 to bypass (not recommended).
 
 preflight_dsv4_multinode() {

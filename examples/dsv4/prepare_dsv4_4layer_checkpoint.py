@@ -1,4 +1,4 @@
-"""Prepare HF → BF16 → Megatron torch_dist checkpoint for DSV4 pretrain smoke.
+"""Prepare HF → BF16 → Megatron torch_dist checkpoint for DSV4 4-layer pretrain smoke.
 
 Uses Miles ``convert_hf_to_torch_dist.py`` via shell (no ``train.py`` / Ray head).
 """

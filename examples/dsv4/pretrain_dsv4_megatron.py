@@ -1,8 +1,8 @@
-"""DSV4 4-layer Megatron pretrain smoke — no Miles train.py, no Ray.
+"""Shared Megatron pretrain entry for DSV4 (4-layer and Flash full model).
 
 Uses ``megatron.training.pretrain`` with ``--spec lumen.models.dsv4.megatron.spec get_dsv4_spec``.
 
-Launch via ``examples/dsv4/run_dsv4_pretrain.sh`` (``torchrun`` on 8×MI308X).
+Launched by ``run_dsv4_4layer_pretrain_inner.sh`` or ``run_dsv4_flash_pretrain_inner.sh``.
 """
 
 from __future__ import annotations

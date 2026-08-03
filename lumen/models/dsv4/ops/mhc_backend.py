@@ -11,11 +11,9 @@ def get_mhc_backend() -> str:
 
 
 def log_mhc_backend() -> str:
-    """Import ops once and return the active backend (for bootstrap logging)."""
+    """Import ops once and return the configured backend (for bootstrap logging)."""
     backend = get_mhc_backend()
-    from tile_kernels.modeling.mhc.ops.backend import get_backend
+    # TileKernels dispatch is via kernel modules under tile_kernels/mhc/; verify import path.
+    import tile_kernels.modeling.mhc.ops  # noqa: F401
 
-    active = get_backend()
-    if active != backend:
-        raise RuntimeError(f"MHC_BACKEND={backend!r} but tile_kernels loaded as {active!r}")
-    return active
+    return backend

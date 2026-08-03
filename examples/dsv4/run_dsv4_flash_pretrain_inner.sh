@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inner container entry for run_dsv4_pretrain_full.sh (2-node full Flash pretrain smoke).
+# Inner container entry for run_dsv4_flash_pretrain.sh (2-node Flash pretrain smoke).
 set -euo pipefail
 
 cd /workspace/Lumen
@@ -39,11 +39,11 @@ fi
 
 if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     if [[ ! -d /workspace/miles ]]; then
-        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_full_checkpoint.py"
+        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_flash_checkpoint.py"
         exit 1
     fi
     export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
-    python examples/dsv4/prepare_dsv4_full_checkpoint.py
+    python examples/dsv4/prepare_dsv4_flash_checkpoint.py
 else
     echo "[prepare] torch_dist checkpoint already present — skipping (path=${CKPT})"
 fi
@@ -76,7 +76,7 @@ torchrun \
     --node_rank="${NODE_RANK}" \
     --master_addr="${MASTER_ADDR}" \
     --master_port="${MASTER_PORT}" \
-    examples/dsv4/pretrain_dsv4.py \
+    examples/dsv4/pretrain_dsv4_megatron.py \
     "${DSV4_MODEL_ARGS[@]}" \
     --transformer-impl local \
     --disable-jit-fuser \

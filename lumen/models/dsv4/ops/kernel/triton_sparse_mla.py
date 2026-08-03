@@ -35,4 +35,6 @@ def sparse_attn_triton(q, kv, attn_sink, topk_idxs, sm_scale=None):
         sink = sink.float()
     out_flat = sparse_mla_dsv4_train(q_flat, kv_flat, sink, idx_flat, sm_scale)
     B, S, H, D = shape
-    return out_flat.reshape(B, S, H, D)
+    # Clone so downstream in-place RoPE (deepseek_v4.apply_rotary_emb) does not
+    # mutate the tensor saved by SparseMLADSV4Function for backward.
+    return out_flat.reshape(B, S, H, D).clone()

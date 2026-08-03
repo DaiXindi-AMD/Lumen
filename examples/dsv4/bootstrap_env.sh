@@ -76,19 +76,9 @@ if [[ "${LUMEN_DSV4_PRETRAIN}" == "1" ]]; then
         echo "[bootstrap_env] installing backports.strenum for Miles convert helper ..."
         pip install backports.strenum -q
     fi
-    _PYPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}"
-    if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        echo "[bootstrap_env] TileKernels dev tree: ${TILEKERNELS_DIR}"
-        _PYPATH="${_PYPATH}:${TILEKERNELS_DIR}"
-    fi
-    export PYTHONPATH="${_PYPATH}:${MEGATRON_PATH}:${SITE_PKGS}:${TILELANG_ROOT}:${PYTHONPATH:-}"
+    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}:${MEGATRON_PATH}:${SITE_PKGS}:${TILELANG_ROOT}:${PYTHONPATH:-}"
 else
-    _PYPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}"
-    if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        echo "[bootstrap_env] TileKernels dev tree: ${TILEKERNELS_DIR}"
-        _PYPATH="${_PYPATH}:${TILEKERNELS_DIR}"
-    fi
-    export PYTHONPATH="${_PYPATH}:${MEGATRON_PATH}:${SITE_PKGS}:${SGLANG_ROOT}:${TILELANG_ROOT}:${PYTHONPATH:-}"
+    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}:${MEGATRON_PATH}:${SITE_PKGS}:${SGLANG_ROOT}:${TILELANG_ROOT}:${PYTHONPATH:-}"
 fi
 
 NATIVE_LIBS="${BOOTSTRAP_DIR}/native-libs"
@@ -145,6 +135,17 @@ if [[ "${LUMEN_DSV4_MOE_MORI:-0}" == "1" ]]; then
         pip install setuptools-scm -q
         SETUPTOOLS_SCM_PRETEND_VERSION_FOR_MORI=0.1.0 pip install -e . -q
     fi
+fi
+
+# Local TileKernels mHC: rsync onto bootstrap site-packages. Do NOT put the dev tree on
+# PYTHONPATH — dev tile_kernels/__init__.py eagerly imports engram kernels that require
+# a newer tilelang PassConfigKey than the bootstrap image provides.
+if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" && -n "${SITE_PKGS:-}" ]]; then
+    _tk_dest="${SITE_PKGS}/tile_kernels"
+    echo "[bootstrap_env] overlay local mHC: ${TILEKERNELS_DIR}/tile_kernels -> ${_tk_dest}"
+    mkdir -p "${_tk_dest}/mhc" "${_tk_dest}/modeling/mhc"
+    rsync -a "${TILEKERNELS_DIR}/tile_kernels/mhc/" "${_tk_dest}/mhc/"
+    rsync -a "${TILEKERNELS_DIR}/tile_kernels/modeling/mhc/" "${_tk_dest}/modeling/mhc/"
 fi
 
 python - <<'PY'

@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
-# run_dsv4_pretrain.sh — DSV4 4-layer native Megatron pretrain smoke (no Miles train.py / Ray).
+# run_dsv4_4layer_pretrain.sh — DSV4 4-layer native Megatron pretrain smoke (no Miles train.py / Ray).
 #
 # Usage:
-#   bash examples/dsv4/run_dsv4_pretrain.sh
-#   TRAIN_ITERS=10 IMAGE=lumen/dsv4-lumen:mi308x bash examples/dsv4/run_dsv4_pretrain.sh
+#   bash examples/dsv4/run_dsv4_4layer_pretrain.sh
+#   TRAIN_ITERS=10 IMAGE=lumen/dsv4-lumen:mi308x bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 #
-# Optional checkpoint prep uses Miles convert scripts only (prepare_dsv4_checkpoint.py).
+# Overridable paths (see header defaults below):
+#   DATA_ROOT=/mnt/data/$USER MODEL_DIR=... LOG_DIR=... bash examples/dsv4/run_dsv4_4layer_pretrain.sh
+#
+# Optional checkpoint prep uses Miles convert scripts only (prepare_dsv4_4layer_checkpoint.py).
+# For 43-layer full Flash pretrain, use run_dsv4_flash_pretrain.sh instead.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LUMEN_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-MILES_DIR="${MILES_DIR:-/home/leiwu/miles}"
-TILEKERNELS_DIR="${TILEKERNELS_DIR:-/home/leiwu/TileKernels}"
-BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/mnt/data/leiwu/lumen-dsv4-bootstrap}"
+# shellcheck source=examples/dsv4/dsv4_paths.sh
+source "${SCRIPT_DIR}/dsv4_paths.sh"
+
+LOGFILE="${LOG_DIR}/lumen_dsv4_4layer_pretrain_$(date +%Y%m%d_%H%M%S).log"
+
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
-MODEL_DIR="${MODEL_DIR:-/mnt/data/leiwu/models}"
-LOG_DIR="${LOG_DIR:-/mnt/data/leiwu/logs}"
-TVM_CACHE_DIR="${TVM_CACHE_DIR:-/mnt/data/leiwu/tvm-cache}"
-LOGFILE="${LOG_DIR}/lumen_dsv4_pretrain_$(date +%Y%m%d_%H%M%S).log"
 
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8-4layer}"
 DSV4_HC_MULT="${DSV4_HC_MULT:-2}"
@@ -72,12 +73,19 @@ mkdir -p "${MODEL_DIR}" "${LOG_DIR}" "${MODEL_DIR}/miopen-cache" "${TVM_CACHE_DI
 echo "════════════════════════════════════════════════"
 echo "  Lumen DSV4 4-layer Megatron pretrain smoke"
 echo "  Image     : ${IMAGE}"
+echo "  Workspace : ${WORKSPACE_ROOT}  (data: ${DATA_ROOT})"
 echo "  Bootstrap : $([[ ${USE_BOOTSTRAP} -eq 1 ]] && echo yes || echo no)"
 echo "  Steps     : ${TRAIN_ITERS}"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
 echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
 echo "  FP8       : $([[ ${LUMEN_DSV4_LINEAR_FP8} -eq 1 ]] && echo "Lumen (${LUMEN_DSV4_FP8_SCALING})" || echo BF16)"
 echo "  MoE EP    : $([[ ${LUMEN_DSV4_MOE_MORI} -eq 1 ]] && echo "MORI" || echo NCCL alltoall)"
+if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" ]]; then
+    echo "  mHC       : overlay ${TILEKERNELS_DIR}/tile_kernels/{mhc,modeling/mhc}"
+else
+    echo "  mHC       : bootstrap site-packages (set TILEKERNELS_DIR for local overlay)"
+fi
+echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND} (triton -> aiter sparse_mla_dsv4_train)"
 echo "  Ckpt      : ${TORCH_DIST}"
 echo "  Log       : ${LOGFILE}"
 echo "════════════════════════════════════════════════"
@@ -161,7 +169,7 @@ docker run --rm \
     "${DOCKER_MOUNTS[@]}" \
     "${DOCKER_ENV[@]}" \
     "${IMAGE}" \
-    bash /workspace/Lumen/examples/dsv4/run_dsv4_pretrain_inner.sh \
+    bash /workspace/Lumen/examples/dsv4/run_dsv4_4layer_pretrain_inner.sh \
     2>&1 | tee "${LOGFILE}"
 
 echo ""

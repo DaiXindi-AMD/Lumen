@@ -4,7 +4,7 @@
 `torchrun` + Lumen `get_dsv4_spec`，**不依赖 Miles `train.py` / Ray**。
 
 模型实现：`lumen/models/dsv4/`  
-入口脚本：`pretrain_dsv4.py`
+入口脚本：`pretrain_dsv4_megatron.py`（4-layer 与 Flash 全模型共用）
 
 ---
 
@@ -16,19 +16,34 @@
 | Docker | 已安装，当前用户可运行 |
 | 基础镜像 | `lumen/tests:latest`（构建 DSV4 镜像用） |
 | Miles 镜像 | `rlsys/miles:rocm7.2-mi308x`（提取 bootstrap 依赖用） |
-| Miles 仓库 | 默认 `/home/leiwu/miles`，需挂载进容器（checkpoint 转换 + Megatron router hook） |
+| Miles 仓库 | 默认 `${WORKSPACE_ROOT}/miles`（Lumen 同级目录），需挂载进容器 |
 | 磁盘 | 模型目录、日志、TVM cache；bootstrap 约数 GB；`.bootstrap-build` staging 约 4GB（可删） |
 
-默认路径（可通过环境变量覆盖）：
+默认路径由 `dsv4_paths.sh` 解析（可通过环境变量覆盖）：
 
 ```text
-LUMEN_DIR=/home/leiwu/Lumen
-MILES_DIR=/home/leiwu/miles
-MODEL_DIR=/mnt/data/leiwu/models
-LOG_DIR=/mnt/data/leiwu/logs
-TVM_CACHE_DIR=/mnt/data/leiwu/tvm-cache
-BOOTSTRAP_DIR=/mnt/data/leiwu/lumen-dsv4-bootstrap
+WORKSPACE_ROOT=..              # Lumen 的父目录
+MILES_DIR=${WORKSPACE_ROOT}/miles
+TILEKERNELS_DIR=${WORKSPACE_ROOT}/TileKernels
+DATA_ROOT=                     # 自动: /nfs/data/$USER → /mnt/data/$USER → ${WORKSPACE_ROOT}/dsv4-data
+MODEL_DIR=${DATA_ROOT}/models
+LOG_DIR=${DATA_ROOT}/logs
+TVM_CACHE_DIR=${DATA_ROOT}/tvm-cache
+BOOTSTRAP_DIR=${DATA_ROOT}/lumen-dsv4-bootstrap
 ```
+
+---
+
+## 命名约定
+
+脚本按模型规模分为两条路径，后缀与已有 `dsv4_*` 配置文件对齐：
+
+| 后缀 | 含义 | 典型硬件 |
+|------|------|----------|
+| `4layer` | Flash **4 层** smoke | 单机 8×MI308X |
+| `flash` | Flash **43 层**全模型 smoke | 2 节点 16 GPU |
+
+共享脚本（无后缀）：`build_dsv4_lumen_image.sh`、`prepare_bootstrap.sh`、`dsv4_paths.sh` 等。
 
 ---
 
@@ -36,17 +51,31 @@ BOOTSTRAP_DIR=/mnt/data/leiwu/lumen-dsv4-bootstrap
 
 ```text
 examples/dsv4/
-├── README.md                      # 本文档
-├── build_dsv4_lumen_image.sh      # 构建 lumen/dsv4-lumen:mi308x
-├── prepare_bootstrap.sh           # 从 Miles 镜像提取 Megatron/tile_kernels 等
-├── run_dsv4_pretrain.sh           # 宿主机 Docker launcher
-├── run_dsv4_pretrain_inner.sh     # 容器内 torchrun 入口
-├── pretrain_dsv4.py               # Megatron pretrain 主程序
-├── prepare_dsv4_checkpoint.py     # HF → BF16 → torch_dist（可选）
-├── dsv4_4layer_megatron_args.sh   # 4-layer 模型与并行参数
-├── setup_container_env.sh         # 容器内 Megatron / tile_kernels 环境
-├── bootstrap_env.sh               # bootstrap PYTHONPATH 设置
-└── .bootstrap-build/              # 镜像构建 staging（gitignore，可删）
+├── README.md                           # 本文档
+├── build_dsv4_lumen_image.sh           # 构建 lumen/dsv4-lumen:mi308x
+├── prepare_bootstrap.sh                # 从 Miles 镜像提取 Megatron/tile_kernels 等
+│
+│  ── 4-layer smoke（单机 8 卡）──
+├── run_dsv4_4layer_pretrain.sh         # 宿主机 Docker launcher
+├── run_dsv4_4layer_pretrain_inner.sh   # 容器内 torchrun 入口
+├── prepare_dsv4_4layer_checkpoint.py   # HF → BF16 → torch_dist（可选）
+├── dsv4_4layer_megatron_args.sh        # 4-layer 模型与并行参数
+│
+│  ── Flash 全模型 smoke（2 节点 16 卡）──
+├── run_dsv4_flash_pretrain.sh          # 宿主机 2-node Docker launcher
+├── run_dsv4_flash_pretrain_inner.sh    # 容器内 multinode torchrun
+├── launch_dsv4_flash_pretrain_2node.sh # head 一键拉起 head+worker（推荐）
+├── preflight_dsv4_flash_multinode.sh   # NFS 两节点配置一致性校验
+├── prepare_dsv4_flash_checkpoint.py    # HF→BF16→torch_dist（16 GPU layout）
+├── dsv4_flash_megatron_args.sh         # 43-layer 模型参数
+├── dsv4_flash_mi300x_parallel.sh       # TP4/PP4/EP4 并行
+│
+│  ── 共享 ──
+├── pretrain_dsv4_megatron.py           # Megatron pretrain 主程序
+├── setup_container_env.sh              # 容器内 Megatron / tile_kernels 环境
+├── dsv4_paths.sh                       # 共享路径默认值（各 launcher source）
+├── bootstrap_env.sh                    # bootstrap PYTHONPATH / mHC overlay
+└── .bootstrap-build/                   # 镜像构建 staging（gitignore，可删）
 ```
 
 ---
@@ -56,7 +85,7 @@ examples/dsv4/
 ### 1. 构建镜像（首次或依赖变更时）
 
 ```bash
-cd /home/leiwu/Lumen
+cd ~/Lumen
 bash examples/dsv4/build_dsv4_lumen_image.sh
 ```
 
@@ -103,15 +132,15 @@ bash examples/dsv4/prepare_bootstrap.sh
 **方式 A — 跑 pretrain 时自动转换**（需挂载 `MILES_DIR`）：
 
 ```bash
-cd /home/leiwu/Lumen
-bash examples/dsv4/run_dsv4_pretrain.sh
-# SKIP_PREPARE 默认为 0，缺 ckpt 时会调 prepare_dsv4_checkpoint.py
+cd ~/Lumen
+bash examples/dsv4/run_dsv4_4layer_pretrain.sh
+# SKIP_PREPARE 默认为 0，缺 ckpt 时会调 prepare_dsv4_4layer_checkpoint.py
 ```
 
 **方式 B — 手动转换**（容器内或宿主机有 Miles 环境时）：
 
 ```bash
-DSV4_HC_MULT=2 python examples/dsv4/prepare_dsv4_checkpoint.py
+DSV4_HC_MULT=2 python examples/dsv4/prepare_dsv4_4layer_checkpoint.py
 ```
 
 流程：HF 权重 → FP8 转 BF16 → Megatron `torch_dist`（用 Miles `convert_hf_to_torch_dist.py`，不用 `train.py`）。
@@ -121,17 +150,17 @@ DSV4_HC_MULT=2 python examples/dsv4/prepare_dsv4_checkpoint.py
 已有 checkpoint 时：
 
 ```bash
-cd /home/leiwu/Lumen
-SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_pretrain.sh
+cd ~/Lumen
+SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 ```
 
-`run_dsv4_pretrain.sh` 会：
+`run_dsv4_4layer_pretrain.sh` 会：
 
 - 镜像不存在时自动调用 `build_dsv4_lumen_image.sh`
 - 挂载 Lumen 源码、模型、日志、TVM cache、Miles 仓库
-- 在容器内执行 `run_dsv4_pretrain_inner.sh` → `torchrun` 8 卡
+- 在容器内执行 `run_dsv4_4layer_pretrain_inner.sh` → `torchrun` 8 卡
 
-日志：`/mnt/data/leiwu/logs/lumen_dsv4_pretrain_<timestamp>.log`
+日志：`${LOG_DIR}/lumen_dsv4_4layer_pretrain_<timestamp>.log`
 
 ### 4. 验证成功
 
@@ -154,13 +183,13 @@ lm loss
 ## 一键流程（已有 checkpoint）
 
 ```bash
-cd /home/leiwu/Lumen
+cd ~/Lumen
 
 # 构建镜像（只需一次）
 bash examples/dsv4/build_dsv4_lumen_image.sh
 
 # 跑 10 step smoke
-SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_pretrain.sh
+SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 ```
 
 ---
@@ -181,22 +210,23 @@ SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_pretrain.s
 | `LUMEN_DSV4_LINEAR_FP8` | `0` | Lumen FP8 linear |
 | `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA 后端（aiter `sparse_mla_dsv4_train`）；`tilelang` 为备选 |
 | `MHC_BACKEND` | `triton` | Hyper-Connection 后端；`tile_kernels/mhc/*_triton.py` |
-| `TILEKERNELS_DIR` | `/home/leiwu/TileKernels` | 本地 TileKernels 源码（挂载进容器，优先于 bootstrap site-packages） |
+| `TILEKERNELS_DIR` | `${WORKSPACE_ROOT}/TileKernels` | 本地 mHC 源码（rsync overlay 到 bootstrap site-packages） |
 | `V4_INDEXER_BLOCK_N` | `64` | MI308X LDS 限制，勿随意改大 |
-| `MILES_DIR` | `/home/leiwu/miles` | Miles 仓库路径 |
-| `MODEL_DIR` | `/mnt/data/leiwu/models` | 模型与 checkpoint 目录 |
+| `MILES_DIR` | `${WORKSPACE_ROOT}/miles` | Miles 仓库路径 |
+| `DATA_ROOT` | 见上 | 模型/日志/bootstrap 根目录 |
+| `MODEL_DIR` | `${DATA_ROOT}/models` | 模型与 checkpoint 目录 |
 
 示例：
 
 ```bash
 # 随机初始化，不加载 ckpt
-LOAD_CKPT=0 SKIP_PREPARE=1 TRAIN_ITERS=5 bash examples/dsv4/run_dsv4_pretrain.sh
+LOAD_CKPT=0 SKIP_PREPARE=1 TRAIN_ITERS=5 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 
 # 关闭 recompute
-DSV4_ENABLE_RECOMPUTE=0 SKIP_PREPARE=1 LOAD_CKPT=1 bash examples/dsv4/run_dsv4_pretrain.sh
+DSV4_ENABLE_RECOMPUTE=0 SKIP_PREPARE=1 LOAD_CKPT=1 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 
 # Lumen FP8 linear
-LUMEN_DSV4_LINEAR_FP8=1 SKIP_PREPARE=1 LOAD_CKPT=1 bash examples/dsv4/run_dsv4_pretrain.sh
+LUMEN_DSV4_LINEAR_FP8=1 SKIP_PREPARE=1 LOAD_CKPT=1 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 ```
 
 ---
@@ -206,7 +236,7 @@ LUMEN_DSV4_LINEAR_FP8=1 SKIP_PREPARE=1 LOAD_CKPT=1 bash examples/dsv4/run_dsv4_p
 使用 `lumen/tests:latest`，运行时挂载 `${BOOTSTRAP_DIR}`：
 
 ```bash
-IMAGE=lumen/tests:latest bash examples/dsv4/run_dsv4_pretrain.sh
+IMAGE=lumen/tests:latest bash examples/dsv4/run_dsv4_4layer_pretrain.sh
 ```
 
 需先 `prepare_bootstrap.sh`；首次启动会慢一些（容器内拷贝 site-packages）。
@@ -216,12 +246,12 @@ IMAGE=lumen/tests:latest bash examples/dsv4/run_dsv4_pretrain.sh
 ## 架构简述
 
 ```text
-run_dsv4_pretrain.sh (host)
+run_dsv4_4layer_pretrain.sh (host)
   └─ docker run lumen/dsv4-lumen:mi308x
-       └─ run_dsv4_pretrain_inner.sh
+       └─ run_dsv4_4layer_pretrain_inner.sh
             ├─ setup_container_env.sh  → Megatron + tile_kernels
-            ├─ prepare_dsv4_checkpoint.py  (可选)
-            └─ torchrun pretrain_dsv4.py
+            ├─ prepare_dsv4_4layer_checkpoint.py  (可选)
+            └─ torchrun pretrain_dsv4_megatron.py
                  └─ megatron.training.pretrain
                       └─ lumen.models.dsv4.megatron.spec.get_dsv4_spec
 ```
@@ -247,17 +277,17 @@ Megatron 参数：`--spec lumen.models.dsv4.megatron.spec get_dsv4_spec`
 | Batch | GBS=8, MBS=1, seq=2048 | GBS=256, MBS=1, seq=2048 |
 | Checkpoint | `{MODEL_DIR}/DeepSeek-V4-Flash-FP8_torch_dist` | 同左（可复用 Miles 转换结果） |
 
-### 新增文件
+### Flash 全模型相关文件
 
 ```text
 examples/dsv4/
-├── dsv4_flash_megatron_args.sh      # 43-layer 模型参数
-├── dsv4_flash_mi300x_parallel.sh    # TP4/PP4/EP4 并行
-├── prepare_dsv4_full_checkpoint.py  # HF→BF16→torch_dist（16 GPU layout）
-├── run_dsv4_pretrain_full.sh        # 宿主机 2-node Docker launcher
-├── run_dsv4_pretrain_full_inner.sh  # 容器内 multinode torchrun
-├── preflight_multinode_launch.sh    # NFS 两节点配置一致性校验
-└── launch_dsv4_pretrain_full_2node.sh  # head 一键拉起 head+worker（推荐）
+├── dsv4_flash_megatron_args.sh         # 43-layer 模型参数
+├── dsv4_flash_mi300x_parallel.sh       # TP4/PP4/EP4 并行
+├── prepare_dsv4_flash_checkpoint.py    # HF→BF16→torch_dist（16 GPU layout）
+├── run_dsv4_flash_pretrain.sh          # 宿主机 2-node Docker launcher
+├── run_dsv4_flash_pretrain_inner.sh    # 容器内 multinode torchrun
+├── preflight_dsv4_flash_multinode.sh   # NFS 两节点配置一致性校验
+└── launch_dsv4_flash_pretrain_2node.sh # head 一键拉起 head+worker（推荐）
 ```
 
 ### 前置：已有 Miles 转换的 checkpoint
@@ -268,45 +298,43 @@ examples/dsv4/
 
 ```bash
 cd ~/Lumen
-MASTER_ADDR=10.194.132.29 WORKER_SSH=leiwu@10.194.132.28 \
-  bash examples/dsv4/launch_dsv4_pretrain_full_2node.sh
+MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-host> \
+  bash examples/dsv4/launch_dsv4_flash_pretrain_2node.sh
 ```
 
 脚本会生成同一个 `PREFLIGHT_ID`，两节点写入 NFS manifest 比对 `LOAD_CKPT` / `GBS` / kernel 后端等，**不一致则 fail-fast**（避免 081342 类 NCCL hang）。
 
 **手动两节点（必须先 head 后 worker，env 必须完全一致）**
 
-**Head (p14, NODE_RANK=0):**
+**Head (NODE_RANK=0):**
 
 ```bash
 cd ~/Lumen
-NODE_RANK=0 MASTER_ADDR=10.194.132.29 \
-MODEL_DIR=/nfs/data/leiwu/models LOG_DIR=/nfs/data/leiwu/logs \
+NODE_RANK=0 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
 SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-  bash examples/dsv4/run_dsv4_pretrain_full.sh
+  bash examples/dsv4/run_dsv4_flash_pretrain.sh
 ```
 
-**Worker (p38, NODE_RANK=1)** — head preflight 通过后再启动：
+**Worker (NODE_RANK=1)** — head preflight 通过后再启动：
 
 ```bash
 cd ~/Lumen
-NODE_RANK=1 MASTER_ADDR=10.194.132.29 \
-MODEL_DIR=/nfs/data/leiwu/models LOG_DIR=/nfs/data/leiwu/logs \
+NODE_RANK=1 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
 SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-  bash examples/dsv4/run_dsv4_pretrain_full.sh
+  bash examples/dsv4/run_dsv4_flash_pretrain.sh
 ```
 
-Preflight 日志：`/nfs/data/leiwu/logs/.dsv4_preflight/runs/<PREFLIGHT_ID>/node*.manifest`
+Preflight 日志：`${LOG_DIR}/.dsv4_preflight/runs/<PREFLIGHT_ID>/node*.manifest`
 
-日志：`/nfs/data/leiwu/logs/lumen_dsv4_full_pretrain_node{0,1}_*.log`
+日志：`${LOG_DIR}/lumen_dsv4_flash_pretrain_node{0,1}_*.log`
 
 ### 首次无 checkpoint：2-node 转换
 
 在 head 上（需挂载 `MILES_DIR`）：
 
 ```bash
-NODE_RANK=0 MASTER_ADDR=10.194.132.29 SKIP_PREPARE=0 \
-  bash examples/dsv4/run_dsv4_pretrain_full.sh
+NODE_RANK=0 MASTER_ADDR=<head-ip> SKIP_PREPARE=0 \
+  bash examples/dsv4/run_dsv4_flash_pretrain.sh
 # 同时在 worker 上 NODE_RANK=1 运行同一命令（prepare 阶段需两节点参与 torchrun convert）
 ```
 

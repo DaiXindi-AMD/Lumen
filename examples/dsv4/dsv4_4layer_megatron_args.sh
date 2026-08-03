@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DSV4 Flash 4-layer Megatron model + training args (sourced by run_dsv4_pretrain_inner.sh).
+# DSV4 Flash 4-layer Megatron model + training args (sourced by run_dsv4_4layer_pretrain_inner.sh).
 #
 # Lumen pretrain smoke default GBS=8 (Miles GRPO smoke uses GBS=256 via rollout 32×8).
 
@@ -81,7 +81,7 @@ DSV4_MODEL_ARGS=(
     --no-activation-func-clamp-shared-expert
 )
 
-# Parallel layout for 8×MI308X smoke (torchrun flags in run_dsv4_pretrain_inner.sh).
+# Parallel layout for 8×MI308X smoke (torchrun flags in run_dsv4_4layer_pretrain_inner.sh).
 TP=8
 PP=1
 CP=1

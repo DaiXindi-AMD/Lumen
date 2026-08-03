@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Launch DSV4 Flash 2-node pretrain from the head node with identical env on both ranks.
 #
-# Usage (on p14 head):
+# Usage (on head node):
 #   cd ~/Lumen
-#   MASTER_ADDR=10.194.132.29 WORKER_SSH=leiwu@10.194.132.110 \
-#     bash examples/dsv4/launch_dsv4_pretrain_full_2node.sh
+#   MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-host> \
+#     bash examples/dsv4/launch_dsv4_flash_pretrain_2node.sh
 #
 # Optional overrides (exported to both nodes):
 #   LOAD_CKPT=0 GBS=8 TRAIN_ITERS=10 SKIP_PREPARE=1 IMAGE=lumen/dsv4-lumen:mi308x
@@ -12,13 +12,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LUMEN_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+# shellcheck source=examples/dsv4/dsv4_paths.sh
+source "${SCRIPT_DIR}/dsv4_paths.sh"
 
 MASTER_ADDR="${MASTER_ADDR:?Set MASTER_ADDR to head node IP}"
-WORKER_SSH="${WORKER_SSH:-leiwu@10.194.132.110}"
+WORKER_ADDR="${WORKER_ADDR:-}"
+WORKER_SSH="${WORKER_SSH:-}"
+if [[ -z "${WORKER_SSH}" && -n "${WORKER_ADDR}" ]]; then
+    WORKER_SSH="${USER}@${WORKER_ADDR}"
+fi
+WORKER_SSH="${WORKER_SSH:?Set WORKER_SSH (e.g. ${USER}@worker-host) or WORKER_ADDR}"
 SSH_KEY="${SSH_KEY:-${HOME}/.ssh/id_ed25519_conductor}"
-MODEL_DIR="${MODEL_DIR:-/nfs/data/leiwu/models}"
-LOG_DIR="${LOG_DIR:-/nfs/data/leiwu/logs}"
 PREFLIGHT_ID="$(date +%Y%m%d_%H%M%S)"
 
 COMMON_ENV=(
@@ -34,7 +38,7 @@ COMMON_ENV=(
     "IMAGE=${IMAGE:-lumen/dsv4-lumen:mi308x}"
     "V4_SPARSE_MLA_BACKEND=${V4_SPARSE_MLA_BACKEND:-triton}"
     "MHC_BACKEND=${MHC_BACKEND:-triton}"
-    "TILEKERNELS_DIR=${TILEKERNELS_DIR:-/home/leiwu/TileKernels}"
+    "TILEKERNELS_DIR=${TILEKERNELS_DIR}"
     "OPTIMIZER_OFFLOAD_FRACTION=${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
 )
 
@@ -64,12 +68,12 @@ join_env() {
     printf '%s' "${out}"
 }
 
-HEAD_LOG="${LOG_DIR}/lumen_dsv4_full_launch_head_${PREFLIGHT_ID}.log"
-WORKER_LOG="${LOG_DIR}/lumen_dsv4_full_launch_worker_${PREFLIGHT_ID}.log"
+HEAD_LOG="${LOG_DIR}/lumen_dsv4_flash_launch_head_${PREFLIGHT_ID}.log"
+WORKER_LOG="${LOG_DIR}/lumen_dsv4_flash_launch_worker_${PREFLIGHT_ID}.log"
 
 cd "${LUMEN_DIR}"
 nohup env NODE_RANK=0 $(join_env) \
-    bash examples/dsv4/run_dsv4_pretrain_full.sh \
+    bash examples/dsv4/run_dsv4_flash_pretrain.sh \
     > "${HEAD_LOG}" 2>&1 &
 HEAD_PID=$!
 echo "[launch] head pid=${HEAD_PID} log=${HEAD_LOG}"
@@ -79,13 +83,13 @@ sleep 5
 if [[ "${WORKER_REACHABLE}" == "1" ]]; then
     ssh -o BatchMode=yes -i "${SSH_KEY}" -o IdentitiesOnly=yes "${WORKER_SSH}" \
         "cd ${LUMEN_DIR} && nohup env NODE_RANK=1 $(join_env) \
-            bash examples/dsv4/run_dsv4_pretrain_full.sh \
+            bash examples/dsv4/run_dsv4_flash_pretrain.sh \
             > ${WORKER_LOG} 2>&1 & echo worker_pid=\$! log=${WORKER_LOG}"
 else
     echo "[launch][WARN] skip worker launch — bring up worker then run:"
-    echo "  cd ${LUMEN_DIR} && NODE_RANK=1 $(join_env) bash examples/dsv4/run_dsv4_pretrain_full.sh"
+    echo "  cd ${LUMEN_DIR} && NODE_RANK=1 $(join_env) bash examples/dsv4/run_dsv4_flash_pretrain.sh"
 fi
 
 echo "[launch] done — tail training logs:"
-echo "  head:   tail -f ${LOG_DIR}/lumen_dsv4_full_pretrain_node0_*.log"
-echo "  worker: tail -f ${LOG_DIR}/lumen_dsv4_full_pretrain_node1_*.log"
+echo "  head:   tail -f ${LOG_DIR}/lumen_dsv4_flash_pretrain_node0_*.log"
+echo "  worker: tail -f ${LOG_DIR}/lumen_dsv4_flash_pretrain_node1_*.log"

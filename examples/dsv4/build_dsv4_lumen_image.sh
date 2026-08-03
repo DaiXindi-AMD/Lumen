@@ -4,7 +4,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LUMEN_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/mnt/data/leiwu/lumen-dsv4-bootstrap}"
+# shellcheck source=examples/dsv4/dsv4_paths.sh
+source "${SCRIPT_DIR}/dsv4_paths.sh"
+
 LUMEN_IMAGE="${LUMEN_IMAGE:-lumen/tests:latest}"
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 STAGING="${LUMEN_DIR}/examples/dsv4/.bootstrap-build"
@@ -31,4 +33,4 @@ docker build -f "${LUMEN_DIR}/Dockerfile.dsv4-lumen" \
     "${LUMEN_DIR}"
 
 echo "==> Done: ${IMAGE}"
-echo "Run: SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 IMAGE=${IMAGE} bash examples/dsv4/run_dsv4_pretrain.sh"
+echo "Run: SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 IMAGE=${IMAGE} bash examples/dsv4/run_dsv4_4layer_pretrain.sh"

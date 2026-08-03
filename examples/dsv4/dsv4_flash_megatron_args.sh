@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# DSV4 Flash full model (43 layers) Megatron args — sourced by run_dsv4_pretrain_full_inner.sh.
+# DSV4 Flash full model (43 layers) Megatron args — sourced by run_dsv4_flash_pretrain_inner.sh.
 #
 # Ported from miles/scripts/models/deepseek-v4-flash.sh with Lumen spec module.
 

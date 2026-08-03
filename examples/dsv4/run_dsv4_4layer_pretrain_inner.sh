@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Inner container entry for run_dsv4_pretrain.sh (sourced config + torchrun).
+# Inner container entry for run_dsv4_4layer_pretrain.sh (sourced config + torchrun).
 set -euo pipefail
 
 cd /workspace/Lumen
@@ -28,11 +28,11 @@ if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
 fi
 if [[ "${SKIP_PREPARE}" != "1" && ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
     if [[ ! -d /workspace/miles ]]; then
-        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_checkpoint.py"
+        echo "[ERROR] Checkpoint missing and MILES_DIR not mounted for prepare_dsv4_4layer_checkpoint.py"
         exit 1
     fi
     export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
-    DSV4_HC_MULT="${DSV4_HC_MULT}" python examples/dsv4/prepare_dsv4_checkpoint.py
+    DSV4_HC_MULT="${DSV4_HC_MULT}" python examples/dsv4/prepare_dsv4_4layer_checkpoint.py
 else
     echo "[prepare] torch_dist checkpoint already present — skipping"
 fi
@@ -57,7 +57,7 @@ fi
 echo "[pretrain] launching torchrun (native Megatron, no Ray) ..."
 echo "[pretrain] batch: GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN} (hc_mult=${DSV4_HC_MULT})"
 torchrun --nproc_per_node=8 --nnodes=1 \
-    examples/dsv4/pretrain_dsv4.py \
+    examples/dsv4/pretrain_dsv4_megatron.py \
     "${DSV4_MODEL_ARGS[@]}" \
     --transformer-impl local \
     --disable-jit-fuser \

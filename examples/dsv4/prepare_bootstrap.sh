@@ -9,7 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/mnt/data/leiwu/lumen-dsv4-bootstrap}"
+# shellcheck source=examples/dsv4/dsv4_paths.sh
+source "${SCRIPT_DIR}/dsv4_paths.sh"
+
 MILES_IMAGE="${MILES_IMAGE:-rlsys/miles:rocm7.2-mi308x}"
 CONTAINER="lumen-dsv4-bootstrap-extract-$$"
 
