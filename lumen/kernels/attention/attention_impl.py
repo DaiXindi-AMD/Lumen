@@ -51,6 +51,17 @@ try:
     )
 except (ImportError, ModuleNotFoundError):
     attn_fwd = None  # type: ignore[assignment]
+    # The remaining names above are only referenced from the FP8 Triton
+    # attention path, which is unreachable once attn_fwd is None. These four
+    # are read at module scope, so mirror the aiter kernel's own defaults.
+    DEBUG = os.environ.get("AITER_ATTENTION_TRITON_AMD_DEBUG", "0").lower() in ("1", "true", "yes")
+    USE_FP8E5M2_BWD = os.environ.get("AITER_ATTENTION_USE_FP8E5M2_BWD", "0").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    FIXED_BLOCK_M = 64
+    FIXED_BLOCK_N = 64
 try:
     from aiter.ops.triton._triton_kernels.attention.mxfp8_attention_kernel import (
         _bwd_kernel_dkdv_mxfp8,
@@ -75,6 +86,16 @@ from lumen.quantize.scaling_manager import ScalingManager
 
 logger = logging.getLogger(__name__)
 _torch_custom_op_wrapper = torch.library.custom_op
+
+if attn_fwd is None:
+    logger.warning(
+        "aiter fp8_attention_kernel unavailable; FP8 Triton attention disabled "
+        "(csrc and BF16 backends unaffected)"
+    )
+if attn_fwd_mxfp8 is None:
+    logger.warning(
+        "aiter mxfp8_attention_kernel unavailable; MXFP8 Triton attention disabled"
+    )
 
 
 ###########################################################################
