@@ -65,6 +65,9 @@ preflight_dsv4_multinode() {
         tilekernels_mounted=1
     fi
 
+    local _load_ckpt="${LOAD_CKPT:-0}"
+    local _train_iters="${TRAIN_ITERS:-${NUM_ROLLOUT:-10}}"
+    local _eval_iters="${EVAL_ITERS:-0}"
     local manifest="${run_dir}/node${NODE_RANK}.manifest"
     local tmp_manifest="${manifest}.$$"
     cat > "${tmp_manifest}" <<EOF
@@ -75,12 +78,12 @@ NNODES=${NNODES}
 NPROC_PER_NODE=${NPROC_PER_NODE}
 MASTER_ADDR=${MASTER_ADDR}
 MASTER_PORT=${MASTER_PORT}
-LOAD_CKPT=${LOAD_CKPT}
+LOAD_CKPT=${_load_ckpt}
 GBS=${GBS}
 MBS=${MBS}
 SEQ_LEN=${SEQ_LEN}
-TRAIN_ITERS=${TRAIN_ITERS}
-EVAL_ITERS=${EVAL_ITERS}
+TRAIN_ITERS=${_train_iters}
+EVAL_ITERS=${_eval_iters}
 MODEL_NAME=${MODEL_NAME}
 DSV4_HC_MULT=${DSV4_HC_MULT}
 SKIP_PREPARE=${SKIP_PREPARE}

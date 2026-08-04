@@ -38,33 +38,36 @@ def prepare(
 
     miles_path = Path(miles_dir)
     if miles_path.is_dir():
-        sys.path.insert(0, str(miles_path))
-        from scripts.gen_fake_rollout_data import (  # noqa: WPS433
-            make_realistic_samples,
-            make_samples,
-            save_rollout_data,
-        )
-
-        bf16_path = f"{model_dir}/{model_name}-bf16"
-        data_path = f"{data_dir}/gsm8k/train.parquet"
-        use_realistic = os.environ.get("SMOKE_LEGACY_FAKE_ROLLOUT", "0") != "1"
-        if use_realistic and Path(bf16_path).is_dir() and Path(data_path).is_file():
-            print(f"[rollout] generating realistic rollout from {data_path}")
-            samples = make_realistic_samples(
-                model_path=bf16_path,
-                data_path=data_path,
-                n_prompts=int(os.environ.get("ROLLOUT_N_PROMPTS", "32")),
-                n_per_prompt=int(os.environ.get("ROLLOUT_N_PER_PROMPT", "8")),
-                response_len=int(os.environ.get("ROLLOUT_RESPONSE_LEN", "64")),
+        try:
+            sys.path.insert(0, str(miles_path))
+            from scripts.gen_fake_rollout_data import (  # noqa: WPS433
+                make_realistic_samples,
+                make_samples,
+                save_rollout_data,
             )
+        except ImportError as exc:
+            print(f"[rollout] Miles rollout helper unavailable ({exc}) — using minimal legacy rollout")
         else:
-            print("[rollout] generating legacy random rollout samples")
-            samples = make_samples(
-                n_prompts=int(os.environ.get("ROLLOUT_N_PROMPTS", "32")),
-                n_per_prompt=int(os.environ.get("ROLLOUT_N_PER_PROMPT", "8")),
-            )
-        save_rollout_data(samples, out)
-        return out
+            bf16_path = f"{model_dir}/{model_name}-bf16"
+            data_path = f"{data_dir}/gsm8k/train.parquet"
+            use_realistic = os.environ.get("SMOKE_LEGACY_FAKE_ROLLOUT", "0") != "1"
+            if use_realistic and Path(bf16_path).is_dir() and Path(data_path).is_file():
+                print(f"[rollout] generating realistic rollout from {data_path}")
+                samples = make_realistic_samples(
+                    model_path=bf16_path,
+                    data_path=data_path,
+                    n_prompts=int(os.environ.get("ROLLOUT_N_PROMPTS", "32")),
+                    n_per_prompt=int(os.environ.get("ROLLOUT_N_PER_PROMPT", "8")),
+                    response_len=int(os.environ.get("ROLLOUT_RESPONSE_LEN", "64")),
+                )
+            else:
+                print("[rollout] generating legacy random rollout samples")
+                samples = make_samples(
+                    n_prompts=int(os.environ.get("ROLLOUT_N_PROMPTS", "32")),
+                    n_per_prompt=int(os.environ.get("ROLLOUT_N_PER_PROMPT", "8")),
+                )
+            save_rollout_data(samples, out)
+            return out
 
     import torch
 
