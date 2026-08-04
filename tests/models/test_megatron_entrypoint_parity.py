@@ -92,6 +92,14 @@ class TestMegatronExampleParity:
         calls = _get_function_calls(LLAMA2_EXAMPLE, "_run_megatron")
         assert "install_fp8_param_gather_hook" in calls
 
+    def test_llama31_installs_mxfp4_weight_cache_hook(self):
+        calls = _get_function_calls(LLAMA31_EXAMPLE, "_run_megatron")
+        assert "install_mxfp4_weight_cache_hook" in calls
+
+    def test_llama2_installs_mxfp4_weight_cache_hook(self):
+        calls = _get_function_calls(LLAMA2_EXAMPLE, "_run_megatron")
+        assert "install_mxfp4_weight_cache_hook" in calls
+
 
 class TestLlama31MegatronArgsParity:
     def test_llama31_add_pretrain_args_drops_moved_shared_flags(self):
@@ -105,7 +113,26 @@ class TestLlama31MegatronArgsParity:
         assert "--gpus-per-node" in literals
 
 
+def _get_nested_function_args(path: Path, outer_name: str, inner_name: str):
+    tree = _parse_module(path)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == outer_name:
+            for child in ast.walk(node):
+                if isinstance(child, ast.FunctionDef) and child.name == inner_name:
+                    spec = child.args
+                    return {a.arg for a in spec.args + spec.posonlyargs + spec.kwonlyargs}
+    return set()
+
+
 class TestSharedMegatronProviderParity:
+    def test_provider_accepts_every_kwarg_megatron_passes(self):
+        # Megatron's get_model calls the provider by keyword, so a kwarg it grows
+        # is a TypeError at model build time rather than anything caught earlier.
+        params = _get_nested_function_args(
+            SHARED_MEGATRON, "make_lumen_model_provider", "model_provider"
+        )
+        assert {"pre_process", "post_process", "vp_stage", "config", "pg_collection"} <= params
+
     def test_shared_provider_forwards_parallel_linear_state(self):
         keywords = _get_call_keywords(
             SHARED_MEGATRON,

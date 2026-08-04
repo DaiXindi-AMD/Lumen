@@ -38,6 +38,7 @@ class TestQuantFormat:
             QuantFormat.FP8_E5M2,
             QuantFormat.HYBRID,
             QuantFormat.MXFP8,
+            QuantFormat.MXFP4,
             QuantFormat.FP4,
         }
 

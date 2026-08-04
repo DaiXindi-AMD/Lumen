@@ -246,6 +246,7 @@ def _run_megatron():
         install_fp8_param_gather_hook,
         install_fp8_param_storage_hook,
         install_hip_graphs_hook,
+        install_mxfp4_weight_cache_hook,
         install_val_loss_early_stop_hook,
         make_lumen_model_provider,
     )
@@ -256,6 +257,7 @@ def _run_megatron():
         fp8_applier=apply_fp8_training,
     )
     install_fp8_param_gather_hook()
+    install_mxfp4_weight_cache_hook()
     install_fp8_param_storage_hook()
     install_hip_graphs_hook()
     install_val_loss_early_stop_hook()

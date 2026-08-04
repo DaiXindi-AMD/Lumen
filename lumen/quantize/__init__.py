@@ -815,8 +815,8 @@ def register_fp8_weight_optimizer_hooks(
 
 
 def register_mxfp4_weight_optimizer_hooks(
-    model: nn.Module,
-    optimizer: torch.optim.Optimizer,
+    model,
+    optimizer,
 ) -> None:
     """Register a post-step hook to invalidate MXFP4 weight caches.
 
@@ -824,13 +824,45 @@ def register_mxfp4_weight_optimizer_hooks(
     across micro-batches within a gradient accumulation step. After
     ``optimizer.step()`` updates BF16 master weights, this hook clears the
     cache so the next forward re-quantizes from the updated weights.
-    """
-    def _post_step(opt, args, kwargs):
-        for m in model.modules():
-            if hasattr(m, "_mxfp4_w_cache"):
-                del m._mxfp4_w_cache
 
-    optimizer.register_step_post_hook(_post_step)
+    Without this the cached FP4 weight is never invalidated, so forward and
+    DGrad keep using the step-0 weights for the whole run — the loss flattens
+    and nothing raises.
+
+    Args:
+        model: A module, or the list of model chunks Megatron builds under
+            virtual pipeline parallelism.
+        optimizer: Any optimizer. Megatron's wrappers are not
+            ``torch.optim.Optimizer`` subclasses and are handled too.
+    """
+    chunks = list(model) if isinstance(model, (list, tuple)) else [model]
+
+    def _invalidate():
+        for chunk in chunks:
+            for m in chunk.modules():
+                if hasattr(m, "_mxfp4_w_cache"):
+                    del m._mxfp4_w_cache
+
+    # Megatron's ChainedOptimizer / DistributedOptimizer are not
+    # torch.optim.Optimizer subclasses and lack register_step_post_hook, so
+    # wrap step() in that case (same approach as
+    # ScalingManager.register_fp8_optimizer_hook).
+    if hasattr(optimizer, "register_step_post_hook"):
+        optimizer.register_step_post_hook(lambda _opt, _a, _k: _invalidate())
+        logger.info("register_mxfp4_weight_optimizer_hooks: registered post-step hook")
+    else:
+        _orig_step = optimizer.step
+
+        def _wrapped_step(*args, **kwargs):
+            result = _orig_step(*args, **kwargs)
+            _invalidate()
+            return result
+
+        optimizer.step = _wrapped_step
+        logger.info(
+            "register_mxfp4_weight_optimizer_hooks: wrapped optimizer.step() "
+            "(no register_step_post_hook)"
+        )
 
 
 def disable(model: nn.Module) -> None:
