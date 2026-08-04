@@ -1,10 +1,22 @@
-# DSV4 4-layer Megatron Pretrain (MI308X)
+# DSV4 on MI308X — GRPO full finetune (recommended) + Megatron pretrain smoke (kernel validation)
 
-在 8×MI308X 上跑 DSV4 Flash 4-layer 的 **native Megatron pretrain smoke**：
-`torchrun` + Lumen `get_dsv4_spec`，**不依赖 Miles `train.py` / Ray**。
+**推荐入口**：`run_dsv4_4layer_finetune.sh` — **GRPO 全参数 finetune**（native torchrun + Lumen `get_dsv4_spec`），不是 pretrain / mock LM loss。
 
-模型实现：`lumen/models/dsv4/`  
-入口脚本：`pretrain_dsv4_megatron.py`（4-layer 与 Flash 全模型共用）
+**Kernel 验证**：`run_dsv4_4layer_pretrain.sh` — native Megatron pretrain smoke（`--mock-data`，无 Ray）。
+
+模型实现：`lumen/models/dsv4/`
+
+---
+
+## 训练模式对比
+
+| 脚本 | 训练类型 | 数据 | 依赖 |
+|------|---------|------|------|
+| **`run_dsv4_4layer_finetune.sh`** | **GRPO full finetune** | GSM8K rollout（默认 fake `.pt`） | native torchrun |
+| `run_dsv4_flash_finetune.sh` | **GRPO full finetune（43L）** | fake `.pt` | native torchrun 2-node |
+| `run_dsv4_4layer_pretrain.sh` | Megatron pretrain smoke | `--mock-data` | torchrun only |
+
+Finetune 与 Miles 对齐：加载预训练 checkpoint → **GRPO policy loss** 更新几乎全部权重（MoE router gate / e-score bias 冻结）。默认 `DEBUG_TRAIN_ONLY=1`（无 SGLang rollout，ROCm 稳定）；与 Miles `run_dsv4_smoke.sh` 相同训练语义。
 
 ---
 
@@ -55,9 +67,15 @@ examples/dsv4/
 ├── build_dsv4_lumen_image.sh           # 构建 lumen/dsv4-lumen:mi308x
 ├── prepare_bootstrap.sh                # 从 Miles 镜像提取 Megatron/tile_kernels 等
 │
-│  ── 4-layer smoke（单机 8 卡）──
+│  ── 4-layer GRPO full finetune（推荐，单机 8 卡）──
+├── run_dsv4_4layer_finetune.sh         # 宿主机 Docker launcher（GRPO）
+├── run_dsv4_4layer_finetune_inner.sh   # 容器内 torchrun GRPO
+├── dsv4_finetune_common.sh             # finetune 共享 bash helpers
+├── smoke_test_dsv4_lumen_grpo.py       # 可选：Miles+Ray 路径（live SGLang）
+│
+│  ── 4-layer pretrain smoke（kernel 验证，单机 8 卡）──
 ├── run_dsv4_4layer_pretrain.sh         # 宿主机 Docker launcher
-├── run_dsv4_4layer_pretrain_inner.sh   # 容器内 torchrun 入口
+├── run_dsv4_4layer_pretrain_inner.sh     # 容器内 torchrun 入口
 ├── prepare_dsv4_4layer_checkpoint.py   # HF → BF16 → torch_dist（可选）
 ├── dsv4_4layer_megatron_args.sh        # 4-layer 模型与并行参数
 │
@@ -71,7 +89,9 @@ examples/dsv4/
 ├── dsv4_flash_mi300x_parallel.sh       # TP4/PP4/EP4 并行
 │
 │  ── 共享 ──
+├── finetune_dsv4_megatron.py           # Megatron GRPO finetune 主程序
 ├── pretrain_dsv4_megatron.py           # Megatron pretrain 主程序
+├── prepare_dsv4_fake_rollout.py        # fake_rollout.pt 生成
 ├── setup_container_env.sh              # 容器内 Megatron / tile_kernels 环境
 ├── dsv4_paths.sh                       # 共享路径默认值（各 launcher source）
 ├── bootstrap_env.sh                    # bootstrap PYTHONPATH / mHC overlay
@@ -145,7 +165,39 @@ DSV4_HC_MULT=2 python examples/dsv4/prepare_dsv4_4layer_checkpoint.py
 
 流程：HF 权重 → FP8 转 BF16 → Megatron `torch_dist`（用 Miles `convert_hf_to_torch_dist.py`，不用 `train.py`）。
 
-### 3. 运行 pretrain smoke test（推荐命令）
+### 3. 运行 GRPO full finetune（推荐）
+
+```bash
+cd ~/Lumen
+# 首次：自动 prepare checkpoint + 下载 GSM8K + 生成 fake rollout
+bash examples/dsv4/run_dsv4_4layer_finetune.sh
+
+# 已有 checkpoint 时跳过 prepare
+SKIP_PREPARE=1 DSV4_HC_MULT=4 bash examples/dsv4/run_dsv4_4layer_finetune.sh
+```
+
+默认 `DEBUG_TRAIN_ONLY=1`：跳过 SGLang，用预生成 rollout 跑 **10 步 GRPO actor 更新**（全参数 finetune，非 pretrain）。
+
+日志：`${LOG_DIR}/lumen_dsv4_4layer_finetune_<timestamp>.log`（Miles 格式 `rollout` / `step` / `perf` 每步各一行）
+
+可选环境变量：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `NUM_ROLLOUT` | `10` | GRPO rollout / 训练步数 |
+| `DEBUG_TRAIN_ONLY` | `1` | `0` = 尝试 live SGLang colocate rollout（ROCm 实验性） |
+| `DSV4_HC_MULT` | `2` | 须与 checkpoint 目录 `_torch_dist_hc{N}` 一致 |
+| `SKIP_PREPARE` | `0` | `1` = 跳过 HF→BF16→torch_dist |
+| `TASK` | `gsm8k` | Miles 数据集任务 |
+| `FP8_TRAINING` | `0` | `1` = Megatron TE FP8 训练（默认 BF16 local impl） |
+
+### 4. 运行 pretrain smoke（kernel 验证，可选）
+
+```bash
+SKIP_PREPARE=1 LOAD_CKPT=1 TRAIN_ITERS=10 bash examples/dsv4/run_dsv4_4layer_pretrain.sh
+```
+
+### 5. 运行 pretrain smoke test（旧文档编号保留）
 
 已有 checkpoint 时：
 
@@ -287,7 +339,10 @@ examples/dsv4/
 ├── run_dsv4_flash_pretrain.sh          # 宿主机 2-node Docker launcher
 ├── run_dsv4_flash_pretrain_inner.sh    # 容器内 multinode torchrun
 ├── preflight_dsv4_flash_multinode.sh   # NFS 两节点配置一致性校验
-└── launch_dsv4_flash_pretrain_2node.sh # head 一键拉起 head+worker（推荐）
+├── launch_dsv4_flash_pretrain_2node.sh # head 一键拉起 head+worker（pretrain）
+├── run_dsv4_flash_finetune.sh          # 宿主机 2-node GRPO finetune launcher
+├── run_dsv4_flash_finetune_inner.sh    # 容器内 multinode torchrun GRPO
+└── launch_dsv4_flash_finetune_2node.sh # head 一键拉起 2-node GRPO finetune（推荐）
 ```
 
 ### 前置：已有 Miles 转换的 checkpoint
@@ -356,7 +411,60 @@ NODE_RANK=0 MASTER_ADDR=<head-ip> SKIP_PREPARE=0 \
 
 ### 与 Miles GRPO 的关系
 
-- **本路径**：Lumen native Megatron **pretrain**（mock data），验证模型/kernel/并行/内存。
-- **Miles GRPO 全链路**（fake rollout / SGLang rollout）：仍用 `miles/scripts/amd/run_deepseek_v4_mi300x_16gpu.sh`。
-- 建议顺序：Lumen 4L smoke → Lumen 全模型 pretrain smoke → Miles GRPO train-only → Miles 完整 GRPO。
+- **pretrain smoke**：Lumen native Megatron **pretrain**（mock data），验证模型/kernel/并行/内存。
+- **GRPO finetune（推荐）**：`run_dsv4_flash_finetune.sh` / `launch_dsv4_flash_finetune_2node.sh` — native `finetune_dsv4_megatron.py` + `fake_rollout.pt` + GRPO policy loss（无 Ray）。
+- **Miles GRPO 全链路**（live SGLang rollout）：仍用 `miles/scripts/amd/run_deepseek_v4_mi300x_16gpu.sh`。
+- 建议顺序：Lumen 4L finetune smoke → Lumen 全模型 finetune smoke → Miles 完整 GRPO（可选）。
+
+---
+
+## DSV4 Flash 全模型 GRPO finetune（2×8，16 GPU）
+
+与 4-layer finetune 相同语义：**加载预训练 checkpoint → GRPO policy loss 全参数更新**（MoE router gate / e-score bias 冻结）。默认 `DEBUG_TRAIN_ONLY=1`，复用 `/root/models/fake_rollout.pt`（可与 4-layer smoke 共用）。
+
+| 项 | 全模型 Lumen finetune | 4-layer Lumen finetune |
+|----|----------------------|------------------------|
+| 节点 | 2×8（16 GPU） | 1×8 |
+| 并行 | TP4 PP4 EP4 | TP8 PP1 EP8 |
+| `GBS` | 256 | 256 |
+| `NUM_ROLLOUT` | 10（默认） | 10 |
+| 入口 | `finetune_dsv4_megatron.py` | 同左 |
+
+**推荐：head 一键拉起**
+
+```bash
+cd ~/Lumen
+MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-host> \
+SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
+  bash examples/dsv4/launch_dsv4_flash_finetune_2node.sh
+```
+
+**手动两节点** — head 与 worker 分别执行（env 必须一致）：
+
+```bash
+# head
+NODE_RANK=0 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
+  bash examples/dsv4/run_dsv4_flash_finetune.sh
+
+# worker（head preflight 通过后再启动）
+NODE_RANK=1 MASTER_ADDR=<head-ip> SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
+  bash examples/dsv4/run_dsv4_flash_finetune.sh
+```
+
+日志：`${LOG_DIR}/lumen_dsv4_flash_finetune_node{0,1}_*.log`（训练指标在 **node0** log 中，Miles 格式）：
+
+```text
+INFO:lumen.models.dsv4.megatron.finetune_loop:rollout 0: {'rollout/num_samples': 256, ...}
+INFO:lumen.models.dsv4.megatron.finetune_loop:step 0: {'train/loss': ..., 'train/grad_norm': ..., 'train/lr-pg_0': ...}
+INFO:lumen.models.dsv4.megatron.finetune_loop:perf 0: {'perf/actor_train_time': ..., 'perf/actor_train_tok_per_s': ...}
+```
+
+额外变量（在 pretrain 变量基础上）：
+
+| 变量 | 默认 | 说明 |
+|------|------|------|
+| `NUM_ROLLOUT` | `10` | GRPO 训练步数 |
+| `GBS` | `256` | 必须等于 rollout 样本数 |
+| `FAKE_ROLLOUT_DATA` | `/root/models/fake_rollout.pt` | debug-train-only rollout |
+| `DEBUG_TRAIN_ONLY` | `1` | 必须为 1（native 路径不支持 live SGLang） |
 

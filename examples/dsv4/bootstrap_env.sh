@@ -9,6 +9,13 @@ AITER_ROOT="${AITER_ROOT:-${LUMEN_DIR}/third_party/aiter}"
 TILEKERNELS_DIR="${TILEKERNELS_DIR:-}"
 WRITABLE_ROOT="${WRITABLE_ROOT:-/tmp/lumen-dsv4-runtime}"
 LUMEN_DSV4_PRETRAIN="${LUMEN_DSV4_PRETRAIN:-0}"
+LUMEN_DSV4_NATIVE_FINETUNE="${LUMEN_DSV4_NATIVE_FINETUNE:-0}"
+
+# Native Megatron pretrain or torchrun GRPO finetune — no Ray / SGLang / Miles requirements.txt.
+_dsv4_megatron_only=0
+if [[ "${LUMEN_DSV4_PRETRAIN}" == "1" || "${LUMEN_DSV4_NATIVE_FINETUNE}" == "1" ]]; then
+    _dsv4_megatron_only=1
+fi
 
 export MEGATRON_PATH="${MEGATRON_PATH:-${BOOTSTRAP_DIR}/Megatron-LM}"
 export MILES_SCRIPT_MEGATRON_PATH="${MEGATRON_PATH}"
@@ -59,7 +66,7 @@ if [[ ! -f "${TILELANG_ROOT}/tilelang/__init__.py" ]]; then
 fi
 
 SGLANG_ROOT="${SGLANG_ROOT:-${WRITABLE_ROOT}/sglang-python}"
-if [[ "${LUMEN_DSV4_PRETRAIN}" != "1" ]]; then
+if [[ "${_dsv4_megatron_only}" != "1" ]]; then
     if [[ ! -f "${SGLANG_ROOT}/sglang/__init__.py" ]]; then
         echo "[bootstrap_env] copying sglang -> ${SGLANG_ROOT}"
         rm -rf "${SGLANG_ROOT}"
@@ -67,7 +74,7 @@ if [[ "${LUMEN_DSV4_PRETRAIN}" != "1" ]]; then
     fi
 fi
 
-if [[ "${LUMEN_DSV4_PRETRAIN}" == "1" ]]; then
+if [[ "${_dsv4_megatron_only}" == "1" ]]; then
     if [[ -d "${MILES_DIR}" ]] && ! python -c "import miles" 2>/dev/null; then
         echo "[bootstrap_env] installing miles (no-deps, for Megatron router hook) ..."
         pip install -e "${MILES_DIR}" --no-deps -q
@@ -95,8 +102,8 @@ fi
 
 echo "[bootstrap_env] MEGATRON_PATH=${MEGATRON_PATH}"
 
-# Miles python deps (skip for native Megatron pretrain — no Ray/train.py).
-if [[ "${LUMEN_DSV4_PRETRAIN}" != "1" ]]; then
+# Miles + SGLang stack (Ray train.py / live rollout). Skip on megatron-only paths.
+if [[ "${_dsv4_megatron_only}" != "1" ]]; then
     if ! python -c "import ray" 2>/dev/null; then
         echo "[bootstrap_env] installing miles python deps..."
         grep -vE 'nvidia-resiliency-ext|torchft-nightly' "${MILES_DIR}/requirements.txt" \
@@ -106,10 +113,12 @@ if [[ "${LUMEN_DSV4_PRETRAIN}" != "1" ]]; then
     if ! python -c "import miles" 2>/dev/null; then
         pip install -e "${MILES_DIR}" --no-deps -q
     fi
-fi
 
-echo "[bootstrap_env] installing bootstrap runtime deps..."
-pip install -r "${LUMEN_DIR}/examples/dsv4/requirements-bootstrap.txt" -q
+    echo "[bootstrap_env] installing bootstrap runtime deps..."
+    pip install -r "${LUMEN_DIR}/examples/dsv4/requirements-bootstrap.txt" -q
+else
+    echo "[bootstrap_env] skip miles python deps (megatron-only: pretrain or native finetune)"
+fi
 
 # MORI EP: host mount replaces image-built libmori_pybinds.so — restore or rebuild.
 if [[ "${LUMEN_DSV4_MOE_MORI:-0}" == "1" ]]; then
@@ -154,7 +163,10 @@ import os
 
 required = ["tile_kernels", "megatron.core", "tilelang"]
 optional = ["transformer_engine", "fast_hadamard_transform"]
-if os.environ.get("LUMEN_DSV4_PRETRAIN", "0") == "1":
+_megatron_only = os.environ.get("LUMEN_DSV4_PRETRAIN", "0") == "1" or os.environ.get(
+    "LUMEN_DSV4_NATIVE_FINETUNE", "0"
+) == "1"
+if _megatron_only:
     required = ["miles", *required]
 else:
     required = ["ray", "miles", "sglang", *required]

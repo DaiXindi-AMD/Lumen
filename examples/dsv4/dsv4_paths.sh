@@ -28,11 +28,13 @@ if [[ -z "${DATA_ROOT:-}" ]]; then
     DATA_ROOT="${DATA_ROOT:-${WORKSPACE_ROOT}/dsv4-data}"
 fi
 
+DATA_DIR="${DATA_DIR:-${DATA_ROOT}/datasets}"
 NFS_ROOT="${NFS_ROOT:-/nfs/data}"
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-${DATA_ROOT}/lumen-dsv4-bootstrap}"
 MODEL_DIR="${MODEL_DIR:-${DATA_ROOT}/models}"
 LOG_DIR="${LOG_DIR:-${DATA_ROOT}/logs}"
 TVM_CACHE_DIR="${TVM_CACHE_DIR:-${DATA_ROOT}/tvm-cache}"
+PIP_CACHE_DIR="${PIP_CACHE_DIR:-${DATA_ROOT}/pip-cache}"
 MEGATRON_PATH="${MEGATRON_PATH:-${DATA_ROOT}/Megatron-LM-miles-main}"
 
 unset _dsv4_data_candidate

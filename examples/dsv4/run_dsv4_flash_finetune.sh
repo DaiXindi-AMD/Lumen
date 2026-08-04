@@ -1,21 +1,25 @@
 #!/usr/bin/env bash
-# run_dsv4_flash_pretrain.sh — DSV4 Flash full model (43L) 2×8 MI300X/MI308X pretrain smoke.
+# run_dsv4_flash_finetune.sh — DSV4 Flash full model (43L) 2×8 GRPO full finetune.
 #
-# Native Megatron + Lumen get_dsv4_spec (no Miles train.py / Ray).
+# Native torchrun + finetune_dsv4_megatron.py + fake_rollout.pt + GRPO policy loss
+# (no Miles train.py / Ray). Default DEBUG_TRAIN_ONLY=1.
+#
 # Run on EACH node with NODE_RANK=0 (head) and NODE_RANK=1 (worker).
 #
 # Example (head):
-#   NODE_RANK=0 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
-#   SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-#     bash examples/dsv4/run_dsv4_flash_pretrain.sh
+#   NODE_RANK=0 MASTER_ADDR=<head-ip> DATA_ROOT=/mnt/data/$USER \
+#   SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
+#     bash examples/dsv4/run_dsv4_flash_finetune.sh
 #
 # Example (worker):
-#   NODE_RANK=1 MASTER_ADDR=<head-ip> DATA_ROOT=/nfs/data/$USER \
-#   SKIP_PREPARE=1 LOAD_CKPT=0 TRAIN_ITERS=10 \
-#     bash examples/dsv4/run_dsv4_flash_pretrain.sh
+#   NODE_RANK=1 MASTER_ADDR=<head-ip> DATA_ROOT=/mnt/data/$USER \
+#   SKIP_PREPARE=1 GBS=256 NUM_ROLLOUT=10 \
+#     bash examples/dsv4/run_dsv4_flash_finetune.sh
 #
-# For GRPO full finetune (recommended), use run_dsv4_flash_finetune.sh instead.
+# Or use launch_dsv4_flash_finetune_2node.sh from the head node.
+#
 # For 4-layer single-node finetune, use run_dsv4_4layer_finetune.sh instead.
+# For kernel-only mock pretrain smoke, use run_dsv4_flash_pretrain.sh instead.
 
 set -euo pipefail
 
@@ -33,10 +37,11 @@ MASTER_PORT="${MASTER_PORT:-29500}"
 
 MODEL_NAME="${MODEL_NAME:-DeepSeek-V4-Flash-FP8}"
 DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
+DATA_DIR="${DATA_DIR:-${DATA_ROOT}/datasets}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
-TRAIN_ITERS="${TRAIN_ITERS:-10}"
-LOAD_CKPT="${LOAD_CKPT:-0}"
-EVAL_ITERS="${EVAL_ITERS:-1}"
+NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
+DEBUG_TRAIN_ONLY="${DEBUG_TRAIN_ONLY:-1}"
+GBS="${GBS:-256}"
 OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 
@@ -51,7 +56,7 @@ V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 LUMEN_DSV4_LINEAR_FP8="${LUMEN_DSV4_LINEAR_FP8:-0}"
 
 TORCH_DIST="${MODEL_DIR}/${MODEL_NAME}_torch_dist"
-LOGFILE="${LOG_DIR}/lumen_dsv4_flash_pretrain_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log"
+LOGFILE="${LOG_DIR}/lumen_dsv4_flash_finetune_node${NODE_RANK}_$(date +%Y%m%d_%H%M%S).log"
 
 USE_MILES_IMAGE=0
 if [[ "${IMAGE}" == miles-dsv4-mi300x* || "${IMAGE}" == rlsys/miles* ]]; then
@@ -84,7 +89,7 @@ if ! ls /dev/kfd &>/dev/null; then
     exit 1
 fi
 
-mkdir -p "${MODEL_DIR}" "${LOG_DIR}" "${MODEL_DIR}/miopen-cache" "${TVM_CACHE_DIR}"
+mkdir -p "${MODEL_DIR}" "${DATA_DIR}" "${LOG_DIR}" "${MODEL_DIR}/miopen-cache" "${TVM_CACHE_DIR}" "${PIP_CACHE_DIR}"
 
 if [[ "${NNODES}" -gt 1 ]]; then
     # shellcheck source=examples/dsv4/preflight_dsv4_flash_multinode.sh
@@ -93,34 +98,36 @@ if [[ "${NNODES}" -gt 1 ]]; then
 fi
 
 echo "════════════════════════════════════════════════"
-echo "  Lumen DSV4 Flash FULL pretrain smoke (16 GPU)"
+echo "  Lumen DSV4 Flash FULL GRPO finetune (16 GPU)"
 echo "  Image     : ${IMAGE}"
+echo "  Mode      : native torchrun GRPO (debug-train-only)"
+echo "  Logs      : Miles format rollout/step/perf per GRPO step"
 echo "  Workspace : ${WORKSPACE_ROOT}  (data: ${DATA_ROOT})"
+echo "  Miles     : ${MILES_DIR}"
 echo "  Nodes     : ${NNODES}×${NPROC_PER_NODE}  node_rank=${NODE_RANK}"
 echo "  Master    : ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Parallel  : TP4 PP4 EP4 (11+11+11+10)"
-echo "  Steps     : ${TRAIN_ITERS}"
-echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
-echo "  Ckpt load : LOAD_CKPT=${LOAD_CKPT}"
-echo "  Preflight : PREFLIGHT_ID=${PREFLIGHT_ID:-n/a}"
-echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} TileKernels=${TILEKERNELS_DIR}"
-echo "  HC mult   : ${DSV4_HC_MULT}"
+echo "  Rollouts  : ${NUM_ROLLOUT}"
+echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN:-4096}"
+echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
+echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
 echo "  Optimizer : CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
-echo "  Ckpt path : ${TORCH_DIST} (used only when LOAD_CKPT=1)"
+echo "  Ckpt      : ${TORCH_DIST}"
+echo "  Rollout   : ${MODEL_DIR}/fake_rollout.pt (shared with 4L smoke OK)"
 echo "  Log       : ${LOGFILE}"
 echo "════════════════════════════════════════════════"
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${MILES_DIR}:/workspace/miles"
     -v "${MODEL_DIR}:/root/models"
+    -v "${DATA_DIR}:/root/datasets"
     -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
+    -v "${PIP_CACHE_DIR}:/root/.cache/pip"
 )
 if [[ -d "${NFS_ROOT}" ]]; then
     DOCKER_MOUNTS+=(-v "${NFS_ROOT}:${NFS_ROOT}")
-fi
-if [[ -d "${MILES_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${MILES_DIR}:/workspace/miles")
 fi
 if [[ -d "${TILEKERNELS_DIR}" ]]; then
     DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
@@ -134,17 +141,19 @@ fi
 
 DOCKER_ENV=(
     -e LUMEN_DIR=/workspace/Lumen
+    -e MILES_DIR=/workspace/miles
+    -e LUMEN_DSV4_NATIVE_FINETUNE=1
     -e LUMEN_DSV4_PRETRAIN=1
     -e MODEL_DIR=/root/models
+    -e DATA_DIR=/root/datasets
     -e MODEL_NAME="${MODEL_NAME}"
-    -e TRAIN_ITERS="${TRAIN_ITERS}"
+    -e DSV4_HC_MULT="${DSV4_HC_MULT}"
+    -e SKIP_PREPARE="${SKIP_PREPARE}"
+    -e NUM_ROLLOUT="${NUM_ROLLOUT}"
     -e GBS="${GBS}"
     -e MBS="${MBS}"
-    -e SEQ_LEN="${SEQ_LEN}"
-    -e SKIP_PREPARE="${SKIP_PREPARE}"
-    -e LOAD_CKPT="${LOAD_CKPT}"
-    -e EVAL_ITERS="${EVAL_ITERS}"
-    -e DSV4_HC_MULT="${DSV4_HC_MULT}"
+    -e SEQ_LEN="${SEQ_LEN:-4096}"
+    -e DEBUG_TRAIN_ONLY="${DEBUG_TRAIN_ONLY}"
     -e NNODES="${NNODES}"
     -e NPROC_PER_NODE="${NPROC_PER_NODE}"
     -e NODE_RANK="${NODE_RANK}"
@@ -174,9 +183,6 @@ DOCKER_ENV=(
 if [[ -d "${TILEKERNELS_DIR}" ]]; then
     DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
 fi
-if [[ -d "${MILES_DIR}" ]]; then
-    DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
-fi
 if [[ "${USE_MILES_IMAGE}" -eq 1 ]]; then
     DOCKER_ENV+=(
         -e RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1
@@ -189,7 +195,7 @@ elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
     DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
 fi
 
-CONTAINER_NAME="lumen-dsv4-full-node${NODE_RANK}"
+CONTAINER_NAME="lumen-dsv4-flash-finetune-node${NODE_RANK}"
 docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 DOCKER_RUN=(
@@ -216,7 +222,7 @@ fi
     "${DOCKER_MOUNTS[@]}" \
     "${DOCKER_ENV[@]}" \
     "${IMAGE}" \
-    bash /workspace/Lumen/examples/dsv4/run_dsv4_flash_pretrain_inner.sh \
+    bash /workspace/Lumen/examples/dsv4/run_dsv4_flash_finetune_inner.sh \
     2>&1 | tee "${LOGFILE}"
 
 echo ""
