@@ -4,7 +4,7 @@
 - PDF：`docs/papers/mxfp4_native_fp4_hardware_2605.09825.pdf`
 - Lumen 侧参照：`docs/mxfp4_status_report.md`、`docs/mxfp4_training_report.md`、`docs/mxfp4_debug_flow.md`、`lumen/ops/quantize/linear.py`、`lumen/ops/quantize/ops.py`
 
-> 本文档反映**当前实现状态**。论文对 Lumen 的核心指导（Wgrad 是主因、确定性 Hadamard、末尾层保 BF16）均已落地并验证：8B MXFP4 已稳定收敛 5000 步。历史排查过程见 `docs/mxfp4_debug_flow.md`。
+> 本文档反映**当前实现状态**。论文对 Lumen 的核心指导（Wgrad 是主因、确定性 Hadamard、H16）均已落地并验证：8B MXFP4 已稳定收敛 5000 步。第三条稳定手段"末尾层保 BF16"来自 NVFP4 论文而非本文，见 §3(3)。历史排查过程见 `docs/mxfp4_debug_flow.md`。
 
 ---
 
@@ -41,7 +41,7 @@
 | Hadamard 随机性 | 结论：**必须确定性**（随机符号在 Wgrad 全量化时不收敛） | **确定性（全 +1）** —— `_get_mxfp4_rht_sign()` 返回 `torch.ones(...)`，与论文结论一致 ✅ |
 | Wgrad 舍入 | SR 单独用不收敛 → 靠确定性 Hadamard 稳定 | 两操作数用 **SR**，但叠加在**确定性** Hadamard 上（非论文中失败的"随机+SR"组合），实测稳定 |
 | Hadamard block 大小 | H16 最优（比 H32 快 8%），H32 也可行 | **g=16**（`_MXFP4_RHT_G = 16`）✅ |
-| 末尾层保高精度 | 保留 ~15% 层（末尾为主）BF16 | **默认保留末尾 `round(0.15·L)` 层 BF16**（8B: 5/36 层）✅ |
+| 末尾层保高精度 | **论文未涉及**：所有 transformer linear layer 全量化，无按层豁免（基线是 FP8） | **默认保留末尾 `round(0.15·L)` 层 BF16**（8B: 5/36 层）—— 依据是 NVFP4 论文 §4 / 附录 E.2 |
 | 量化粒度策略 | 附录D：2D 适合权重，1D 行适合激活 | 权重 2D(32×32)，激活 1D(1×32) —— **与论文附录D 一致** ✅ |
 | 端到端结果 | 全链路 MXFP4+确定性 Hadamard：比 FP8 快 9–10%，token 开销 8–9% | 0.6B 收敛 (Δloss +0.045)；8B 收敛 (val_loss 7.07→5.74, 5000 步)。**当前 8B 比 BF16 快 6.7%**（869.4 vs 928.0 ms，见 `mxfp4_optimization_report.md`） |
 
@@ -49,7 +49,7 @@
 
 ## 3. Lumen 如何落地论文配方 + 结果
 
-论文对 Lumen 8B 收敛问题的三条关键指导，均已应用（对照代码）：
+解决 Lumen 8B 收敛问题的三条关键措施，均已应用（对照代码）。前两条出自本文，第三条出自 NVFP4 论文：
 
 **(1) 确定性 Hadamard（非随机符号）** — WGrad 沿 reduction dim M 做 blockwise Hadamard，两操作数共用同一个 H，在 GEMM 内对消 `(dY^T H)(X^T H)^T = dY^T X`：
 
@@ -97,7 +97,7 @@ def _get_mxfp4_rht_sign(device: torch.device) -> torch.Tensor:
 
 **(2) G=16** — `_MXFP4_RHT_G = 16`（论文：H16 比 H32 快 8% 且同等稳定）。
 
-**(3) 末尾层保 BF16** — MXFP4 预训练脚本默认保留末尾 ~15% 层为 BF16（`pretrain_qwen3_mxfp4.py`）。论文（及 NVFP4 论文）均指出末尾层对 FP4 最敏感。
+**(3) 末尾层保 BF16** — MXFP4 预训练脚本默认保留末尾 ~15% 层为 BF16（`pretrain_qwen3_mxfp4.py`）。⚠️ 这条**不是本文的结论**，而是 NVFP4 论文 §4 / 附录 E.2 的（"末尾线性层最敏感，保留 <15% 在 BF16/MXFP8"）。本文对所有 linear layer 全量化，"最敏感"指的是 **Wgrad 这条通路**，不是层的位置。
 
 **结果**：8B MXFP4 从原先的 step ~1275–3600 崩溃（loss spike 到 11.94），改为 **5000 步稳定收敛，val_loss 7.07→5.74，零发散**（lr=1e-4, warmup=50, FSDP2 8×MI350X）。详见 `docs/mxfp4_status_report.md` §4.4 与 `docs/mxfp4_debug_flow.md`。
 

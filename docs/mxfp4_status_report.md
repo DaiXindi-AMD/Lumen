@@ -165,7 +165,8 @@ WGrad 的处理流程：
    (G=16, sign=全+1)，butterfly 全在寄存器里，接着寄存器内量化写出 packed FP4 + scale。
    两个操作数用同一个 H，在 GEMM 内消掉：(dY^T H)(X^T H)^T = dY^T HH^T X = dY^T X。
    确定性 sign（不用随机 ±1）按 arXiv:2605.09825 的结论 —— 随机 sign 在 Wgrad 全量化时导致发散。
-   G=16（而非 32）按两篇论文推荐，kernel 快 8% 且同等稳定。
+   G=16（而非 32）按 arXiv:2605.09825：H16 kernel 快 8% 且同等稳定。（NVFP4 论文对 NVFP4 也用 16×16，
+   但对 MXFP4 是用 d=32 去对齐 block 大小的，所以这里跟的是 AMD/PSU 那篇。）
 4. **GEMM**: `gemm_mxfp4_dispatch(dY^T_fp4, X^T_fp4) → dW`
 
 `M % 16 != 0` 时跳过 Hadamard，两个操作数走普通 `convert_to_mxfp4`（SR/RTN 分工不变）。
@@ -201,7 +202,7 @@ BF16 对比：0 quant, 0 dequant, 0 Hadamard, 0 transpose, 3 BF16 GEMMs。
 
 ### 3.6 混合精度：末尾层保留 BF16
 
-按 NVFP4 (NVIDIA, arXiv:2509.25149) §4 和 arXiv:2605.09825 的结论——**末尾线性层对 FP4 量化最敏感**，两篇都建议保留 ~15% 层（以末尾为主）在高精度。该机制已接入训练脚本：
+按 NVFP4 (NVIDIA, arXiv:2509.25149) §4 / 附录 E.2 的结论——**末尾线性层对 FP4 量化最敏感**，该文建议保留 ~15% 层（以末尾为主）在高精度。arXiv:2605.09825 (AMD/PSU) 没有这条：它对所有 transformer linear layer 全量化（基线是 FP8），稳定手段只有确定性 Hadamard。该机制已接入训练脚本：
 
 ```265:268:examples/qwen3/pretrain_qwen3_mxfp4.py
     # MXFP4: keep last ~15% layers in BF16 (NVFP4 paper §4:末尾层最敏感)
@@ -334,7 +335,7 @@ FSDP2 fix 后，所有全量化变体仍在 step ~1275-3600 崩溃（FSDP2 fix �
 | 全量化, H32, 确定性 sign        | step ~1275 crash              |
 | **H16 + 末尾 5 层 BF16**       | **5000 步稳定, val_loss 5.74** |
 
-两篇论文均指出末尾层对 FP4 最敏感，保留 ~15% 在 BF16 是头号稳定性建议。H16 比 H32 快 8% 且同等稳定。详细排查流程见 `docs/mxfp4_debug_flow.md`。
+NVFP4 论文指出末尾层对 FP4 最敏感，保留 ~15% 在 BF16 是其头号稳定性建议（AMD/PSU 那篇不涉及层位置敏感度）。H16 比 H32 快 8% 且同等稳定。详细排查流程见 `docs/mxfp4_debug_flow.md`。
 
 ---
 
