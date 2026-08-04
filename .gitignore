@@ -15,3 +15,11 @@ wandb/
 runs/
 train_*.log
 .claude/worktrees/
+
+# Corpora staged by the Qwen3 Megatron launcher (hundreds of MB each)
+examples/qwen3/results/mock_data/
+examples/qwen3/results/c4_data/
+# Run output: training logs and the per-shape GEMM backend cache. Megabytes per
+# run, and the numbers worth keeping are quoted in docs/mxfp4_training_report.md.
+examples/qwen3/results/*.log
+examples/qwen3/results/mxfp4_autotune_*.json
