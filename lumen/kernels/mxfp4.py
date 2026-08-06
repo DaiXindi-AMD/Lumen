@@ -36,6 +36,13 @@ import triton.language as tl
 FP4_E2M1_MAX = 6.0
 _E2M1_EMAX = 2  # largest normal biased exponent for E2M1
 
+# Philox rounds behind stochastic rounding. Triton defaults to 10; Random123's
+# authors report Philox4x32-7 already passing BigCrush, and rounding noise asks
+# less of a generator than a simulation does. Dropping the three spare rounds
+# takes 8-12% off the dual-layout quantizer, where SR is a fifth of the work.
+SR_PHILOX_ROUNDS = 7
+SR_PHILOX_ROUNDS_C = tl.constexpr(SR_PHILOX_ROUNDS)
+
 
 # ---------------------------------------------------------------------------
 # Scale calculation (shared by RTN and SR paths)
@@ -115,11 +122,27 @@ def _calculate_fp4_scales(
 
 
 @triton.jit
-def _generate_randval(m, n, philox_seed, philox_offset):
+def _generate_randval(m: tl.constexpr, n: tl.constexpr, philox_seed, philox_offset):
+    """An (m, n) tile of random 32-bit words for stochastic rounding.
+
+    Philox emits four words per round whether or not the caller reads them, so
+    taking one word per element pays four times the rounds it needs. Spreading
+    each round's four words across four adjacent columns covers the same tile in
+    a quarter of the rounds: on the dual-layout quantizer that drops SR from 44%
+    of kernel time to nothing measurable (0.146 ms -> 0.059 ms vs 0.057 ms RTN).
+    """
+    if n % 4 == 0:
+        QN: tl.constexpr = n // 4
+        ms = tl.arange(0, m)
+        ns = tl.arange(0, QN)
+        rng_offsets = philox_offset + ms[:, None] * QN + ns[None, :]
+        r0, r1, r2, r3 = tl.randint4x(philox_seed, rng_offsets, SR_PHILOX_ROUNDS_C)
+        return tl.join(tl.join(r0, r1), tl.join(r2, r3)).reshape(m, n)
+    # Narrow tiles can't be quartered; fall back to one round per element.
     ms = tl.arange(0, m)
     ns = tl.arange(0, n)
     rng_offsets = philox_offset + ms[:, None] * n + ns[None, :]
-    r1, _, _, _ = tl.randint4x(philox_seed, rng_offsets)
+    r1, _, _, _ = tl.randint4x(philox_seed, rng_offsets, SR_PHILOX_ROUNDS_C)
     return r1
 
 
@@ -296,6 +319,10 @@ def _convert_to_mxfp4_kernel(
     IS_2D_BLOCK: tl.constexpr,
     USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
+    SWIZZLE_SCALE: tl.constexpr,
+    NUM_SCALE_COLS: tl.constexpr,
+    SHUFFLE_DATA: tl.constexpr = False,
+    NUM_PACKED_COLS: tl.constexpr = 0,
 ):
     """BF16/FP32 → packed MXFP4 with E8M0 block scales.
 
@@ -348,9 +375,27 @@ def _convert_to_mxfp4_kernel(
 
     # Store packed FP4 output (HALF_BLOCK_N bytes per row)
     offs_yn = pid_n * HALF_BLOCK_N + tl.arange(0, HALF_BLOCK_N)
-    offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
-    tl.store(y_ptr + offs_y, y)
-    tl.store(s_ptr + offs_s, scales)
+    if SHUFFLE_DATA:
+        tl.store(
+            y_ptr + _shuffled_fp4_offsets(
+                offs_m[:, None], offs_yn[None, :], NUM_PACKED_COLS,
+                TILE_ROWS=MXFP4_SHUFFLE_TILE_ROWS_C, UNIT=MXFP4_SHUFFLE_UNIT_BYTES_C,
+            ),
+            y,
+        )
+    else:
+        offs_y = offs_m[:, None] * stride_ym + offs_yn[None, :] * stride_yn
+        tl.store(y_ptr + offs_y, y)
+    if SWIZZLE_SCALE:
+        tl.store(
+            s_ptr + _swizzled_scale_offsets(
+                offs_sm[:, None], offs_sn[None, :], NUM_SCALE_COLS,
+                STRIPE=MXFP4_SCALE_STRIPE_C, KCHUNK=MXFP4_SCALE_KCHUNK_C,
+            ),
+            scales,
+        )
+    else:
+        tl.store(s_ptr + offs_s, scales)
 
 
 # ---------------------------------------------------------------------------
@@ -366,10 +411,18 @@ def _transpose_packed_fp4_kernel(
     stride_om, stride_on,
     BLOCK_M: tl.constexpr,
     BLOCK_N_PACKED: tl.constexpr,
+    SHUFFLE_DATA: tl.constexpr = False,
+    NUM_PACKED_COLS: tl.constexpr = 0,
+    IN_SHUFFLED: tl.constexpr = False,
 ):
     """Transpose packed FP4: (M, N//2) -> (N, M//2).
 
     Unpacks nibbles, transposes, repacks.
+
+    ``SHUFFLE_DATA`` stores the result in the GEMM's B-operand order instead of
+    row-major, for callers whose only consumer is that GEMM. ``IN_SHUFFLED``
+    says the input already sits in that order, so the tile is gathered through
+    the same map instead of a pass first putting it back row-major.
     """
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
@@ -382,8 +435,14 @@ def _transpose_packed_fp4_kernel(
     rn_packed = pid_n * BLOCK_N_PACKED + tl.arange(0, BLOCK_N_PACKED)
 
     mask = (rm[:, None] < M) & (rn_packed[None, :] < N_packed)
-    packed = tl.load(in_ptr + rm[:, None] * stride_im + rn_packed[None, :] * stride_in,
-                     mask=mask, other=0).to(tl.uint8)
+    if IN_SHUFFLED:
+        in_offs = _shuffled_fp4_offsets(
+            rm[:, None], rn_packed[None, :], N_packed,
+            TILE_ROWS=MXFP4_SHUFFLE_TILE_ROWS_C, UNIT=MXFP4_SHUFFLE_UNIT_BYTES_C,
+        )
+    else:
+        in_offs = rm[:, None] * stride_im + rn_packed[None, :] * stride_in
+    packed = tl.load(in_ptr + in_offs, mask=mask, other=0).to(tl.uint8)
 
     # AITER convention: even in low nibble, odd in high nibble
     even = packed & 0x0F
@@ -399,8 +458,17 @@ def _transpose_packed_fp4_kernel(
     rn_full = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     rm_packed = pid_m * BLOCK_M_HALF + tl.arange(0, BLOCK_M_HALF)
     out_mask = (rn_full[:, None] < N) & (rm_packed[None, :] < (M // 2))
-    tl.store(out_ptr + rn_full[:, None] * stride_om + rm_packed[None, :] * stride_on,
-             repacked, mask=out_mask)
+    if SHUFFLE_DATA:
+        tl.store(
+            out_ptr + _shuffled_fp4_offsets(
+                rn_full[:, None], rm_packed[None, :], NUM_PACKED_COLS,
+                TILE_ROWS=MXFP4_SHUFFLE_TILE_ROWS_C, UNIT=MXFP4_SHUFFLE_UNIT_BYTES_C,
+            ),
+            repacked, mask=out_mask,
+        )
+    else:
+        tl.store(out_ptr + rn_full[:, None] * stride_om + rm_packed[None, :] * stride_on,
+                 repacked, mask=out_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +566,23 @@ def _hadamard16_butterfly(x, ROWS: tl.constexpr):
     return x * 0.25  # 1/sqrt(16) = 0.25
 
 
+@triton.jit
+def _hadamard16_mfma(x, hmat_ptr, ROWS: tl.constexpr):
+    """Hadamard-16 of ``x`` (any shape whose last axis groups into 16) via MFMA.
+
+    ``hmat_ptr`` holds diag(sign) @ H16 / sqrt(16), which is the same linear map
+    the butterfly applies. Its entries are ±1/4 and the caller's values are
+    BF16-exact, so routing it through the matrix unit costs nothing in accuracy
+    and replaces four stages of cross-lane reshuffling with one instruction —
+    measured 33% off the dual-layout quantizer, 1.49 → 2.21 TB/s.
+
+    Caller must pass BF16 ``x``; an FP32 operand would be truncated here.
+    """
+    G: tl.constexpr = 16
+    hmat = tl.load(hmat_ptr + tl.arange(0, G)[:, None] * G + tl.arange(0, G)[None, :])
+    return tl.dot(x.reshape(ROWS, G), hmat, out_dtype=tl.float32)
+
+
 # ---------------------------------------------------------------------------
 # Fused Hadamard + MXFP4 Quantization kernel
 # ---------------------------------------------------------------------------
@@ -505,7 +590,7 @@ def _hadamard16_butterfly(x, ROWS: tl.constexpr):
 
 @triton.jit
 def _fused_hadamard_quant_mxfp4_kernel(
-    x_ptr, y_ptr, s_ptr, sign_ptr,
+    x_ptr, y_ptr, s_ptr, sign_ptr, hmat_ptr,
     stride_xm, stride_xn,
     stride_ym, stride_yn,
     stride_sm, stride_sn,
@@ -516,12 +601,14 @@ def _fused_hadamard_quant_mxfp4_kernel(
     USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
 ):
-    """BF16 → Hadamard-16 rotate (in-register butterfly) → packed MXFP4 + E8M0 scales.
+    """BF16 → Hadamard-16 rotate (in-register) → packed MXFP4 + E8M0 scales.
 
     Fuses hadamard_transform + convert_to_mxfp4 into a single kernel,
-    eliminating one global memory roundtrip. The Hadamard rotation uses
-    an O(N log N) butterfly algorithm entirely in registers.
-    Hardcoded for G=16.
+    eliminating one global memory roundtrip. Hardcoded for G=16.
+
+    A BF16 input takes the matrix-unit rotation, matching what the dual-layout
+    and WGrad-activation quantizers do so the three agree bit for bit; an FP32
+    input keeps the butterfly, which does not have to narrow the operand.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -536,14 +623,15 @@ def _fused_hadamard_quant_mxfp4_kernel(
     offs_xn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
 
     offs_x = offs_m[:, None] * stride_xm + offs_xn[None, :] * stride_xn
-    x = tl.load(x_ptr + offs_x).to(tl.float32)
+    x_in = tl.load(x_ptr + offs_x)
 
-    # --- Hadamard-16 butterfly in registers (zero memory traffic) ---
-    sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
-    x = x.reshape(ROWS, G)
-    x = x * sign[None, :]
-    x = _hadamard16_butterfly(x, ROWS=ROWS)
-    x = x.reshape(BLOCK_M, BLOCK_N)
+    # --- Hadamard-16 in registers (zero memory traffic) ---
+    if x_in.type.element_ty == tl.bfloat16:
+        x = _hadamard16_mfma(x_in, hmat_ptr, ROWS=ROWS).reshape(BLOCK_M, BLOCK_N)
+    else:
+        sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
+        x = x_in.to(tl.float32).reshape(ROWS, G) * sign[None, :]
+        x = _hadamard16_butterfly(x, ROWS=ROWS).reshape(BLOCK_M, BLOCK_N)
 
     # --- FP4 quantization in registers ---
     scales = _calculate_fp4_scales(
@@ -576,6 +664,149 @@ def _fused_hadamard_quant_mxfp4_kernel(
 
 
 # ---------------------------------------------------------------------------
+# Dual-layout quantization: one read of x, both MXFP4 layouts backward needs
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _dual_layout_quant_mxfp4_kernel(
+    x_ptr,
+    a_ptr, as_ptr,
+    b_ptr, bs_ptr,
+    sign_ptr, hmat_ptr,
+    stride_xm, stride_xn,
+    stride_am, stride_an,
+    stride_asm, stride_asn,
+    stride_bm, stride_bn,
+    stride_bsm, stride_bsn,
+    philox_seed, philox_offset_a, philox_offset_b,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_SR_A: tl.constexpr,
+    USE_SR_B: tl.constexpr,
+    USE_ASM: tl.constexpr,
+    SWIZZLE_SCALE: tl.constexpr,
+    NUM_SCALE_COLS_A: tl.constexpr,
+    NUM_SCALE_COLS_B: tl.constexpr,
+    SHUFFLE_B: tl.constexpr = False,
+    NUM_PACKED_COLS_B: tl.constexpr = 0,
+):
+    """One tile read of x → MXFP4 along n *and* Hadamard-rotated MXFP4 along m.
+
+    Backward quantizes the gradient twice: row-major for DGrad, then rotated and
+    transposed for WGrad. Run separately the second pass has to read x^T as a
+    view, which measures 1.70x slower than the same shape dense because of the
+    register layout the strided load forces (report §5.10). Here the tile is read
+    once, densely, and transposed in registers.
+
+    Both outputs' scale blocks live entirely inside the tile, so BLOCK_M and
+    BLOCK_N each have to be a whole number of quant blocks and BLOCK_M a whole
+    number of Hadamard groups. No cross-tile reduction is needed.
+    """
+    G: tl.constexpr = 16
+    tl.static_assert(BLOCK_M % QUANT_BLOCK_SIZE == 0)
+    tl.static_assert(BLOCK_N % QUANT_BLOCK_SIZE == 0)
+    tl.static_assert(BLOCK_M % G == 0)
+
+    pid_m = tl.program_id(axis=0)
+    pid_n = tl.program_id(axis=1)
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    x_in = tl.load(x_ptr + offs_m[:, None] * stride_xm + offs_n[None, :] * stride_xn)
+    x = x_in.to(tl.float32)
+
+    # --- A: row-major, quant blocks along n ---
+    a_scales = _calculate_fp4_scales(
+        x,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+    )
+    a = _pack_fp4(
+        x, a_scales,
+        philox_seed, philox_offset_a,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+        USE_SR=USE_SR_A,
+        USE_ASM=USE_ASM,
+    )
+
+    HALF_BLOCK_N: tl.constexpr = BLOCK_N // 2
+    SCALE_BLOCK_N: tl.constexpr = BLOCK_N // QUANT_BLOCK_SIZE
+    offs_an = pid_n * HALF_BLOCK_N + tl.arange(0, HALF_BLOCK_N)
+    tl.store(a_ptr + offs_m[:, None] * stride_am + offs_an[None, :] * stride_an, a)
+    offs_asn = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)
+    if SWIZZLE_SCALE:
+        tl.store(
+            as_ptr + _swizzled_scale_offsets(
+                offs_m[:, None], offs_asn[None, :], NUM_SCALE_COLS_A,
+                STRIPE=MXFP4_SCALE_STRIPE_C, KCHUNK=MXFP4_SCALE_KCHUNK_C,
+            ),
+            a_scales,
+        )
+    else:
+        tl.store(as_ptr + offs_m[:, None] * stride_asm + offs_asn[None, :] * stride_asn, a_scales)
+
+    # --- B: transposed, Hadamard-16 along m, quant blocks along m ---
+    ROWS_B: tl.constexpr = BLOCK_N * (BLOCK_M // G)
+    if x_in.type.element_ty == tl.bfloat16:
+        xt = _hadamard16_mfma(tl.trans(x_in), hmat_ptr, ROWS=ROWS_B).reshape(BLOCK_N, BLOCK_M)
+    else:
+        sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
+        xt = tl.trans(x).reshape(ROWS_B, G) * sign[None, :]
+        xt = _hadamard16_butterfly(xt, ROWS=ROWS_B).reshape(BLOCK_N, BLOCK_M)
+
+    b_scales = _calculate_fp4_scales(
+        xt,
+        BLOCK_M=BLOCK_N,
+        BLOCK_N=BLOCK_M,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+    )
+    b = _pack_fp4(
+        xt, b_scales,
+        philox_seed, philox_offset_b,
+        BLOCK_M=BLOCK_N,
+        BLOCK_N=BLOCK_M,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+        USE_SR=USE_SR_B,
+        USE_ASM=USE_ASM,
+    )
+
+    HALF_BLOCK_M: tl.constexpr = BLOCK_M // 2
+    SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    offs_bn = pid_m * HALF_BLOCK_M + tl.arange(0, HALF_BLOCK_M)
+    if SHUFFLE_B:
+        tl.store(
+            b_ptr + _shuffled_fp4_offsets(
+                offs_n[:, None], offs_bn[None, :], NUM_PACKED_COLS_B,
+                TILE_ROWS=MXFP4_SHUFFLE_TILE_ROWS_C, UNIT=MXFP4_SHUFFLE_UNIT_BYTES_C,
+            ),
+            b,
+        )
+    else:
+        tl.store(b_ptr + offs_n[:, None] * stride_bm + offs_bn[None, :] * stride_bn, b)
+    offs_bsn = pid_m * SCALE_BLOCK_M + tl.arange(0, SCALE_BLOCK_M)
+    if SWIZZLE_SCALE:
+        tl.store(
+            bs_ptr + _swizzled_scale_offsets(
+                offs_n[:, None], offs_bsn[None, :], NUM_SCALE_COLS_B,
+                STRIPE=MXFP4_SCALE_STRIPE_C, KCHUNK=MXFP4_SCALE_KCHUNK_C,
+            ),
+            b_scales,
+        )
+    else:
+        tl.store(bs_ptr + offs_n[:, None] * stride_bsm + offs_bsn[None, :] * stride_bsn, b_scales)
+
+
+# ---------------------------------------------------------------------------
 # Fused dequant + transpose: packed FP4 (M, K/2) → BF16 (K, M)
 # ---------------------------------------------------------------------------
 
@@ -594,6 +825,139 @@ def _fp4_e2m1_decode(code):
           tl.where(magnitude == 6, 4.0,
                    6.0)))))))
     return tl.where(sign > 0.5, -val, val)
+
+
+@triton.jit
+def _dequant_hadamard_quant_mxfp4_kernel(
+    fp4_ptr, in_scale_ptr,
+    out_ptr, out_scale_ptr,
+    hmat_ptr,
+    stride_fm, stride_fk,
+    stride_ism, stride_isk,
+    stride_om, stride_on,
+    stride_osm, stride_osn,
+    philox_seed, philox_offset,
+    BLOCK_M: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    USE_SR: tl.constexpr,
+    USE_ASM: tl.constexpr,
+    SWIZZLE_SCALE: tl.constexpr,
+    NUM_SCALE_COLS: tl.constexpr,
+    SHUFFLE_DATA: tl.constexpr,
+    NUM_PACKED_COLS: tl.constexpr,
+    IN_SCALE_SWIZZLED: tl.constexpr = False,
+    NUM_IN_SCALE_COLS: tl.constexpr = 0,
+):
+    """Packed FP4 (M, K/2) → Hadamard-rotated, transposed packed FP4 (K, M/2).
+
+    WGrad needs the activation rotated and transposed, but forward only stored it
+    row-major in FP4. Done in two passes that costs a full BF16 (K, M) buffer
+    written and read back — 4x the bytes of either FP4 end. Here the tile is
+    decoded, transposed and rotated in registers, so the BF16 form never reaches
+    memory and the kernel moves half a byte per element on each side.
+
+    The output's quant blocks run along M, so BLOCK_M has to be a whole number of
+    both quant blocks and Hadamard groups; BLOCK_K likewise for the input scales.
+    """
+    G: tl.constexpr = 16
+    tl.static_assert(BLOCK_M % QUANT_BLOCK_SIZE == 0)
+    tl.static_assert(BLOCK_M % G == 0)
+    tl.static_assert(BLOCK_K % QUANT_BLOCK_SIZE == 0)
+
+    pid_m = tl.program_id(axis=0)
+    pid_k = tl.program_id(axis=1)
+
+    HALF_BLOCK_K: tl.constexpr = BLOCK_K // 2
+    SCALE_BLOCK_K: tl.constexpr = BLOCK_K // QUANT_BLOCK_SIZE
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_fk = pid_k * HALF_BLOCK_K + tl.arange(0, HALF_BLOCK_K)
+
+    packed = tl.load(
+        fp4_ptr + offs_m[:, None] * stride_fm + offs_fk[None, :] * stride_fk
+    ).to(tl.uint8)
+    vals = tl.reshape(
+        tl.join(_fp4_e2m1_decode(packed & 0x0F), _fp4_e2m1_decode((packed >> 4) & 0x0F)),
+        (BLOCK_M, BLOCK_K),
+    )
+
+    offs_sk = pid_k * SCALE_BLOCK_K + tl.arange(0, SCALE_BLOCK_K)
+    if IN_SCALE_SWIZZLED:
+        # The forward's quantizer wrote these straight into the GEMM's order, so
+        # reading them here is a gather through the same index map rather than a
+        # separate pass to put them back.
+        in_scale_offs = _swizzled_scale_offsets(
+            offs_m[:, None], offs_sk[None, :], NUM_IN_SCALE_COLS,
+            STRIPE=MXFP4_SCALE_STRIPE_C, KCHUNK=MXFP4_SCALE_KCHUNK_C,
+        )
+    else:
+        in_scale_offs = offs_m[:, None] * stride_ism + offs_sk[None, :] * stride_isk
+    scale_raw = tl.load(in_scale_ptr + in_scale_offs).to(tl.int32)
+    # E8M0 stores the exponent biased by 127, i.e. the float is 2^(raw-127),
+    # which is the raw byte shifted into an fp32's exponent field.
+    scale_f32 = (scale_raw.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+    x = vals * (
+        scale_f32
+        .reshape(BLOCK_M, SCALE_BLOCK_K, 1)
+        .broadcast_to(BLOCK_M, SCALE_BLOCK_K, QUANT_BLOCK_SIZE)
+        .reshape(BLOCK_M, BLOCK_K)
+    )
+
+    # An E2M1 magnitude needs two mantissa bits and the E8M0 scale is a power of
+    # two, so every decoded value is exact in BF16 and the matrix-unit rotation
+    # below is lossless.
+    ROWS: tl.constexpr = BLOCK_K * (BLOCK_M // G)
+    xt = _hadamard16_mfma(
+        tl.trans(x.to(tl.bfloat16)), hmat_ptr, ROWS=ROWS,
+    ).reshape(BLOCK_K, BLOCK_M)
+
+    out_scales = _calculate_fp4_scales(
+        xt,
+        BLOCK_M=BLOCK_K,
+        BLOCK_N=BLOCK_M,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+    )
+    y = _pack_fp4(
+        xt, out_scales,
+        philox_seed, philox_offset,
+        BLOCK_M=BLOCK_K,
+        BLOCK_N=BLOCK_M,
+        QUANT_BLOCK_SIZE=QUANT_BLOCK_SIZE,
+        IS_2D_BLOCK=False,
+        USE_SR=USE_SR,
+        USE_ASM=USE_ASM,
+    )
+
+    HALF_BLOCK_M: tl.constexpr = BLOCK_M // 2
+    SCALE_BLOCK_M: tl.constexpr = BLOCK_M // QUANT_BLOCK_SIZE
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_on = pid_m * HALF_BLOCK_M + tl.arange(0, HALF_BLOCK_M)
+    if SHUFFLE_DATA:
+        tl.store(
+            out_ptr + _shuffled_fp4_offsets(
+                offs_k[:, None], offs_on[None, :], NUM_PACKED_COLS,
+                TILE_ROWS=MXFP4_SHUFFLE_TILE_ROWS_C, UNIT=MXFP4_SHUFFLE_UNIT_BYTES_C,
+            ),
+            y,
+        )
+    else:
+        tl.store(out_ptr + offs_k[:, None] * stride_om + offs_on[None, :] * stride_on, y)
+    offs_osn = pid_m * SCALE_BLOCK_M + tl.arange(0, SCALE_BLOCK_M)
+    if SWIZZLE_SCALE:
+        tl.store(
+            out_scale_ptr + _swizzled_scale_offsets(
+                offs_k[:, None], offs_osn[None, :], NUM_SCALE_COLS,
+                STRIPE=MXFP4_SCALE_STRIPE_C, KCHUNK=MXFP4_SCALE_KCHUNK_C,
+            ),
+            out_scales,
+        )
+        return
+    tl.store(
+        out_scale_ptr + offs_k[:, None] * stride_osm + offs_osn[None, :] * stride_osn,
+        out_scales,
+    )
 
 
 @triton.jit
@@ -664,4 +1028,171 @@ def _dequant_transpose_mxfp4_kernel(
         out_ptr + rk_full[:, None] * stride_ok + rm[None, :] * stride_om,
         result_t,
         mask=mask_out,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GEMM scale swizzle (gfx950)
+# ---------------------------------------------------------------------------
+
+# gfx950 packs the scale's row axis into stripes of 32 lanes and its K axis into
+# chunks of 8 groups. Both split once more into halves inside the tile, which is
+# what makes the reference permute 7-dimensional.
+MXFP4_SCALE_STRIPE = 32
+MXFP4_SCALE_KCHUNK = 8
+
+# Triton cannot read plain python globals from inside a kernel, and the
+# quantizers that store swizzled scales take the tiling from the module rather
+# than as arguments, so keep a constexpr view of the same two numbers.
+MXFP4_SCALE_STRIPE_C = tl.constexpr(MXFP4_SCALE_STRIPE)
+MXFP4_SCALE_KCHUNK_C = tl.constexpr(MXFP4_SCALE_KCHUNK)
+
+
+# The MXFP4 GEMMs read their B operand in AITER's ``layout=(16, 16)`` order: the
+# packed row axis is tiled by 16, and along the row a 32-byte group splits into
+# four 8-byte units that end up interleaved with the 16 rows. Those are the three
+# numbers the permutation is built from.
+MXFP4_SHUFFLE_TILE_ROWS = 16
+MXFP4_SHUFFLE_UNIT_BYTES = 8
+MXFP4_SHUFFLE_UNITS_PER_GROUP = 4
+MXFP4_SHUFFLE_GROUP_BYTES = MXFP4_SHUFFLE_UNIT_BYTES * MXFP4_SHUFFLE_UNITS_PER_GROUP
+
+MXFP4_SHUFFLE_TILE_ROWS_C = tl.constexpr(MXFP4_SHUFFLE_TILE_ROWS)
+MXFP4_SHUFFLE_UNIT_BYTES_C = tl.constexpr(MXFP4_SHUFFLE_UNIT_BYTES)
+
+
+@triton.jit
+def _shuffled_fp4_offsets(
+    rows, byte_cols, num_byte_cols,
+    TILE_ROWS: tl.constexpr, UNIT: tl.constexpr,
+):
+    """Flat byte offsets of packed-FP4 elements ``(rows, byte_cols)`` once shuffled.
+
+    Lets a quantizer store its output straight in the B-operand order instead of
+    writing it row-major for ``_shuffle_mxfp4_weight`` to permute in a second
+    pass. The reference builds the same bytes as an int64 ``permute()``:
+    ``(n/16, 16, kp/32, 2, 2) -> (n/16, kp/32, 2, 16, 2)``.
+
+    Writing it this way is also the more coalesced of the two: 16 rows x 32 bytes
+    of the tile land on one contiguous 256-byte run, where the row-major store
+    scatters those same bytes across 16 rows.
+    """
+    UNITS_PER_GROUP: tl.constexpr = 4
+    i = rows // TILE_ROWS
+    r = rows % TILE_ROWS
+    unit = byte_cols // UNIT
+    within_unit = byte_cols % UNIT
+    j = unit // UNITS_PER_GROUP
+    rest = unit % UNITS_PER_GROUP
+    p = rest // 2
+    q = rest % 2
+    groups = num_byte_cols // (UNIT * UNITS_PER_GROUP)
+    dst_unit = ((i * groups + j) * 2 + p) * (TILE_ROWS * 2) + r * 2 + q
+    return dst_unit * UNIT + within_unit
+
+
+@triton.jit
+def _swizzled_scale_offsets(rows, cols, num_cols, STRIPE: tl.constexpr, KCHUNK: tl.constexpr):
+    """Flat offsets of scale elements ``(rows, cols)`` inside the swizzled buffer.
+
+    Lets a quantizer store its scales straight into the GEMM's layout instead of
+    writing them row-major for a second kernel to permute. Within a stripe the
+    32 rows of one column land on ``b*4 + a``, so they occupy 32 bytes of a
+    64-byte window rather than scattering across the tensor.
+    """
+    s = rows // STRIPE
+    a = (rows % STRIPE) // (STRIPE // 2)
+    b = rows % (STRIPE // 2)
+    k = cols // KCHUNK
+    c = (cols % KCHUNK) // (KCHUNK // 2)
+    d = cols % (KCHUNK // 2)
+    within = (k * (KCHUNK // 2) + d) * (STRIPE * 2) + b * 4 + c * 2 + a
+    return s * (num_cols * STRIPE) + within
+
+
+@triton.jit
+def _swizzle_mxfp4_scale_gfx950_kernel(
+    src_ptr, dst_ptr, cols, stride_sm,
+    STRIPE: tl.constexpr,
+    KCHUNK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """E8M0 scales (rows, cols) → the tiled order the gfx950 MXFP4 GEMMs read.
+
+    The reference builds this with a 7-D ``permute().contiguous()``, whose
+    destination chunks are 4 bytes gathered from scattered rows, so it lands at a
+    fraction of peak bandwidth. The permutation is block diagonal in the row
+    axis though: output row ``s`` is built solely from input rows
+    ``32s .. 32s+31``. Giving one program that whole stripe lets the reorder
+    happen in registers and every store go out fully coalesced.
+
+    Indices split as row = 32s + 16a + b and col = 8k + 4c + d, and the output
+    orders them (k, d, b, c, a); a program covers BLOCK_K k-chunks at a time.
+    """
+    pid_s = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    S: tl.constexpr = STRIPE
+    KW: tl.constexpr = KCHUNK
+    TILE_C: tl.constexpr = BLOCK_K * KW
+
+    offs_r = tl.arange(0, S)
+    offs_c = pid_k * TILE_C + tl.arange(0, TILE_C)
+    x = tl.load(
+        src_ptr + (pid_s * S + offs_r)[:, None] * stride_sm + offs_c[None, :],
+        mask=offs_c[None, :] < cols,
+        other=0,
+    )
+
+    x = tl.reshape(x, (2, S // 2, BLOCK_K, 2, KW // 2))
+    x = tl.permute(x, (2, 4, 1, 3, 0))
+    x = tl.reshape(x, (TILE_C * S,))
+
+    offs_o = pid_k * (TILE_C * S) + tl.arange(0, TILE_C * S)
+    tl.store(dst_ptr + pid_s * (cols * S) + offs_o, x, mask=offs_o < cols * S)
+
+
+@triton.jit
+def _swizzle_expanded_2d_scale_kernel(
+    src_ptr, dst_ptr, cols,
+    stride_tile_row, stride_tile_col,
+    QUANT_BLOCK_SIZE: tl.constexpr,
+    STRIPE: tl.constexpr,
+    KCHUNK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """2D tile scales → the swizzled per-row scales the gfx950 MXFP4 GEMMs read.
+
+    An MXFP4 weight shares one E8M0 scale across a ``block x block`` tile, but
+    the GEMMs index one scale per row, so the tile scale has to be replicated
+    down its rows before it is permuted. Materialising that expansion is a copy
+    of ``rows x cols`` bytes plus a launch, and the weight serves two operand
+    layouts, so a step pays for it once per layout per layer. Replicating in the
+    load instead makes the whole thing one pass with no intermediate.
+
+    Reading the tile grid transposed -- swap the two strides -- gives the
+    layout DGrad's operand needs, since a 2D block scale is transpose-invariant.
+    """
+    pid_s = tl.program_id(0)
+    pid_k = tl.program_id(1)
+
+    S: tl.constexpr = STRIPE
+    TILE_C: tl.constexpr = BLOCK_K * KCHUNK
+
+    rows = pid_s * S + tl.arange(0, S)
+    offs_c = pid_k * TILE_C + tl.arange(0, TILE_C)
+    mask = offs_c[None, :] < cols
+    x = tl.load(
+        src_ptr
+        + (rows // QUANT_BLOCK_SIZE)[:, None] * stride_tile_row
+        + offs_c[None, :] * stride_tile_col,
+        mask=mask,
+        other=0,
+    )
+    tl.store(
+        dst_ptr + _swizzled_scale_offsets(
+            rows[:, None], offs_c[None, :], cols, STRIPE=STRIPE, KCHUNK=KCHUNK,
+        ),
+        x,
+        mask=mask,
     )

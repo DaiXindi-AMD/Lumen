@@ -448,6 +448,97 @@ def _maybe_cache_frozen_weight(module, scaling_type, fp8_dtype, block_size):
             pass
 
 
+def _mxfp4_cached_weight(
+    module, weight, wcache, wscale, scaling_type, fp8_dtype, block_size,
+    gemm_rows=None,
+):
+    """Quantize an MXFP4 weight once per optimizer step, not once per micro-batch.
+
+    MXFP4 weight quantization is round-to-nearest, so every micro-batch of a
+    gradient accumulation step re-derives byte-identical FP4 data, packed
+    transpose and transposed scales from an unchanged weight.
+    ``register_mxfp4_weight_optimizer_hooks`` drops the cache when
+    ``optimizer.step()`` moves the master weights, so a stale cache cannot
+    outlive the weight it came from.
+
+    ``gemm_rows`` is the row count of the GEMMs this weight is about to serve,
+    which is what decides whether either operand can be stored pre-shuffled.
+
+    Returns the (data, scale) pair to hand the GEMM, unchanged when the caller
+    already has a weight cache of its own or the format is not MXFP4.
+    """
+    if (
+        wcache is not None
+        or scaling_type != "mxfp4"
+        or _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") == "1"
+    ):
+        return wcache, wscale
+
+    cached = getattr(module, "_mxfp4_w_cache", None)
+    if cached is not None:
+        return cached[0], cached[1]
+
+    from lumen.ops.quantize.linear import (
+        _mark_mxfp4_data_shuffled,
+        _mark_mxfp4_scale_swizzled,
+        _mxfp4_can_fuse_b_shuffle,
+        _mxfp4_can_fuse_scale_swizzle,
+        quantize_input,
+    )
+    from lumen.ops.quantize.ops import (
+        swizzle_expanded_mxfp4_scale,
+        transpose_packed_fp4,
+    )
+
+    n_out, k_in = weight.shape
+    # Anything the quantizer has to pad no longer matches the shapes the fusions
+    # were cleared for, and every shape they pay off on is aligned already.
+    unpadded = n_out % block_size == 0 and k_in % block_size == 0
+
+    # Neither weight operand has a consumer other than a GEMM, so when the
+    # backend for its shape reads the shuffled order it is built in that order:
+    # the forward's by the quantizer, DGrad's by the transpose. Each fusion
+    # drops a read+write pass over the whole FP4 weight, once per step.
+    fuse_fwd_shuffle = unpadded and gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, n_out, k_in), n_out, k_in // 2,
+    )
+    fuse_dgrad_shuffle = unpadded and gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, k_in, n_out), k_in, n_out // 2,
+    )
+    desc = quantize_input(
+        weight.contiguous(), "mxfp4", fp8_dtype, block_size,
+        None, None, is_weight=True, shuffle_data=fuse_fwd_shuffle,
+    )
+    data, scale = desc.data, desc.scale
+
+    data_t = transpose_packed_fp4(
+        data, shuffle_data=fuse_dgrad_shuffle, in_shuffled=fuse_fwd_shuffle,
+    )
+    if fuse_dgrad_shuffle:
+        _mark_mxfp4_data_shuffled(data_t)
+
+    # Both operand layouts read the same tile scales, only replicated down a
+    # different axis, and a GEMM is their only consumer. Building each one
+    # directly in the GEMM's order turns five passes over the scales -- two
+    # expansions, two swizzles and a transposing copy -- into two.
+    _is_tile_grid = tuple(scale.shape) == (n_out // block_size, k_in // block_size)
+    if _is_tile_grid and _mxfp4_can_fuse_scale_swizzle(
+        (n_out, k_in // block_size), (k_in, n_out // block_size),
+    ):
+        fwd_scale = _mark_mxfp4_scale_swizzled(
+            swizzle_expanded_mxfp4_scale(scale, block_size=block_size)
+        )
+        dgrad_scale = _mark_mxfp4_scale_swizzled(
+            swizzle_expanded_mxfp4_scale(scale, block_size=block_size, transpose=True)
+        )
+    else:
+        fwd_scale, dgrad_scale = scale, scale.t().contiguous()
+
+    data._mxfp4_wt_cached = (data_t, dgrad_scale)
+    module._mxfp4_w_cache = (data, fwd_scale)
+    return data, fwd_scale
+
+
 def _replace_forward(
     module,
     manager,
@@ -516,26 +607,9 @@ def _replace_forward(
                 w._lumen_frozen = True
             elif getattr(module, "_lumen_frozen", False):
                 w._lumen_frozen = True
-            if (
-                _wcache is None
-                and scaling_type == "mxfp4"
-                and _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") != "1"
-            ):
-                _mc = getattr(module, "_mxfp4_w_cache", None)
-                if _mc is not None:
-                    _wcache, _wscale = _mc[:2]
-                else:
-                    from lumen.ops.quantize.linear import quantize_input as _qi
-                    from lumen.ops.quantize.ops import transpose_packed_fp4 as _tp
-                    _wd = _qi(
-                        w.contiguous(), "mxfp4", fp8_dtype, block_size,
-                        None, None, is_weight=True,
-                    )
-                    _wcache, _wscale = _wd.data, _wd.scale
-                    _wt = _tp(_wcache)
-                    _wst = _wscale.t().contiguous()
-                    _wcache._mxfp4_wt_cached = (_wt, _wst)
-                    module._mxfp4_w_cache = (_wcache, _wscale)
+            _wcache, _wscale = _mxfp4_cached_weight(
+                module, w, _wcache, _wscale, scaling_type, fp8_dtype, block_size,
+            )
             return quantized_linear(
                 input_tensor,
                 w,
@@ -585,6 +659,14 @@ def _replace_forward(
                     tensor_parallel_output_grad=True,
                     group=tp_group,
                 )
+
+            # After the gather, so the row count handed to the weight cache is the
+            # one the GEMMs will see; it decides which backend layout to build for.
+            _wcache, _wscale = _mxfp4_cached_weight(
+                module, module.weight, _wcache, _wscale,
+                scaling_type, fp8_dtype, block_size,
+                gemm_rows=input_tensor.numel() // input_tensor.shape[-1],
+            )
 
             result = quantized_linear(
                 input_tensor,

@@ -67,6 +67,8 @@ def convert_to_mxfp4(data_hp, block_size=32, axis=-1, use_sr=False):
         IS_2D_BLOCK=False,
         USE_SR=use_sr,
         USE_ASM=use_asm,
+        SWIZZLE_SCALE=False,
+        NUM_SCALE_COLS=N // block_size,
     )
 
     out_shape = (*orig_shape[:-1], N // 2)
@@ -107,6 +109,8 @@ def convert_to_mxfp4_2d(data_hp, block_size=32, use_sr=False):
         IS_2D_BLOCK=True,
         USE_SR=use_sr,
         USE_ASM=use_asm,
+        SWIZZLE_SCALE=False,
+        NUM_SCALE_COLS=sn,
     )
 
     out_shape = (*orig_shape[:-1], N // 2)

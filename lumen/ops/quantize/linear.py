@@ -405,6 +405,8 @@ def quantize_input(
     backward=False,
     is_weight=False,
     use_sr=False,
+    swizzle_scale=False,
+    shuffle_data=False,
 ) -> Optional[FP8Descriptor]:
     """Quantize input tensor according to scaling_type (all via AITER).
 
@@ -414,6 +416,13 @@ def quantize_input(
     Args:
         use_sr: For MXFP4 only — use stochastic rounding (True for gradients,
             False/RTN for weights and activations per NVFP4 paper §4.4).
+        swizzle_scale: For MXFP4 activations only — store the scales in the
+            gfx950 GEMM layout, so the GEMM needs no permuting pass. The caller
+            is responsible for telling the scale's other readers; ask
+            ``_mxfp4_can_fuse_scale_swizzle`` whether the shape allows it.
+        shuffle_data: For MXFP4 weights only — the same for the packed data,
+            which is legal once the consuming backend is known to read the
+            shuffled order (``_mxfp4_can_fuse_b_shuffle``).
 
     Scale tensor shapes by mode:
     - per-tensor: ``(1,)``
@@ -505,11 +514,17 @@ def quantize_input(
         if is_weight:
             x_fp4, x_scale = convert_to_mxfp4_2d(
                 x_2d, block_size=mxfp4_block, use_sr=use_sr,
+                shuffle_data=shuffle_data,
             )
+            if shuffle_data:
+                _mark_mxfp4_data_shuffled(x_fp4)
         else:
             x_fp4, x_scale = convert_to_mxfp4(
                 x_2d, block_size=mxfp4_block, axis=-1, use_sr=use_sr,
+                swizzle_scale=swizzle_scale,
             )
+            if swizzle_scale:
+                _mark_mxfp4_scale_swizzled(x_scale)
         return FP8Descriptor(data=x_fp4, scale=x_scale, fp8_dtype=None)
 
     raise ValueError(f"Unknown scaling_type={scaling_type!r}")
@@ -923,6 +938,50 @@ def gemm_mxfp8(a_fp8, w_fp8, scale_a, scale_w):
     return try_backends(backends, op_name="gemm_mxfp8")
 
 
+# Set on a scale tensor that a quantizer already stored in the gfx950 GEMM
+# layout. Without it the swizzled shape (rows/32, cols*32) is indistinguishable
+# from a 2D block scale, and _expand_2d_scale_to_1d would "expand" it.
+_MXFP4_SWIZZLED_ATTR = "_mxfp4_scale_swizzled"
+
+
+def _mark_mxfp4_scale_swizzled(scale):
+    setattr(scale, _MXFP4_SWIZZLED_ATTR, True)
+    return scale
+
+
+def _is_mxfp4_scale_swizzled(scale):
+    return getattr(scale, _MXFP4_SWIZZLED_ATTR, False)
+
+
+# Set on a packed FP4 tensor that a quantizer already stored in the GEMM's
+# B-operand order, so _shuffle_mxfp4_weight knows there is nothing left to do.
+# The shuffle does not change the shape, so nothing else can tell.
+_MXFP4_DATA_SHUFFLED_ATTR = "_mxfp4_data_shuffled"
+
+
+def _mark_mxfp4_data_shuffled(data):
+    setattr(data, _MXFP4_DATA_SHUFFLED_ATTR, True)
+    return data
+
+
+def _is_mxfp4_data_shuffled(data):
+    return getattr(data, _MXFP4_DATA_SHUFFLED_ATTR, False)
+
+
+def _unswizzle_mxfp4_scale(scale):
+    """Undo a fused swizzle, for the backends that read scales row-major.
+
+    Only the plain Triton GEMM and the BF16 fallback need this, and the tuned
+    shapes reach neither, so it stays off the measured path.
+    """
+    if not _is_mxfp4_scale_swizzled(scale):
+        return scale
+    from aiter.ops.triton.utils.shuffle import unshuffle_scale_gemm
+
+    _logger.debug("mxfp4: un-swizzling scales for a row-major backend")
+    return unshuffle_scale_gemm(scale)
+
+
 def _expand_2d_scale_to_1d(scale, data_shape, block_size=32):
     """Expand 2D block scales (M//b, K//b) → 1D per-row block scales (M, K//b).
 
@@ -930,6 +989,10 @@ def _expand_2d_scale_to_1d(scale, data_shape, block_size=32):
     2D scales replicate each tile scale across the block_size rows it covers
     (NVFP4 paper §4.3: "2D block scales are replicated for each of the 1×16 blocks").
     """
+    if _is_mxfp4_scale_swizzled(scale):
+        # Already one scale per row-block, just permuted; expanding would
+        # replicate along an axis the swizzle has already folded away.
+        return scale
     if scale.dim() == 1 or (scale.dim() == 2 and scale.shape[0] == data_shape[0]):
         return scale
     sm, sn = scale.shape
@@ -942,6 +1005,9 @@ def _expand_2d_scale_to_1d(scale, data_shape, block_size=32):
 def _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w):
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4
 
+    # This kernel indexes scales row-major, so a fused swizzle has to be undone.
+    scale_a = _unswizzle_mxfp4_scale(scale_a)
+    scale_w = _unswizzle_mxfp4_scale(scale_w)
     # Expand 2D weight scales to 1D if needed
     sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
     sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
@@ -958,6 +1024,39 @@ _MXFP4_SCALE_SHUFFLE_TILING = {
 
 # The B operand shuffle emits (N // 16) tiles, so N must be a multiple of 16.
 _MXFP4_SHUFFLE_N_MULTIPLE = 16
+
+
+def _shuffle_mxfp4_scale(scales, arch, tiling):
+    """gfx950 GEMM scale swizzle, via Lumen's coalesced kernel where it applies.
+
+    AITER expresses the permutation as a 7-D ``permute().contiguous()``, which
+    leaves the copy gathering 4-byte chunks and running well under peak; every
+    training step does this a few thousand times. ``swizzle_mxfp4_scale`` emits
+    the identical bytes from a kernel that stores coalesced.
+
+    Falls back to AITER for other architectures and for shapes that are not a
+    whole number of scale tiles, which the Lumen kernel does not mask for.
+    """
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+
+    if _is_mxfp4_scale_swizzled(scales):
+        return scales
+
+    preshuffle_factor, scale_kwidth = tiling
+    if (
+        arch == "gfx950"
+        and scales.dim() == 2
+        and scales.is_contiguous()
+        and scales.shape[0] % preshuffle_factor == 0
+        and scales.shape[1] % scale_kwidth == 0
+    ):
+        from lumen.ops.quantize.ops import swizzle_mxfp4_scale
+
+        return swizzle_mxfp4_scale(scales)
+    return shuffle_scale_gemm(
+        scales, arch=arch, preshuffle_factor=preshuffle_factor,
+        scale_kwidth=scale_kwidth,
+    )
 
 # Below this the shuffle is launch-bound, so the vectorized form in
 # ``_shuffle_mxfp4_weight`` has nothing to win and measures ~2us slower on
@@ -978,6 +1077,9 @@ def _shuffle_mxfp4_weight(w_fp4, arch=None):
     unaligned or non-contiguous operands, and for small weights.
     """
     from aiter.ops.shuffle import shuffle_weight
+
+    if _is_mxfp4_data_shuffled(w_fp4):
+        return w_fp4
 
     dtype = w_fp4.dtype
     w = w_fp4
@@ -1036,28 +1138,29 @@ def _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w):
     rewritten into the tiled layout the kernel reads coalesced.
     """
     from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
-    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+    from lumen.ops.quantize.ops import triton_arch
 
-    arch = get_arch()
+    arch = triton_arch()
     tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
     if tiling is None:
         raise NotImplementedError(f"MXFP4 scale shuffle tiling unknown for {arch}")
-    preshuffle_factor, scale_kwidth = tiling
 
     sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
-    sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
 
-    w_shuf = _shuffle_mxfp4_weight(w_fp4, arch=arch).reshape(
-        w_fp4.shape[0] // _MXFP4_SHUFFLE_N_MULTIPLE,
-        w_fp4.shape[1] * _MXFP4_SHUFFLE_N_MULTIPLE,
+    def _build():
+        sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+        return (
+            _shuffle_mxfp4_weight(w_fp4, arch=arch).reshape(
+                w_fp4.shape[0] // _MXFP4_SHUFFLE_N_MULTIPLE,
+                w_fp4.shape[1] * _MXFP4_SHUFFLE_N_MULTIPLE,
+            ),
+            _shuffle_mxfp4_scale(sw, arch, tiling),
+        )
+
+    w_shuf, sw_shuf = _cached_weight_operands(
+        w_fp4, scale_w, "_mxfp4_preshuffle_operands", _build
     )
-    sa_shuf = shuffle_scale_gemm(
-        sa, arch=arch, preshuffle_factor=preshuffle_factor, scale_kwidth=scale_kwidth
-    )
-    sw_shuf = shuffle_scale_gemm(
-        sw, arch=arch, preshuffle_factor=preshuffle_factor, scale_kwidth=scale_kwidth
-    )
+    sa_shuf = _shuffle_mxfp4_scale(sa, arch, tiling)
     return gemm_afp4wfp4_preshuffle(
         a_fp4, w_shuf, sa_shuf, sw_shuf, torch.bfloat16
     )
@@ -1071,6 +1174,103 @@ _MXFP4_ASM_ARCHS = ("gfx950",)
 # MXFP4 quantizer allocates: rows up to 256, K/32 columns up to 8.
 _MXFP4_ASM_SCALE_ROW_MULTIPLE = 256
 _MXFP4_ASM_SCALE_COL_MULTIPLE = 8
+
+
+def _mxfp4_can_fuse_scale_swizzle(*scale_shapes):
+    """Whether a quantizer may store these scales in the GEMM layout directly.
+
+    Which of the three MXFP4 backends runs is decided per shape after the
+    operands exist, so the quantizer cannot know its consumer. Requiring the
+    strictest alignment of the two that read swizzled scales -- the ASM
+    kernels', which also fixes the padding -- makes the fused layout valid for
+    either, and the row-major backends undo it.
+    """
+    from lumen.ops.quantize.ops import mxfp4_scale_swizzle_supported, triton_arch
+
+    if triton_arch() != "gfx950":
+        return False
+    return all(
+        rows % _MXFP4_ASM_SCALE_ROW_MULTIPLE == 0
+        and cols % _MXFP4_ASM_SCALE_COL_MULTIPLE == 0
+        and mxfp4_scale_swizzle_supported(rows, cols)
+        for rows, cols in scale_shapes
+    )
+
+
+def _mxfp4_can_fuse_b_shuffle(gemm_key, rows, packed_cols):
+    """Whether a quantizer may store this B operand in the GEMM's shuffled order.
+
+    Unlike the scale swizzle, this one cannot be undone cheaply, so it is only
+    safe once the backend for the consuming shape is known to be one that reads
+    the shuffled order. That decision is measured on the shape's first call, so
+    the first micro-batch of a run writes row-major and every later one fuses.
+
+    The payoff is for the operands that are not weights: a weight's shuffled copy
+    is built once per optimizer step and reused, but a wgrad's activation operand
+    is new every call, so the separate pass over it is pure overhead.
+    """
+    from lumen.ops.quantize.ops import mxfp4_data_shuffle_supported
+
+    return (
+        mxfp4_autotune.cached(gemm_key) in ("asm", "shuffled")
+        and mxfp4_data_shuffle_supported(rows, packed_cols)
+    )
+
+
+def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_swizzled, needs_wgrad):
+    """Quantize the activation into the forward operand *and* WGrad's, in one pass.
+
+    WGrad reads the same activation rotated and transposed. Derived in backward
+    from the stored FP4 it costs a full second pass (decode, rotate, requantize);
+    derived here it is one extra store off a read the quantizer already does, and
+    the values are quantized once instead of twice.
+
+    Returns ``(forward_descriptor, wgrad_fp4, wgrad_scale, wgrad_shuffled)``, or
+    ``None`` when the shape, dtype or graph does not allow the fused form and the
+    caller should quantize the forward operand on its own.
+    """
+    # needs_wgrad is ctx.needs_input_grad for the weight, which is also how an
+    # inference call reports itself: autograd runs forward with grad mode off,
+    # so torch.is_grad_enabled() says nothing here.
+    if scaling_type != "mxfp4" or not needs_wgrad:
+        return None
+    if input_2d.dim() != 2 or not input_2d.is_contiguous():
+        return None
+    if input_2d.dtype not in (torch.bfloat16, torch.float32):
+        return None
+
+    M, K = input_2d.shape
+    block = 32
+    if M % block or K % block or M % _MXFP4_RHT_G:
+        return None
+    # One flag swizzles both scale tensors, so both have to tile; without it the
+    # forward operand would lose the swizzle it gets on its own.
+    if not row_scales_swizzled or not _mxfp4_can_fuse_scale_swizzle((K, M // block)):
+        return None
+
+    from lumen.ops.quantize.ops import dual_layout_quant_mxfp4
+    from lumen.quantize.descriptor import FP8Descriptor
+
+    # WGrad consumes this operand as B, so store it in that GEMM's order too
+    # once the backend for the shape is known (see _mxfp4_can_fuse_b_shuffle).
+    shuffled = _mxfp4_can_fuse_b_shuffle((weight.shape[0], K, M), K, M // 2)
+    # NVFP4 §4.4: stochastic rounding is for gradients; the activation is RTN in
+    # both layouts, as it was when WGrad rebuilt this operand for itself.
+    row_fp4, row_scale, col_fp4, col_scale = dual_layout_quant_mxfp4(
+        input_2d, _get_mxfp4_rht_sign(input_2d.device),
+        block_size=block, g=_MXFP4_RHT_G,
+        use_sr_row=False, use_sr_transposed=False,
+        swizzle_scale=True, shuffle_col=shuffled,
+    )
+    _mark_mxfp4_scale_swizzled(row_scale)
+    _mark_mxfp4_scale_swizzled(col_scale)
+    if shuffled:
+        _mark_mxfp4_data_shuffled(col_fp4)
+    return (
+        FP8Descriptor(data=row_fp4, scale=row_scale, fp8_dtype=None),
+        col_fp4, col_scale, shuffled,
+    )
+
 
 # Measured on gfx950 (MI350X) at M=8192, sweeping N. Like the preshuffle kernel,
 # the ASM path has to amortise a layout prologue -- here a weight shuffle plus a
@@ -1106,9 +1306,9 @@ def _mxfp4_asm_tuned(M, N, K):
 
 def _mxfp4_asm_supported(a_fp4, w_fp4):
     """True when the prebuilt A4W4 ASM/CK kernels can correctly run this shape."""
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from lumen.ops.quantize.ops import triton_arch
 
-    if get_arch() not in _MXFP4_ASM_ARCHS:
+    if triton_arch() not in _MXFP4_ASM_ARCHS:
         return False
     # shuffle_weight(layout=(16, 16)) tiles both dims of the packed weight by 16.
     if w_fp4.shape[0] % 16 != 0 or w_fp4.shape[1] % 16 != 0:
@@ -1140,7 +1340,14 @@ def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
     ``shuffle_scale_gemm``'s natural ``(rows_pad // 32, k32_pad * 32)`` view makes
     the ASM kernel read out of bounds.
     """
-    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+    preshuffle_factor, _ = tiling
+    if _is_mxfp4_scale_swizzled(scale):
+        # Same bytes the two-step path would have produced, so only the ASM
+        # kernel's shape is left to restore. A quantizer only fuses the swizzle
+        # for shapes that need no padding, so there is none to add here.
+        return scale.reshape(
+            scale.shape[0] * preshuffle_factor, scale.shape[1] // preshuffle_factor
+        )
 
     rows, cols = scale.shape
     rows_pad = -(-rows // _MXFP4_ASM_SCALE_ROW_MULTIPLE) * _MXFP4_ASM_SCALE_ROW_MULTIPLE
@@ -1157,14 +1364,37 @@ def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
         )
         padded[:rows, :cols] = scale
 
-    preshuffle_factor, scale_kwidth = tiling
-    shuffled = shuffle_scale_gemm(
-        padded,
-        arch=arch,
-        preshuffle_factor=preshuffle_factor,
-        scale_kwidth=scale_kwidth,
-    )
+    shuffled = _shuffle_mxfp4_scale(padded, arch, tiling)
     return shuffled.reshape(rows_pad, cols_pad).contiguous()
+
+
+def _cached_weight_operands(w_fp4, scale_w, key, build):
+    """Memoize the weight-derived GEMM operands on the FP4 weight tensor.
+
+    The shuffled weight and its swizzled scales depend only on the weight, but
+    this GEMM runs once per micro-batch in forward and again in DGrad, so
+    rebuilding them per call repeats ~5 ms of copies per pass over Qwen3-8B's
+    linears. The cache rides on the FP4 weight tensor rather than the module so
+    it expires exactly when that tensor does: MXFP4 weight caching drops it on
+    ``optimizer.step()``, and with weight caching off every call gets a fresh
+    tensor and simply misses. The scale identity is part of the key because a
+    weight tensor outliving its scales would otherwise go silently stale.
+    """
+    stamp = (scale_w.data_ptr(), scale_w._version)
+    cached = getattr(w_fp4, key, None)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    built = build()
+    if any(t is w_fp4 for t in built):
+        # A quantizer that already stored this operand in the GEMM's layout gets
+        # the same tensor back, so there is nothing to memoize -- and hanging the
+        # result off it would make the tensor reference itself, which refcounting
+        # cannot free. GPU bytes are invisible to the cyclic collector's
+        # thresholds, so the weight would sit in memory until an unrelated gen-2
+        # collection happened to run.
+        return built
+    setattr(w_fp4, key, (stamp, built))
+    return built
 
 
 def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
@@ -1175,21 +1405,31 @@ def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
     and CK kernels, and slices the row-padded output back to M.
     """
     import aiter
-    from aiter.ops.triton.utils._triton.arch_info import get_arch
+    from lumen.ops.quantize.ops import triton_arch
 
-    arch = get_arch()
+    arch = triton_arch()
     tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
     if tiling is None:
         raise NotImplementedError(f"MXFP4 scale shuffle tiling unknown for {arch}")
 
     sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
-    sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+
+    def _build():
+        sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
+        return (
+            _shuffle_mxfp4_weight(w_fp4, arch=arch),
+            _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
+        )
+
+    w_shuf, sw_shuf = _cached_weight_operands(
+        w_fp4, scale_w, "_mxfp4_asm_operands", _build
+    )
 
     return aiter.gemm_a4w4(
         a_fp4,
-        _shuffle_mxfp4_weight(w_fp4, arch=arch),
+        w_shuf,
         _pad_and_swizzle_mxfp4_scale(sa, arch, tiling),
-        _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
+        sw_shuf,
         dtype=torch.bfloat16,
     )
 
@@ -1197,6 +1437,10 @@ def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
 def _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w):
     """Dequant both operands to BF16, do BF16 GEMM (TN layout)."""
     from lumen.ops.quantize.ops import convert_from_mxfp4, convert_from_mxfp4_2d
+
+    # The dequant kernels read scales row-major.
+    scale_a = _unswizzle_mxfp4_scale(scale_a)
+    scale_w = _unswizzle_mxfp4_scale(scale_w)
 
     K_packed_a = a_fp4.shape[1]
     block_size = (K_packed_a * 2) // scale_a.shape[-1]
@@ -1296,13 +1540,23 @@ _MXFP4_BACKEND_KIND = {
 
 def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
     """MXFP4 GEMM: Y = X @ W^T with E8M0 block scales. AITER first, dequant+BF16 fallback."""
+    # A quantizer only stores the B operand pre-shuffled for a consumer that reads
+    # that order, so the row-major kernels are not a legal fallback here -- they
+    # would read the permuted bytes as if they were in place.
+    shuffled_b = _is_mxfp4_data_shuffled(w_fp4)
     if _mxfp4_probe_backends():
         name = _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w)
+        if shuffled_b and name == "plain":
+            raise AssertionError(
+                "MXFP4 B operand was stored pre-shuffled but this shape dispatches "
+                "to the row-major kernel; the quantizer and the dispatch disagree"
+            )
         if _FAST_QUANT_DISPATCH:
             return _MXFP4_BACKENDS[name](a_fp4, w_fp4, scale_a, scale_w)
         # Same choice, but keep the other kernels behind it so a backend that
         # rejects these operands at runtime degrades instead of raising.
-        order = [name] + [n for n in ("asm", "shuffled", "plain") if n != name]
+        legal = ("asm", "shuffled") if shuffled_b else ("asm", "shuffled", "plain")
+        order = [name] + [n for n in legal if n != name]
         backends = [
             (
                 _MXFP4_BACKEND_KIND[n],
@@ -1312,7 +1566,10 @@ def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
         ]
     else:
         backends = []
-    backends.append((Backend.TRITON, lambda: _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w)))
+    if not shuffled_b:
+        backends.append(
+            (Backend.TRITON, lambda: _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w))
+        )
     return try_backends(backends, op_name="gemm_mxfp4")
 
 
@@ -1548,6 +1805,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             return output
 
         input_2d = _to_2d(input)
+        input_wgrad_operand = None
 
         if pre_quantized_input is not None:
             _pqi_fp8, _pqi_scale = pre_quantized_input
@@ -1574,14 +1832,33 @@ class QuantizedLinearFunction(torch.autograd.Function):
         else:
             _act_mgr = scaling_manager if activation_tensor_id else None
             _act_tid = activation_tensor_id or "activation"
-            input_desc = quantize_input(
-                input_2d,
-                scaling_type,
-                fp8_dtype,
-                block_size,
-                _act_mgr,
-                _act_tid,
+            # This layer's GEMM, DGrad's, and the wgrad requantizer all read the
+            # activation's scales in the GEMM layout, so having the quantizer
+            # store them that way takes a permuting pass out of each.
+            _fuse_in_swizzle = (
+                scaling_type == "mxfp4"
+                and input_2d.shape[1] % 32 == 0
+                and _mxfp4_can_fuse_scale_swizzle((input_2d.shape[0], input_2d.shape[1] // 32))
             )
+            # WGrad's activation operand is the same values rotated and
+            # transposed, so the quantizer can emit it from the read it already
+            # does. Rebuilding it in backward off the stored FP4 instead costs a
+            # second pass over the activation (measured 1.65x the fused form).
+            input_wgrad_operand = _mxfp4_wgrad_activation_operand(
+                input_2d, weight, scaling_type, _fuse_in_swizzle, ctx.needs_input_grad[1],
+            )
+            if input_wgrad_operand is not None:
+                input_desc, _wg_fp4, _wg_scale, _wg_shuffled = input_wgrad_operand
+            else:
+                input_desc = quantize_input(
+                    input_2d,
+                    scaling_type,
+                    fp8_dtype,
+                    block_size,
+                    _act_mgr,
+                    _act_tid,
+                    swizzle_scale=_fuse_in_swizzle,
+                )
         if fp8_weight_cache is not None and fp8_weight_scale is not None:
             from lumen.quantize.descriptor import FP8Descriptor as _FP8D
             # blockwise2d expects a 2D (N/block, K/block) scale — fail fast if
@@ -1663,14 +1940,42 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 w_fp4_t, w_scale_t = _wt_cached
             else:
                 from lumen.ops.quantize.ops import transpose_packed_fp4
-                w_fp4_t = transpose_packed_fp4(weight_desc.data)
+                # This transpose exists only to be DGrad's B operand, so store it
+                # in that GEMM's order and skip the separate shuffling pass.
+                n_out, k_packed = weight_desc.data.shape
+                _fuse_wt_shuffle = _mxfp4_can_fuse_b_shuffle(
+                    (input_2d.shape[0], k_packed * 2, n_out), k_packed * 2, n_out // 2,
+                )
+                w_fp4_t = transpose_packed_fp4(
+                    weight_desc.data, shuffle_data=_fuse_wt_shuffle,
+                )
+                if _fuse_wt_shuffle:
+                    _mark_mxfp4_data_shuffled(w_fp4_t)
                 w_scale_t = weight_desc.scale.t().contiguous()
-            ctx.save_for_backward(
-                input_desc.data,
-                input_desc.scale,
-                w_fp4_t,
-                w_scale_t,
-            )
+            # The marker is a Python attribute, which save_for_backward is not
+            # obliged to carry to the tensor backward unpacks; the layout is a
+            # property of this call, so record it on ctx instead.
+            ctx.mxfp4_input_scale_swizzled = _is_mxfp4_scale_swizzled(input_desc.scale)
+            ctx.mxfp4_wgrad_activation = input_wgrad_operand is not None
+            if input_wgrad_operand is not None:
+                # The row-major activation stays saved for the BF16 fallback,
+                # which is the one WGrad path that cannot read the rotated form.
+                ctx.mxfp4_wgrad_activation_shuffled = _wg_shuffled
+                ctx.save_for_backward(
+                    input_desc.data,
+                    input_desc.scale,
+                    w_fp4_t,
+                    w_scale_t,
+                    _wg_fp4,
+                    _wg_scale,
+                )
+            else:
+                ctx.save_for_backward(
+                    input_desc.data,
+                    input_desc.scale,
+                    w_fp4_t,
+                    w_scale_t,
+                )
         else:
             ctx.save_for_backward(
                 input_desc.data,
@@ -1823,8 +2128,22 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
 
         if scaling_type == "mxfp4":
-            # Saved: (input_fp4, input_scale, w_fp4_transposed, w_scale_transposed)
-            input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
+            # Saved: (input_fp4, input_scale, w_fp4_transposed, w_scale_transposed),
+            # plus WGrad's rotated activation operand when forward fused it.
+            wgrad_act = None
+            if getattr(ctx, "mxfp4_wgrad_activation", False):
+                (input_data, input_scale, weight_data, weight_scale,
+                 _wg_fp4, _wg_scale) = ctx.saved_tensors
+                # Markers are Python attributes; save_for_backward need not carry
+                # them, so restore the layout this call recorded on ctx.
+                _mark_mxfp4_scale_swizzled(_wg_scale)
+                if ctx.mxfp4_wgrad_activation_shuffled:
+                    _mark_mxfp4_data_shuffled(_wg_fp4)
+                wgrad_act = (_wg_fp4, _wg_scale)
+            else:
+                input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
+            if getattr(ctx, "mxfp4_input_scale_swizzled", False):
+                _mark_mxfp4_scale_swizzled(input_scale)
         elif scaling_type in ("blockwise", "blockwise2d"):
             weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
         else:
@@ -2038,19 +2357,20 @@ class QuantizedLinearFunction(torch.autograd.Function):
         #   1. DGrad reuses FP4 weight cached from forward (2D block scales
         #      are transpose-invariant).  Eliminates BF16→FP4 re-quantization
         #      + packed transpose from backward — both are pre-computed in fwd.
-        #   2. WGrad uses fused Hadamard+Quant kernel (hadamard_quant_mxfp4)
-        #      instead of separate hadamard_transform + convert_to_mxfp4,
-        #      eliminating 2 kernel launches and 2 global memory roundtrips.
-        #   3. Activation dequant for WGrad still needed (FP4→BF16 for Hadamard
-        #      input), but the subsequent Hadamard+requant is fused.
-        # Per-layer ops: 4 quant (was 6), 1 dequant, 0 separate Hadamard
-        # (was 2), 1 transpose (was 3), 3 FP4 GEMM.
+        #   2. The gradient is quantized once into both layouts DGrad and WGrad
+        #      need (dual_layout_quant_mxfp4), off a single dense read.
+        #   3. The activation's WGrad operand goes straight from stored FP4 to
+        #      rotated, transposed FP4 (dequant_hadamard_quant_mxfp4) — the BF16
+        #      form in between is never written.
+        # Per-layer ops: 3 quant, 0 dequant, 0 separate Hadamard, 0 transpose,
+        # 3 FP4 GEMM.
         if scaling_type == "mxfp4":
             from lumen.ops.quantize.ops import (
                 convert_from_mxfp4,
                 convert_to_mxfp4,
+                dequant_hadamard_quant_mxfp4,
                 dequant_transpose_mxfp4,
-                hadamard_quant_mxfp4,
+                dual_layout_quant_mxfp4,
             )
 
             grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
@@ -2066,47 +2386,85 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     # Reuse FP4 weight + pre-transposed weight from forward.
                     # The FP4 tensors are independent allocations (not views of
                     # the BF16 param), so they survive FSDP2 resharding.
-                    from lumen.ops.quantize.padding import pad_to_block
-                    g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
-                    g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
-                    g_fp4, g_scale = convert_to_mxfp4(
-                        g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
-                    )
+                    rht_g = _MXFP4_RHT_G
+                    _rht_ok = (M % rht_g == 0)
+
+                    if _rht_ok:
+                        # The gradient feeds both GEMMs: row-major for DGrad and
+                        # rotated + transposed for WGrad. Quantizing it once for
+                        # both keeps the read dense; taking dY^T as a view instead
+                        # costs 1.70x on the same shape (report §5.10).
+                        sign_m = _get_mxfp4_rht_sign(grad_flat.device)
+                        # Storing the scales already swizzled saves a permuting
+                        # pass over each on the way into the GEMM.
+                        _fuse_swizzle = _mxfp4_can_fuse_scale_swizzle(
+                            (M, N_out // mxfp4_block), (N_out, M // mxfp4_block),
+                        )
+                        g_fp4, g_scale, grad_t_fp4, grad_t_scale = dual_layout_quant_mxfp4(
+                            grad_flat, sign_m, block_size=mxfp4_block, g=rht_g,
+                            use_sr_row=True, use_sr_transposed=True,
+                            swizzle_scale=_fuse_swizzle,
+                        )
+                        if _fuse_swizzle:
+                            _mark_mxfp4_scale_swizzled(g_scale)
+                            _mark_mxfp4_scale_swizzled(grad_t_scale)
+                    else:
+                        from lumen.ops.quantize.padding import pad_to_block
+                        g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
+                        g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
+                        g_fp4, g_scale = convert_to_mxfp4(
+                            g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
+                        )
+                        # convert_to_mxfp4 can route to AITER's quant, which wants
+                        # a dense operand.
+                        grad_t_fp4, grad_t_scale = convert_to_mxfp4(
+                            grad_flat.t().contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
+                        )
 
                     # weight_data / weight_scale are already the pre-transposed
                     # forms saved in forward (W^T packed, scales^T).
                     grad_input = gemm_mxfp4_dispatch(g_fp4, weight_data, g_scale, weight_scale)
 
                     # --- WGrad: dW = fused_HQ(dY^T) @ fused_HQ(X^T)^T ---
-                    rht_g = _MXFP4_RHT_G
-                    _rht_ok = (M % rht_g == 0)
-
-                    # Left as a view: hadamard_quant_mxfp4 indexes through both
-                    # strides, so it reads the transpose directly and the
-                    # (N_out, M) copy never happens.
-                    grad_t = grad_flat.t()
-                    # Fused, so no separate BF16 (M, K) dequant buffer is written.
-                    # It also lands dense, which the non-RHT quantizer below needs.
-                    input_t = dequant_transpose_mxfp4(
-                        input_data, input_scale, block_size=mxfp4_block,
-                    )
-
-                    if _rht_ok:
-                        sign_m = _get_mxfp4_rht_sign(grad_flat.device)
-                        grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
-                            grad_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=True,
+                    # NVFP4 §4.4 / E.3: stochastic rounding belongs on the
+                    # gradient only. On activations it buys little and can
+                    # diverge, so the activation stays round-to-nearest.
+                    if wgrad_act is not None:
+                        # Forward already emitted this operand off its own read of
+                        # the activation (_mxfp4_wgrad_activation_operand).
+                        input_t_fp4, input_t_scale = wgrad_act
+                    elif _rht_ok:
+                        # Decode, transpose, rotate and requantize in one pass, so
+                        # the BF16 (K, M) form of the activation — four times the
+                        # bytes of either FP4 end — never reaches memory.
+                        _fuse_act_swizzle = _mxfp4_can_fuse_scale_swizzle(
+                            (K_in, M // mxfp4_block),
                         )
-                        # NVFP4 §4.4 / E.3: stochastic rounding belongs on the
-                        # gradient only. On activations it buys little and can
-                        # diverge, so the activation stays round-to-nearest.
-                        input_t_fp4, input_t_scale = hadamard_quant_mxfp4(
-                            input_t, sign_m, block_size=mxfp4_block, g=rht_g, use_sr=False,
+                        # This activation is the WGrad GEMM's B operand and is
+                        # never reused, so storing it already shuffled saves a
+                        # whole read+write pass over it per micro-batch.
+                        _fuse_act_shuffle = _mxfp4_can_fuse_b_shuffle(
+                            (N_out, K_in, M), K_in, M // 2,
                         )
+                        input_t_fp4, input_t_scale = dequant_hadamard_quant_mxfp4(
+                            input_data.reshape(-1, input_data.shape[-1]),
+                            input_scale.reshape(-1, input_scale.shape[-1]),
+                            sign_m, block_size=mxfp4_block, g=rht_g, use_sr=False,
+                            swizzle_scale=_fuse_act_swizzle,
+                            shuffle_data=_fuse_act_shuffle,
+                            in_scale_swizzled=_is_mxfp4_scale_swizzled(input_scale),
+                        )
+                        if _fuse_act_swizzle:
+                            _mark_mxfp4_scale_swizzled(input_t_scale)
+                        if _fuse_act_shuffle:
+                            _mark_mxfp4_data_shuffled(input_t_fp4)
                     else:
-                        # convert_to_mxfp4 can route to AITER's quant, which wants
-                        # a dense operand.
-                        grad_t_fp4, grad_t_scale = convert_to_mxfp4(
-                            grad_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
+                        # Without the rotation there is nothing to fuse into; the
+                        # transposing dequant still lands dense, which the
+                        # quantizer below needs.
+                        input_t = dequant_transpose_mxfp4(
+                            input_data, _unswizzle_mxfp4_scale(input_scale),
+                            block_size=mxfp4_block,
                         )
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
                             input_t, block_size=mxfp4_block, axis=-1, use_sr=False,
@@ -2125,7 +2483,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
             if not _aligned:
                 w_ref = ctx.weight_ref
                 input_bf16 = convert_from_mxfp4(
-                    input_data, input_scale,
+                    input_data, _unswizzle_mxfp4_scale(input_scale),
                     output_dtype=torch.bfloat16, block_size=mxfp4_block,
                 )
                 grad_input = dispatch_gemm(

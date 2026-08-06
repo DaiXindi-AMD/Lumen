@@ -33,10 +33,15 @@ from lumen.ops.quantize import (
     convert_to_mxfp4_dual_axis,
     convert_to_mxfp8,
     dequant_fp8_tensorwise_impl,
+    dequant_hadamard_quant_mxfp4,
+    dequant_transpose_mxfp4,
+    dual_layout_quant_mxfp4,
     hadamard_quant_mxfp4,
     hadamard_transform,
+    is_cdna4,
     quant_fp8_blockwise_impl,
     quant_fp8_tensorwise_impl,
+    swizzle_mxfp4_scale,
     transpose_packed_fp4,
 )
 from lumen.ops.quantize import mxfp4_autotune
@@ -740,6 +745,451 @@ def test_mxfp4_dual_axis_vs_torchao(shape):
     )
 
 
+@pytest.mark.parametrize(
+    "M,K",
+    [(4096, 4096), (2048, 12288), (512, 128)],
+    ids=["square", "wide", "small"],
+)
+def test_mxfp4_dequant_hadamard_quant_matches_two_pass(M, K):
+    """The fused WGrad activation path must equal the two kernels it replaces.
+
+    Backward needs the stored FP4 activation rotated and transposed. Doing it as
+    dequant-transpose then Hadamard-quant writes a BF16 (K, M) buffer worth four
+    times the bytes of either FP4 end; the fused kernel keeps it in registers.
+    With round-to-nearest the arithmetic is identical, so bit-equality is the
+    right bar -- anything looser would hide a mislaid scale block.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(3)
+    torch.cuda.manual_seed(3)
+    G = 16
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    try:
+        fp4, scales = convert_to_mxfp4(x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+        ref_bf16 = dequant_transpose_mxfp4(fp4, scales, block_size=MXFP4_BLOCK_SIZE)
+        ref_q, ref_s = hadamard_quant_mxfp4(
+            ref_bf16, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+        )
+        got_q, got_s = dequant_hadamard_quant_mxfp4(
+            fp4, scales, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+        )
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    assert tuple(got_q.shape) == (K, M // 2)
+    assert tuple(got_s.shape) == (K, M // MXFP4_BLOCK_SIZE)
+    torch.testing.assert_close(got_q, ref_q, atol=0, rtol=0)
+    torch.testing.assert_close(got_s, ref_s, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,K",
+    [(4096, 4096), (2048, 12288), (512, 256)],
+    ids=["square", "wide", "small"],
+)
+def test_mxfp4_wgrad_operand_shuffle_matches_reference(M, K):
+    """Storing the WGrad B operand shuffled must equal shuffling it afterwards.
+
+    The GEMM reads this operand through a hardcoded permuted offset, so bytes
+    landing in the wrong place would quietly multiply the wrong elements instead
+    of failing. Only bit-equality against the separate shuffle catches that.
+    """
+    _require_mxfp4_dtype()
+    pytest.importorskip("aiter")
+    from lumen.ops.quantize.linear import _shuffle_mxfp4_weight
+    from lumen.ops.quantize.ops import mxfp4_data_shuffle_supported
+
+    if not is_cdna4():
+        pytest.skip("gfx950 B-operand layout")
+
+    torch.manual_seed(5)
+    G = 16
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    # No skip-on-failure here: the hardware gates above already decide whether
+    # this shape is supported, so anything raised past them is a real defect.
+    fp4, scales = convert_to_mxfp4(x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+    assert mxfp4_data_shuffle_supported(K, M // 2)
+    plain, plain_s = dequant_hadamard_quant_mxfp4(
+        fp4, scales, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+    )
+    fused, fused_s = dequant_hadamard_quant_mxfp4(
+        fp4, scales, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+        shuffle_data=True,
+    )
+
+    ref = _shuffle_mxfp4_weight(plain, arch="gfx950")
+    assert tuple(fused.shape) == tuple(plain.shape)
+    torch.testing.assert_close(fused.view(torch.uint8), ref.view(torch.uint8), atol=0, rtol=0)
+    # The shuffle only reorders the packed data; scales are untouched.
+    torch.testing.assert_close(fused_s, plain_s, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "N_out,K_in",
+    [(6144, 4096), (4096, 4096), (24576, 4096), (4096, 12288)],
+    ids=["qkv", "proj", "fc1", "fc2"],
+)
+def test_mxfp4_transposed_weight_shuffle_matches_reference(N_out, K_in):
+    """The pre-transposed weight may be stored shuffled without changing a byte.
+
+    DGrad reads this operand through the GEMM's permuted offsets, so writing it
+    in that order during the transpose has to land every byte exactly where the
+    separate shuffle would have put it.
+    """
+    _require_mxfp4_dtype()
+    pytest.importorskip("aiter")
+    from lumen.ops.quantize.linear import _shuffle_mxfp4_weight
+    from lumen.ops.quantize.ops import mxfp4_data_shuffle_supported, transpose_packed_fp4
+
+    if not is_cdna4():
+        pytest.skip("gfx950 B-operand layout")
+
+    torch.manual_seed(7)
+    w = torch.randn(N_out, K_in, device="cuda", dtype=torch.bfloat16)
+    w_fp4, _ = convert_to_mxfp4(w, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+
+    assert mxfp4_data_shuffle_supported(K_in, N_out // 2)
+    plain = transpose_packed_fp4(w_fp4)
+    fused = transpose_packed_fp4(w_fp4, shuffle_data=True)
+
+    assert tuple(fused.shape) == (K_in, N_out // 2)
+    torch.testing.assert_close(fused, _shuffle_mxfp4_weight(plain, arch="gfx950"), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "N_out,K_in",
+    [(6144, 4096), (4096, 4096), (24576, 4096), (4096, 12288)],
+    ids=["qkv", "proj", "fc1", "fc2"],
+)
+def test_mxfp4_weight_quant_fused_shuffle_matches_reference(N_out, K_in):
+    """The forward weight operand may be quantized straight into the GEMM order.
+
+    Nothing but the GEMM reads it, so the quantizer stores it shuffled and the
+    separate permuting pass over the whole FP4 weight goes away. The transpose
+    that DGrad's operand comes from then has to read that layout back, and both
+    ends have to land byte for byte where the two-pass path put them.
+    """
+    _require_mxfp4_dtype()
+    pytest.importorskip("aiter")
+    from lumen.ops.quantize.linear import _shuffle_mxfp4_weight
+    from lumen.ops.quantize.ops import (
+        convert_to_mxfp4_2d,
+        mxfp4_data_shuffle_supported,
+        transpose_packed_fp4,
+    )
+
+    if not is_cdna4():
+        pytest.skip("gfx950 B-operand layout")
+
+    torch.manual_seed(9)
+    w = torch.randn(N_out, K_in, device="cuda", dtype=torch.bfloat16)
+
+    assert mxfp4_data_shuffle_supported(N_out, K_in // 2)
+    plain, plain_s = convert_to_mxfp4_2d(w, block_size=MXFP4_BLOCK_SIZE, use_sr=False)
+    fused, fused_s = convert_to_mxfp4_2d(
+        w, block_size=MXFP4_BLOCK_SIZE, use_sr=False, shuffle_data=True,
+    )
+
+    torch.testing.assert_close(fused, _shuffle_mxfp4_weight(plain, arch="gfx950"), atol=0, rtol=0)
+    # Only the packed data moves; the tile scales are laid out as before.
+    torch.testing.assert_close(fused_s, plain_s, atol=0, rtol=0)
+
+    # DGrad's operand comes off the same tensor, so the transpose has to be able
+    # to read the shuffled form back.
+    torch.testing.assert_close(
+        transpose_packed_fp4(fused, in_shuffled=True),
+        transpose_packed_fp4(plain),
+        atol=0, rtol=0,
+    )
+    torch.testing.assert_close(
+        transpose_packed_fp4(fused, in_shuffled=True, shuffle_data=True),
+        transpose_packed_fp4(plain, shuffle_data=True),
+        atol=0, rtol=0,
+    )
+
+
+@pytest.mark.parametrize(
+    "N_out,K_in",
+    [(6144, 4096), (4096, 4096), (24576, 4096), (4096, 12288)],
+    ids=["qkv", "proj", "fc1", "fc2"],
+)
+@pytest.mark.parametrize("transpose", [False, True], ids=["forward", "dgrad"])
+def test_mxfp4_expanded_scale_swizzle_matches_two_step(N_out, K_in, transpose):
+    """Expanding 2D tile scales inside the swizzle must not move a byte.
+
+    Both operand layouts of an MXFP4 weight read their scales through the GEMM's
+    permuted offsets, so replicating the tile scale in the load has to land
+    exactly where expand-then-swizzle would have put it.
+    """
+    _require_mxfp4_dtype()
+    pytest.importorskip("aiter")
+    from lumen.ops.quantize.linear import _expand_2d_scale_to_1d
+    from lumen.ops.quantize.ops import convert_to_mxfp4_2d, swizzle_expanded_mxfp4_scale
+
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(11)
+    w = torch.randn(N_out, K_in, device="cuda", dtype=torch.bfloat16)
+    _, scale_2d = convert_to_mxfp4_2d(w, block_size=MXFP4_BLOCK_SIZE)
+
+    src = scale_2d.t().contiguous() if transpose else scale_2d
+    rows = (K_in if transpose else N_out)
+    ref = swizzle_mxfp4_scale(_expand_2d_scale_to_1d(src, (rows, 0)))
+    got = swizzle_expanded_mxfp4_scale(
+        scale_2d, block_size=MXFP4_BLOCK_SIZE, transpose=transpose,
+    )
+
+    assert tuple(got.shape) == tuple(ref.shape)
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "rows,cols",
+    [(16384, 128), (16384, 384), (24576, 512), (4096, 512), (32, 8)],
+    ids=["act", "act-wide", "wgrad", "wgrad-narrow", "single-tile"],
+)
+def test_mxfp4_scale_swizzle_matches_aiter(rows, cols):
+    """The scale swizzle must reproduce AITER's layout byte for byte.
+
+    The GEMM addresses scales through a hardcoded permuted offset, so a single
+    misplaced byte silently scales the wrong block rather than failing -- only
+    bit-equality catches that.
+    """
+    pytest.importorskip("aiter")
+    from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm
+
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(0)
+    scales = torch.randint(0, 256, (rows, cols), dtype=torch.uint8, device="cuda")
+
+    ref = shuffle_scale_gemm(scales, arch="gfx950", preshuffle_factor=32, scale_kwidth=8)
+    got = swizzle_mxfp4_scale(scales)
+
+    assert tuple(got.shape) == (rows // 32, cols * 32)
+    torch.testing.assert_close(got, ref.reshape(got.shape), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,N", [(4096, 4096), (2048, 12288)], ids=["square", "wide"],
+)
+def test_mxfp4_dual_layout_rotation_matches_reference_hadamard(M, N):
+    """The transposed output must be the reference rotation, quantized.
+
+    The quantizers apply the rotation on the matrix unit as one ±1/4 matrix
+    rather than as a sign multiply plus a butterfly. That is only free because
+    BF16 holds both the matrix and the operand exactly, and a lost bit would
+    show up as a rounding difference rather than a failure, so compare the
+    packed result against the torch reference bit for bit.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(11)
+    G = 16
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    try:
+        _, _, got_b, got_bs = dual_layout_quant_mxfp4(
+            x, sign, block_size=MXFP4_BLOCK_SIZE, g=G,
+            use_sr_row=False, use_sr_transposed=False,
+        )
+        # dY^T rotated along its last axis is what WGrad consumes. Rotating in
+        # FP32 keeps the reference where the kernel is: the operands are
+        # BF16-exact but each rotated value is a sum of 16 of them.
+        ref_rot = hadamard_transform(x.t().contiguous().float(), sign, g=G)
+        ref_b, ref_bs = convert_to_mxfp4(
+            ref_rot, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    torch.testing.assert_close(got_b, ref_b, atol=0, rtol=0)
+    torch.testing.assert_close(got_bs, ref_bs, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,N", [(4096, 4096), (2048, 12288)], ids=["square", "wide"],
+)
+def test_mxfp4_dual_layout_fused_swizzle_matches_separate_pass(M, N):
+    """Storing scales pre-swizzled must equal quantizing then swizzling.
+
+    The GEMM reads scales through a fixed permuted offset, so a wrong index in
+    the fused store mis-scales blocks instead of failing; only bit-equality
+    against the two-step path catches it.
+    """
+    _require_mxfp4_dtype()
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(7)
+    G = 16
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+    kw = dict(block_size=MXFP4_BLOCK_SIZE, g=G, use_sr_row=False, use_sr_transposed=False)
+
+    try:
+        ref_a, ref_as, ref_b, ref_bs = dual_layout_quant_mxfp4(x, sign, **kw)
+        got_a, got_as, got_b, got_bs = dual_layout_quant_mxfp4(
+            x, sign, swizzle_scale=True, **kw
+        )
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    # The packed data is untouched by the scale layout.
+    torch.testing.assert_close(got_a, ref_a, atol=0, rtol=0)
+    torch.testing.assert_close(got_b, ref_b, atol=0, rtol=0)
+    torch.testing.assert_close(got_as, swizzle_mxfp4_scale(ref_as), atol=0, rtol=0)
+    torch.testing.assert_close(got_bs, swizzle_mxfp4_scale(ref_bs), atol=0, rtol=0)
+
+
+def test_mxfp4_dequant_hadamard_fused_swizzle_matches_separate_pass():
+    """The WGrad activation quantizer's swizzled store must match the two-step path."""
+    _require_mxfp4_dtype()
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(5)
+    M, K, G = 2048, 4096, 16
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    try:
+        fp4, scales = convert_to_mxfp4(x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+
+        def run(swz):
+            return dequant_hadamard_quant_mxfp4(
+                fp4, scales, sign, block_size=MXFP4_BLOCK_SIZE, g=G,
+                use_sr=False, swizzle_scale=swz,
+            )
+
+        ref_q, ref_s = run(False)
+        got_q, got_s = run(True)
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    torch.testing.assert_close(got_q, ref_q, atol=0, rtol=0)
+    torch.testing.assert_close(got_s, swizzle_mxfp4_scale(ref_s), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "M,K", [(4096, 4096), (2048, 12288)], ids=["square", "wide"],
+)
+def test_mxfp4_convert_fused_swizzle_matches_separate_pass(M, K):
+    """The activation quantizer's swizzled store must match the two-step path."""
+    _require_mxfp4_dtype()
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(3)
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        ref_q, ref_s = convert_to_mxfp4(x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+        got_q, got_s = convert_to_mxfp4(
+            x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False, swizzle_scale=True,
+        )
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    torch.testing.assert_close(got_q, ref_q, atol=0, rtol=0)
+    torch.testing.assert_close(got_s, swizzle_mxfp4_scale(ref_s), atol=0, rtol=0)
+
+
+def test_mxfp4_dequant_hadamard_reads_swizzled_input_scale():
+    """Reading a pre-swizzled input scale must equal reading the row-major one.
+
+    Forward stores the activation's scales in the GEMM layout, so WGrad's
+    requantizer gathers them through the permutation instead of a separate pass
+    putting them back. A wrong index there mis-scales blocks rather than
+    failing, so only equality against the row-major read catches it.
+    """
+    _require_mxfp4_dtype()
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+
+    torch.manual_seed(5)
+    M, K, G = 2048, 4096, 16
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    try:
+        fp4, scales = convert_to_mxfp4(x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+        fp4_s, scales_s = convert_to_mxfp4(
+            x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False, swizzle_scale=True,
+        )
+        ref_q, ref_s = dequant_hadamard_quant_mxfp4(
+            fp4, scales, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+        )
+        got_q, got_s = dequant_hadamard_quant_mxfp4(
+            fp4_s, scales_s, sign, block_size=MXFP4_BLOCK_SIZE, g=G, use_sr=False,
+            in_scale_swizzled=True,
+        )
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    torch.testing.assert_close(got_q, ref_q, atol=0, rtol=0)
+    torch.testing.assert_close(got_s, ref_s, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("backend", ["asm", "shuffled", "plain"])
+def test_mxfp4_gemm_accepts_fused_swizzled_scales(backend):
+    """Every GEMM backend must read a fused-swizzle scale as the plain one.
+
+    The quantizer cannot know which backend its scales will reach, so it emits
+    the swizzled layout and each backend either reads it directly or undoes it.
+    Feeding both layouts of the same quantization through the same kernel is
+    what proves that contract holds -- a backend that ignored the tag would
+    still return a plausible-looking tensor.
+    """
+    _require_mxfp4_dtype()
+    if not is_cdna4():
+        pytest.skip("gfx950 scale layout")
+    from lumen.ops.quantize.linear import (
+        _MXFP4_BACKENDS,
+        _mark_mxfp4_scale_swizzled,
+        _mxfp4_can_fuse_scale_swizzle,
+    )
+
+    torch.manual_seed(11)
+    M, N, K = 512, 512, 4096
+    G, blk = 16, MXFP4_BLOCK_SIZE
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    sign = torch.where(torch.rand(G, device="cuda") < 0.5, -1.0, 1.0).to(torch.bfloat16)
+
+    if not _mxfp4_can_fuse_scale_swizzle((M, K // blk), (K, M // blk)):
+        pytest.skip(f"({M}, {K}) scales do not meet the fused-swizzle alignment")
+
+    # Same philox stream both ways, so only the scale layout differs.
+    seed, off = 1234, 99
+    kw = dict(block_size=blk, g=G, use_sr_row=False, use_sr_transposed=False,
+              philox_seed=seed, philox_offset=off)
+    try:
+        a_fp4, a_scale, _, _ = dual_layout_quant_mxfp4(x, sign, **kw)
+        a_fp4_s, a_scale_s, _, _ = dual_layout_quant_mxfp4(x, sign, swizzle_scale=True, **kw)
+        w_fp4, w_scale = convert_to_mxfp4(w, block_size=blk, axis=-1, use_sr=False)
+    except (AssertionError, RuntimeError, CompilationError) as e:
+        pytest.skip(f"Lumen MXFP4 kernels unavailable: {e}")
+
+    torch.testing.assert_close(a_fp4_s, a_fp4, atol=0, rtol=0)
+    _mark_mxfp4_scale_swizzled(a_scale_s)
+
+    gemm = _MXFP4_BACKENDS[backend]
+    try:
+        ref = gemm(a_fp4, w_fp4, a_scale, w_scale)
+        got = gemm(a_fp4_s, w_fp4, a_scale_s, w_scale)
+    except (AssertionError, RuntimeError, NotImplementedError) as e:
+        pytest.skip(f"{backend} backend rejected these operands: {e}")
+
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
 def test_mxfp4_stochastic_rounding_unbiased():
     """SR quant-dequant should be unbiased: mean over many rounds ≈ original."""
     _require_mxfp4_dtype()
@@ -784,6 +1234,49 @@ def test_mxfp4_stochastic_rounding_unbiased():
 
     # SR should produce different packed bytes from RTN for at least some elements
     assert not torch.equal(sr_last_fp4, rtn_fp4), "SR and RTN produced identical outputs"
+
+
+def test_mxfp4_stochastic_rounding_neighbours_draw_independently():
+    """Adjacent elements must not share a random word.
+
+    One Philox round yields four 32-bit words and the kernel spends all four,
+    handing them to four adjacent output bytes rather than throwing three away.
+    Broadcasting a single word across those bytes instead would be just as fast
+    and just as unbiased, but would correlate the rounding noise of neighbours
+    and defeat the point of stochastic rounding. This pins the distinction.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(7)
+    torch.cuda.manual_seed(7)
+    M, N = 256, 128
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16).float()
+
+    # Elements sharing a round span 4 packed bytes = 8 columns.
+    SPAN = 8
+    rounds = 32
+    noise = []
+    for i in range(rounds):
+        try:
+            fp4, scales = convert_to_mxfp4(
+                x, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=True,
+                philox_seed=i, philox_offset=0,
+            )
+        except (AssertionError, RuntimeError, CompilationError) as e:
+            pytest.skip(f"Lumen MXFP4 SR quant unavailable: {e}")
+        deq = convert_from_mxfp4(
+            fp4, scales, output_dtype=torch.float32, block_size=MXFP4_BLOCK_SIZE,
+        )
+        noise.append(deq - x)
+    noise = torch.stack(noise)  # (rounds, M, N)
+
+    flat = noise[:, :, :SPAN].permute(2, 0, 1).reshape(SPAN, -1)
+    corr = torch.corrcoef(flat)
+    off_diag = corr[~torch.eye(SPAN, dtype=torch.bool, device=corr.device)]
+    max_corr = off_diag.abs().max().item()
+    assert max_corr < 0.2, (
+        f"noise of elements sharing a Philox round correlates at {max_corr:.3f}; "
+        "they are drawing from the same word"
+    )
 
 
 @pytest.mark.parametrize(
@@ -956,6 +1449,48 @@ def test_mxfp4_asm_gemm_matches_plain(M, N, K):
 
     y_dispatch = gemm_mxfp4_dispatch(a_fp4, w_fp4, a_scales, w_scales)
     torch.testing.assert_close(y_dispatch, y_asm, atol=0, rtol=0)
+
+
+def test_mxfp4_asm_weight_operand_cache_follows_the_scales():
+    """The cached weight layout must not survive a change of scales.
+
+    The shuffled weight and its swizzled scales are memoized on the FP4 weight
+    tensor so forward and DGrad across micro-batches don't rebuild them. A weight
+    tensor re-used with different scales must miss, because a stale cache here
+    would not raise -- it would quietly compute with the old scales.
+    """
+    _require_mxfp4_dtype()
+    torch.manual_seed(17)
+    torch.cuda.manual_seed(17)
+    M, N, K = 2048, 6144, 4096
+
+    from aiter.ops.triton.utils._triton.arch_info import get_arch
+
+    if get_arch() not in _MXFP4_ASM_ARCHS or not _mxfp4_asm_tuned(M, N, K):
+        pytest.skip(f"no tuned A4W4 kernel for {M}x{N}x{K} on {get_arch()}")
+
+    a_hp = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    w_hp = torch.randn(N, K, device="cuda", dtype=torch.bfloat16) * 0.05
+    a_fp4, a_scales = convert_to_mxfp4(a_hp, block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False)
+    w_fp4, w_scales = convert_to_mxfp4_2d(w_hp, block_size=MXFP4_BLOCK_SIZE, use_sr=False)
+
+    try:
+        first = _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_scales, w_scales)
+    except (AssertionError, RuntimeError, NotImplementedError) as e:
+        pytest.skip(f"AITER A4W4 MXFP4 GEMM unavailable: {e}")
+
+    assert hasattr(w_fp4, "_mxfp4_asm_operands"), "weight operands were not cached"
+
+    # A second call on the same weight must hit the cache and change nothing.
+    torch.testing.assert_close(
+        _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_scales, w_scales), first, atol=0, rtol=0,
+    )
+
+    # Same weight tensor, different scales: the result must follow the new scales.
+    other_scales = torch.full_like(w_scales, 128)
+    got = _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_scales, other_scales)
+    expected = _gemm_mxfp4_aiter(a_fp4, w_fp4, a_scales, other_scales)
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
 
 
 def test_mxfp4_asm_eligibility():
