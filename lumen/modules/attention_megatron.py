@@ -54,13 +54,25 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
-def _sbhd_to_bshd(t: torch.Tensor) -> torch.Tensor:
-    """Megatron [s, b, h, d] -> TL [b, s, h, d]"""
-    return t.permute(1, 0, 2, 3).contiguous()
+def _sbhd_to_bshd(t: torch.Tensor, materialize: bool = True) -> torch.Tensor:
+    """Megatron [s, b, h, d] -> TL [b, s, h, d]
+
+    The permuted view keeps ``stride(-1) == 1``, which is the only layout
+    constraint the CK flash-attention entry point imposes -- it reads the batch,
+    sequence and head strides from the tensor. Materialising the permute is
+    therefore only needed for backends that assert contiguity (Triton FP8) or
+    that reinterpret the buffer directly (context-parallel all-to-all).
+    """
+    view = t.permute(1, 0, 2, 3)
+    return view.contiguous() if materialize else view
 
 
 def _bshd_to_sbhd(t: torch.Tensor) -> torch.Tensor:
-    """TL [b, s, h, d] -> Megatron [s, b, h, d]"""
+    """TL [b, s, h, d] -> Megatron [s, b, h, d]
+
+    Backends that honour ``seq_major_out`` already wrote the values in Megatron's
+    order, which leaves the permute alone contiguous and the copy a no-op.
+    """
     return t.permute(1, 0, 2, 3).contiguous()
 
 
@@ -165,9 +177,10 @@ class LumenDotProductAttention(MegatronModule):
         Returns:
             context: [sq, b, hp]   (hp = np * hn)
         """
-        q = _sbhd_to_bshd(query)
-        k = _sbhd_to_bshd(key)
-        v = _sbhd_to_bshd(value)
+        materialize = self.backend != "aiter_csrc" or self.cp_size > 1
+        q = _sbhd_to_bshd(query, materialize)
+        k = _sbhd_to_bshd(key, materialize)
+        v = _sbhd_to_bshd(value, materialize)
 
         causal = self.attn_mask_type == AttnMaskType.causal
         dropout_p = self.dropout_p if self.training else 0.0
@@ -221,6 +234,9 @@ class LumenDotProductAttention(MegatronModule):
                 backend_type=self.backend,
                 cp_param_bundle=cp_param_bundle,
                 grad_quant_type=self.grad_quant_type,
+                # The result feeds Megatron's [s, b, ...] residual stream, so
+                # ask the kernel to write it that way and skip the transpose.
+                seq_major_out=cp_param_bundle is None,
             )
 
         # out: [b, sq, np, hn] -> [sq, b, np*hn]

@@ -146,8 +146,44 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 
+def _install_gc_freeze(warmup_steps: int = 20) -> None:
+    """Match the Lumen arm's GC policy, so the comparison is not measuring it.
+
+    A step allocates enough short-lived Python objects to reach a generation-2
+    collection every few steps, and that collection walks every tracked object
+    in the process, which stalls whichever step it lands in.  Freezing after
+    warmup leaves only the step's own garbage to scan.  Lumen's entry point does
+    the same in ``lumen.models.megatron.install_gc_freeze_hook``; this is a copy
+    rather than an import because the control arm deliberately runs without
+    Lumen on its path.
+    """
+    import gc
+
+    import megatron.training.training as _mt_training
+
+    original = _mt_training.train_step
+    state = {"calls": 0}
+
+    def _train_step(*args, **kwargs):
+        out = original(*args, **kwargs)
+        state["calls"] += 1
+        if state["calls"] == warmup_steps:
+            gc.collect()
+            gc.freeze()
+            print_rank_0(
+                f"> GC: froze {gc.get_freeze_count()} objects after "
+                f"{warmup_steps} steps (later collections skip them)"
+            )
+            _mt_training.train_step = original
+        return out
+
+    _mt_training.train_step = _train_step
+
+
 if __name__ == "__main__":
     train_valid_test_datasets_provider.is_distributed = True
+    if os.environ.get("LUMEN_GC_FREEZE", "1") != "0":
+        _install_gc_freeze()
 
     pretrain(
         train_valid_test_datasets_provider,

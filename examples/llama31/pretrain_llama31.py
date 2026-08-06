@@ -40,6 +40,7 @@ def _run_megatron():
     )
     from lumen.models.megatron import (
         install_fp8_param_gather_hook,
+        install_gc_freeze_hook,
         install_mxfp4_weight_cache_hook,
         make_lumen_model_provider,
     )
@@ -51,6 +52,7 @@ def _run_megatron():
     )
     install_fp8_param_gather_hook()
     install_mxfp4_weight_cache_hook()
+    install_gc_freeze_hook()
 
     train_valid_test_datasets_provider.is_distributed = True
 

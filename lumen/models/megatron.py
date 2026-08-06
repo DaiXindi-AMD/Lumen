@@ -166,6 +166,10 @@ _NORM_ATTRS = (
     "final_layernorm",
 )
 
+# Per-head QK norms sit one level down, inside the attention submodule spec, and
+# normalise over head_dim instead of hidden_size.
+_ATTN_NORM_ATTRS = ("q_layernorm", "k_layernorm")
+
 
 def _patch_norms_in_spec(spec, norm_cls=None):
     """Replace **all** norm classes in a spec tree with Lumen norm modules.
@@ -196,6 +200,17 @@ def _patch_norms_in_spec(spec, norm_cls=None):
             cur = getattr(spec.submodules, attr, None)
             if cur is not None and cur is not IdentityOp:
                 setattr(spec.submodules, attr, norm_cls)
+
+        for attn_attr in ("self_attention", "cross_attention"):
+            attn_sub = getattr(getattr(spec.submodules, attn_attr, None), "submodules", None)
+            if attn_sub is None:
+                continue
+            for attr in _ATTN_NORM_ATTRS:
+                cur = getattr(attn_sub, attr, None)
+                # L2Norm is a different normalisation, not an RMSNorm variant.
+                if cur is None or cur is IdentityOp or getattr(cur, "__name__", "") == "L2Norm":
+                    continue
+                setattr(attn_sub, attr, norm_cls)
 
     layer_specs = getattr(spec, "layer_specs", None)
     if layer_specs is None and hasattr(spec, "submodules"):
@@ -1278,6 +1293,54 @@ def install_fp8_param_gather_hook() -> None:
 
     _setup_with_fp8_hook._lumen_fp8_param_gather_hook = True
     _mt_training.setup_model_and_optimizer = _setup_with_fp8_hook
+
+
+def install_gc_freeze_hook(warmup_steps: int = 20) -> None:
+    """Take the process's permanent Python objects out of the collector's reach.
+
+    A step allocates enough short-lived Python objects to reach a generation-2
+    collection every few steps, and that collection walks *every* tracked object
+    in the process: the imported modules, the Triton and AITER kernel caches,
+    every parameter and every autograd node. Here it measures ~1.2 s, landing on
+    whichever step it happens to fall in — the run's step time is fine at the
+    median and has a tail of steps that take twice as long.
+
+    Almost all of what it walks is alive for the whole run. ``gc.freeze()`` moves
+    the objects that exist when it is called into a permanent generation the
+    collector never visits, so later collections scan only the step's own
+    garbage. It runs after ``warmup_steps`` so that the kernel caches, which fill
+    in on the shapes' first call, are frozen too.
+
+    Set ``LUMEN_GC_FREEZE=0`` to keep stock collector behaviour.
+    """
+    if os.environ.get("LUMEN_GC_FREEZE", "1") == "0":
+        return
+
+    import gc
+
+    import megatron.training.training as _mt_training
+
+    current_train_step = _mt_training.train_step
+    if getattr(current_train_step, "_lumen_gc_freeze_hook", False):
+        return
+
+    state = {"calls": 0}
+
+    def _train_step_with_gc_freeze(*args, **kwargs):
+        out = current_train_step(*args, **kwargs)
+        state["calls"] += 1
+        if state["calls"] == warmup_steps:
+            gc.collect()
+            gc.freeze()
+            print_rank_0(
+                f"> GC: froze {gc.get_freeze_count()} objects after "
+                f"{warmup_steps} steps (later collections skip them)"
+            )
+            _mt_training.train_step = current_train_step
+        return out
+
+    _train_step_with_gc_freeze._lumen_gc_freeze_hook = True
+    _mt_training.train_step = _train_step_with_gc_freeze
 
 
 def install_val_loss_early_stop_hook() -> None:

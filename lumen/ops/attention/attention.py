@@ -621,11 +621,112 @@ class AttentionCsrcFP8BwdFunction(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None, None
 
 
+class AttentionCsrcSeqMajorOutFunction(torch.autograd.Function):
+    """CK csrc attention whose output lands in a seq-major ``[s, b, h, d]`` buffer.
+
+    The CK forward takes its output buffer as an argument and reads the batch,
+    sequence and head strides from it, requiring only ``stride(-1) == 1``.
+    Handing it a transposed view of a ``[s, b, h, d]`` allocation therefore costs
+    the kernel nothing, and saves a caller whose consumer is seq-major (Megatron's
+    residual stream) a full read+write pass over the output.
+
+    ``flash_attn_func`` does not expose that buffer, so this reimplements the
+    autograd glue around the same forward and backward entry points.  It is
+    restricted to the plain dense case -- no bias, alibi, dropout or padding --
+    which is all the layout shortcut is worth; everything else keeps using
+    ``flash_attn_func``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q,
+        k,
+        v,
+        softmax_scale,
+        causal,
+        window_size,
+        deterministic,
+        grad_quant_type,
+    ):
+        from aiter.ops.mha import _flash_attn_forward
+
+        batch, seqlen_q, nhead_q, _ = q.shape
+        hdim_v = v.shape[3]
+        out = torch.empty(
+            (seqlen_q, batch, nhead_q, hdim_v), dtype=q.dtype, device=q.device
+        ).permute(1, 0, 2, 3)
+
+        out, softmax_lse, _, rng_state = _flash_attn_forward(
+            q,
+            k,
+            v,
+            0.0,
+            softmax_scale,
+            causal=causal,
+            window_size_left=int(window_size[0]),
+            window_size_right=int(window_size[1]),
+            sink_size=0,
+            bias=None,
+            alibi_slopes=None,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            return_lse=True,
+            return_softmax=False,
+            out=out,
+        )
+
+        ctx.save_for_backward(q, k, v, out, softmax_lse, rng_state)
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.deterministic = deterministic
+        ctx.grad_quant_type = grad_quant_type
+        return out
+
+    @staticmethod
+    def backward(ctx, dout, *args):
+        from aiter.ops.mha import _flash_attn_backward
+
+        q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
+        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+
+        _flash_attn_backward(
+            dout,
+            q,
+            k,
+            v,
+            out,
+            softmax_lse,
+            dq,
+            dk,
+            dv,
+            None,
+            0.0,
+            ctx.softmax_scale,
+            ctx.causal,
+            int(ctx.window_size[0]),
+            int(ctx.window_size[1]),
+            None,
+            None,
+            ctx.deterministic,
+            rng_state,
+        )
+
+        gqt = ctx.grad_quant_type
+        dq = quantize_grad_tensor(dq, gqt)
+        dk = quantize_grad_tensor(dk, gqt)
+        dv = quantize_grad_tensor(dv, gqt)
+        return dq, dk, dv, None, None, None, None, None
+
+
 _mark_allow_in_graph(
     AttentionTritonFunction,
     AttentionTritonMXFP8Function,
     AttentionTritonBlockwise2DFunction,
     AttentionCsrcFP8BwdFunction,
+    AttentionCsrcSeqMajorOutFunction,
 )
 
 
@@ -650,7 +751,15 @@ def attention(
     backend_type: str = "auto",
     cp_param_bundle=None,
     grad_quant_type: Optional[str] = None,
+    seq_major_out: bool = False,
 ):
+    """Dense attention over ``[b, s, h, d]`` operands.
+
+    ``seq_major_out`` asks for the output to be allocated so that
+    ``out.permute(1, 0, 2, 3)`` is contiguous.  Callers feeding a seq-major
+    consumer can then transpose the result for free instead of copying it.  It
+    is a hint: backends that cannot honour it return the usual layout.
+    """
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** (-0.5)
 
@@ -843,6 +952,33 @@ def attention(
                 window_size,
                 _csrc_bias,
                 alibi_slopes,
+                deterministic,
+                grad_quant_type,
+            )
+
+        # Seq-major output is only a layout choice for the buffer CK writes, so
+        # it is available whenever nothing else needs the generic wrapper: the
+        # head dims must not need padding, and bias / alibi / dropout / probs
+        # all route through code paths flash_attn_func owns.
+        _seq_major_eligible = (
+            seq_major_out
+            and dropout_p == 0.0
+            and _csrc_bias is None
+            and alibi_slopes is None
+            and not return_lse
+            and not _return_softmax
+            and q.shape[3] % 8 == 0
+            and v.shape[3] % 8 == 0
+        )
+        if _seq_major_eligible:
+            _warn_ck_jit_if_needed()
+            return AttentionCsrcSeqMajorOutFunction.apply(
+                q,
+                k,
+                v,
+                softmax_scale,
+                causal,
+                window_size,
                 deterministic,
                 grad_quant_type,
             )
