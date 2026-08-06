@@ -201,6 +201,14 @@ def main() -> None:
             "backfilled_from_log": str(args.log.resolve()),
         },
     )
+    # Eval lines are folded into the iteration they belong to rather than logged
+    # after the loop: wandb ignores any log at a step below the highest one seen,
+    # so a trailing val pass would silently drop every point.
+    val_at = {}
+    if not args.delta_only:
+        for iteration, split, loss in vals:
+            val_at.setdefault(iteration, {})[f"val/lm_loss_{split}"] = loss
+
     # step_time_ms is per-iteration wall time as Megatron reports it, so it already
     # excludes nothing — iteration 1 carries the process warmup.
     for row in iters:
@@ -214,11 +222,13 @@ def main() -> None:
             metrics["delta/lm_loss_vs_baseline"] = row["lm_loss"] - base_loss[it]
         if it in base_step_ms:
             metrics["delta/speedup_vs_baseline"] = base_step_ms[it] / row["step_time_ms"]
+        metrics.update(val_at.pop(it, {}))
         if metrics:
             wandb.log(metrics, step=it)
-    if not args.delta_only:
-        for iteration, split, loss in vals:
-            wandb.log({f"val/lm_loss_{split}": loss}, step=iteration)
+    # Eval passes that carry no matching iteration line (the end-of-training
+    # validation and test passes) still have to go somewhere.
+    for iteration in sorted(val_at):
+        wandb.log(val_at[iteration], step=max(iteration, iters[-1]["iteration"]))
     run.summary.update(summary)
     run.finish()
     print(f"uploaded as {run.url}")

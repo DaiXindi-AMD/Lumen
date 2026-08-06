@@ -52,6 +52,9 @@ if [ -n "${WANDB_PROJECT:-}" ]; then
         --wandb-project "${WANDB_PROJECT}"
         --wandb-exp-name "${WANDB_NAME:-te-${PRECISION}-8b${LOG_TAG:+-${LOG_TAG}}-${TRAIN_STEPS}}"
         --wandb-save-dir "${RESULTS_ROOT}/wandb"
+        # Required, not decorative: Megatron gates every wandb write on the
+        # TensorBoard writer existing. Without this the run uploads nothing.
+        --tensorboard-dir "${RESULTS_ROOT}/tensorboard/${WANDB_NAME:-te-${PRECISION}${LOG_TAG:+-${LOG_TAG}}}"
     )
     if [ -n "${WANDB_ENTITY:-}" ]; then
         WANDB_ARGS+=(--wandb-entity "${WANDB_ENTITY}")

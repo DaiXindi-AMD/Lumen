@@ -56,14 +56,22 @@ mkdir -p "${DATA_DIR}"
 
 # Megatron builds its wandb writer only when --wandb-project is non-empty, and it
 # writes from the last rank rather than rank 0. Without WANDB_PROJECT the metrics
-# exist only in LOG_FILE; scripts/wandb_backfill_megatron_log.py can replay one of
-# those logs after the fact.
+# exist only in LOG_FILE; examples/qwen3/scripts/wandb_backfill_megatron_log.py
+# can replay one of those logs after the fact.
+#
+# --tensorboard-dir is not optional here. Every wandb_writer.log() call in
+# Megatron's training_log() sits inside `if writer and ...`, where `writer` is
+# the *TensorBoard* writer, which exists only when --tensorboard-dir is set. Ask
+# for wandb without it and the run appears in the project, connects, and uploads
+# nothing but a runtime -- an empty workspace with no way to tell it apart from a
+# run that never started.
 WANDB_ARGS=()
 if [ -n "${WANDB_PROJECT:-}" ]; then
     WANDB_ARGS=(
         --wandb-project "${WANDB_PROJECT}"
         --wandb-exp-name "${WANDB_NAME:-megatron-${PRECISION}-8b${LOG_TAG:+-${LOG_TAG}}-${TRAIN_STEPS}}"
         --wandb-save-dir "${RESULTS_ROOT}/wandb"
+        --tensorboard-dir "${RESULTS_ROOT}/tensorboard/${WANDB_NAME:-${PRECISION}${LOG_TAG:+-${LOG_TAG}}}"
     )
     if [ -n "${WANDB_ENTITY:-}" ]; then
         WANDB_ARGS+=(--wandb-entity "${WANDB_ENTITY}")
