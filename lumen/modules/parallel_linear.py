@@ -39,7 +39,7 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint
 from torch.nn.parameter import Parameter
 
 __all__ = ["LumenColumnParallelLinear", "LumenRowParallelLinear", "_DeferredWgrad"]
@@ -150,9 +150,11 @@ def _overlap_method_from_args():
         return "nccl"
 
 
-def _get_tp_group(tp_group, is_expert):
+def _get_tp_group(tp_group, is_expert, pg_collection=None):
     if tp_group is not None:
         return tp_group
+    if pg_collection is not None and is_expert:
+        return getattr(pg_collection, "expt_tp", None)
     from megatron.core.tensor_parallel.layers import get_tensor_model_parallel_group_if_none
 
     return get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
@@ -377,8 +379,12 @@ class LumenColumnParallelLinear(nn.Module):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        stride: int = 1,
+        pg_collection=None,
+        **kwargs,
     ):
         super().__init__()
+        del kwargs
 
         self.config = config
         self.input_size = input_size
@@ -386,8 +392,9 @@ class LumenColumnParallelLinear(nn.Module):
         self.gather_output = gather_output
         self.skip_bias_add = skip_bias_add
         self.is_expert = is_expert
+        self.stride = stride
 
-        self.tp_group = _get_tp_group(tp_group, is_expert)
+        self.tp_group = _get_tp_group(tp_group, is_expert, pg_collection)
         self.tp_size = _pg_size(self.tp_group)
         tp_rank = _pg_rank(self.tp_group)
 
@@ -444,7 +451,7 @@ class LumenColumnParallelLinear(nn.Module):
                         self.output_size_per_partition,
                         0,
                         condition_init_method(config, init_method),
-                        stride=1,
+                        stride=stride,
                         return_master_weight=False,
                         rank=tp_rank,
                         world_size=self.tp_size,
@@ -464,8 +471,12 @@ class LumenColumnParallelLinear(nn.Module):
                         self.weight,
                         init_method,
                         partition_dim=0,
-                        stride=1,
+                        stride=stride,
                         is_expert=is_expert,
+                    )
+                else:
+                    set_tensor_model_parallel_attributes(
+                        tensor=self.weight, is_parallel=True, dim=0, stride=stride
                     )
             setattr(self.weight, "allreduce", not (is_expert and self.expert_parallel))
         else:
@@ -482,17 +493,13 @@ class LumenColumnParallelLinear(nn.Module):
                         dtype=config.params_dtype,
                     )
                 )
-            set_tensor_model_parallel_attributes(self.bias, True, 0, 1)
+            set_tensor_model_parallel_attributes(self.bias, True, 0, stride)
             if getattr(config, "perform_initialization", True):
                 with torch.no_grad():
                     self.bias.zero_()
             setattr(self.bias, "allreduce", not (is_expert and self.expert_parallel))
         else:
             self.register_parameter("bias", None)
-
-        self._register_load_state_dict_pre_hook(
-            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(f"{prefix}_extra_state")
-        )
 
     def _get_sdma_comm(self):
         if self._sdma_comm is None:
@@ -695,19 +702,22 @@ class LumenColumnParallelLinear(nn.Module):
             self.block_size = block_size
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
         return make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
             {"weight": 0, "bias": 0},
             sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def set_extra_state(self, state):
         pass
 
     def get_extra_state(self):
-        return None
+        return torch.empty(0, dtype=torch.uint8)
 
     def execute_deferred_wgrad(self):
         """Execute any deferred weight gradient computation."""
@@ -759,8 +769,11 @@ class LumenRowParallelLinear(nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection=None,
+        **kwargs,
     ):
         super().__init__()
+        del kwargs
 
         self.config = config
         self.input_size = input_size
@@ -769,7 +782,7 @@ class LumenRowParallelLinear(nn.Module):
         self.skip_bias_add = skip_bias_add
         self.is_expert = is_expert
 
-        self.tp_group = _get_tp_group(tp_group, is_expert)
+        self.tp_group = _get_tp_group(tp_group, is_expert, pg_collection)
         self.tp_size = _pg_size(self.tp_group)
         tp_rank = _pg_rank(self.tp_group)
 
@@ -863,10 +876,6 @@ class LumenRowParallelLinear(nn.Module):
             setattr(self.bias, "sequence_parallel", self.sequence_parallel)
         else:
             self.register_parameter("bias", None)
-
-        self._register_load_state_dict_pre_hook(
-            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(f"{prefix}_extra_state")
-        )
 
     def _get_sdma_comm(self):
         if self._sdma_comm is None:
@@ -1006,19 +1015,25 @@ class LumenRowParallelLinear(nn.Module):
             self.block_size = block_size
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
         state_dict = self.state_dict(prefix="", keep_vars=True)
+        shard_map = {"weight": 1}
+        if self.bias is not None:
+            shard_map["bias"] = 0
         return make_sharded_tensors_for_checkpoint(
             state_dict,
             prefix,
-            {"weight": 1},
+            shard_map,
             sharded_offsets,
+            tp_group=self.tp_group,
+            dp_cp_group=metadata["dp_cp_group"],
         )
 
     def set_extra_state(self, state):
         pass
 
     def get_extra_state(self):
-        return None
+        return torch.empty(0, dtype=torch.uint8)
 
     def execute_deferred_wgrad(self):
         """Execute any deferred weight gradient computation."""

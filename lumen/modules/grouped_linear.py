@@ -6,11 +6,9 @@
 
 """Grouped-linear (MoE) modules with tensor-parallel support.
 
-For MoE, TP communication is handled by the MoE token dispatcher — the
-grouped linear itself does **not** perform all-gather / reduce-scatter.
-When ``is_expert=True`` and TP > 1 (or EP > 1), the weight dimensions
-are sharded manually and ``parallel_mode`` is set to ``None`` so the
-module's internal communication is skipped.
+Parameter names and dist-checkpoint sharding follow Megatron TE grouped linear
+(``weight0``, ``weight1``, …) so torch_dist checkpoints from the Miles DSV4
+spec load without key remapping.
 """
 
 from typing import Callable, Optional
@@ -18,8 +16,11 @@ from typing import Callable, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
+from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint
+from megatron.core.utils import get_pg_rank, get_pg_size
 from torch.nn.parameter import Parameter
 
 from lumen.modules.parallel_linear import _DeferredWgrad, _get_tp_group, _pg_size
@@ -32,12 +33,7 @@ __all__ = [
 
 
 class LumenGroupedLinear(nn.Module):
-    """Grouped linear for MoE: ``num_gemms`` independent linear layers
-    whose weights are stored as ``nn.ParameterList``.
-
-    Forward signature: ``forward(x, m_splits)`` where ``m_splits`` is a
-    list of per-expert token counts.
-    """
+    """Grouped linear for MoE experts (TE-compatible checkpoint layout)."""
 
     def __init__(
         self,
@@ -53,8 +49,11 @@ class LumenGroupedLinear(nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection=None,
+        **kwargs,
     ):
         super().__init__()
+        del kwargs, tp_comm_buffer_name
 
         self.config = config
         self.num_gemms = num_gemms
@@ -62,8 +61,14 @@ class LumenGroupedLinear(nn.Module):
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
         self.is_expert = is_expert
+        self.use_bias = bias
 
-        self.tp_group = _get_tp_group(tp_group, is_expert)
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self._pg_collection = pg_collection
+
+        self.tp_group = _get_tp_group(tp_group, is_expert, pg_collection)
+        self._tp_group = self.tp_group
         tp_size = _pg_size(self.tp_group)
 
         self.expert_parallel = getattr(config, "expert_model_parallel_size", 1) > 1
@@ -78,7 +83,6 @@ class LumenGroupedLinear(nn.Module):
         self.in_features = input_size
         self.out_features = output_size
 
-        # FP8 config
         self.scaling_type = "none"
         self.scaling_manager = None
         from lumen.quantize.config import _get_float8_e4m3
@@ -90,56 +94,34 @@ class LumenGroupedLinear(nn.Module):
         self.fp8_activation_store = False
         self._deferred_wgrad = _DeferredWgrad()
 
-        # Per-expert weights
-        self.weights = nn.ParameterList(
-            [
-                Parameter(
-                    torch.empty(
+        for gemm_idx in range(num_gemms):
+            weight = Parameter(
+                torch.empty(
+                    output_size,
+                    input_size,
+                    device=torch.cuda.current_device(),
+                    dtype=config.params_dtype,
+                )
+            )
+            setattr(self, f"weight{gemm_idx}", weight)
+            if bias:
+                bias_param = Parameter(
+                    torch.zeros(
                         output_size,
-                        input_size,
                         device=torch.cuda.current_device(),
                         dtype=config.params_dtype,
                     )
                 )
-                for _ in range(num_gemms)
-            ]
-        )
-        if getattr(config, "perform_initialization", True):
-            for w in self.weights:
-                init_method(w)
+                setattr(self, f"bias{gemm_idx}", bias_param)
 
-        if bias:
-            self.biases = nn.ParameterList(
-                [
-                    Parameter(
-                        torch.zeros(
-                            output_size,
-                            device=torch.cuda.current_device(),
-                            dtype=config.params_dtype,
-                        )
-                    )
-                    for _ in range(num_gemms)
-                ]
-            )
-        else:
-            self.biases = None
+        if getattr(config, "perform_initialization", True):
+            for gemm_idx in range(num_gemms):
+                init_method(getattr(self, f"weight{gemm_idx}"))
 
         for param in self.parameters():
             setattr(param, "allreduce", not (is_expert and self.expert_parallel))
 
-        self._register_load_state_dict_pre_hook(
-            lambda state_dict, prefix, *args, **kwargs: state_dict.setdefault(f"{prefix}_extra_state")
-        )
-
     def forward(self, x: torch.Tensor, m_splits, m_splits_gpu=None):
-        """Forward: sequentially process each expert's tokens.
-
-        Args:
-            x: [total_tokens, in_features]
-            m_splits: list/tensor of per-expert token counts.
-        Returns:
-            (output, bias)
-        """
         outputs = []
         offset = 0
         for i in range(self.num_gemms):
@@ -147,13 +129,16 @@ class LumenGroupedLinear(nn.Module):
             if count == 0:
                 continue
             xi = x[offset : offset + count]
-            bias_i = None if self.skip_bias_add else (self.biases[i] if self.biases else None)
+            bias_i = None
+            if self.use_bias and not self.skip_bias_add:
+                bias_i = getattr(self, f"bias{i}")
+            weight = getattr(self, f"weight{i}")
             if self.scaling_type != "none" or self.delay_wgrad:
                 from lumen.ops.quantize.linear import quantized_linear
 
                 yi = quantized_linear(
                     xi,
-                    self.weights[i],
+                    weight,
                     bias_i,
                     scaling_manager=self.scaling_manager,
                     scaling_type=self.scaling_type,
@@ -164,7 +149,7 @@ class LumenGroupedLinear(nn.Module):
                     deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
                 )
             else:
-                yi = F.linear(xi, self.weights[i], bias_i)
+                yi = F.linear(xi, weight, bias_i)
             outputs.append(yi)
             offset += count
 
@@ -173,8 +158,8 @@ class LumenGroupedLinear(nn.Module):
         else:
             output = torch.cat(outputs, dim=0)
 
-        if self.skip_bias_add and self.biases is not None:
-            output_bias = torch.cat([b.unsqueeze(0) for b in self.biases], dim=0)
+        if self.skip_bias_add and self.use_bias:
+            output_bias = torch.stack([getattr(self, f"bias{i}") for i in range(self.num_gemms)], dim=0)
         else:
             output_bias = None
         return output, output_bias
@@ -189,22 +174,87 @@ class LumenGroupedLinear(nn.Module):
         if block_size is not None:
             self.block_size = block_size
 
-    def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, {}, sharded_offsets)
+    @staticmethod
+    def _empty_extra_state():
+        return torch.empty(0, dtype=torch.uint8)
+
+    def _split_extra_state(self, state):
+        return [state] * self.num_gemms
+
+    def _sharded_state_dict_grouped(
+        self,
+        tp_axis_map,
+        prefix="",
+        sharded_offsets=(),
+        metadata=None,
+    ):
+        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        sharded_state_dict = {}
+        full_state_dict = self.state_dict(prefix="", keep_vars=True)
+        num_global_experts = get_pg_size(self._pg_collection.ep) * self.num_gemms
+        local_expert_indices_offset = get_pg_rank(self._pg_collection.ep) * self.num_gemms
+        ep_axis = len(sharded_offsets)
+        extra_state = full_state_dict.get("_extra_state", self._empty_extra_state())
+        extra_states = self._split_extra_state(extra_state)
+        singleton_local_shards = (metadata or {}).get("singleton_local_shards", False)
+
+        for gemm_idx in range(self.num_gemms):
+            global_expert_idx = local_expert_indices_offset + gemm_idx
+            state_dict = {
+                f"{gemm_idx}.weight": full_state_dict[f"weight{gemm_idx}"],
+                f"{gemm_idx}._extra_state": extra_states[gemm_idx],
+            }
+            if self.use_bias:
+                state_dict[f"{gemm_idx}.bias"] = full_state_dict[f"bias{gemm_idx}"]
+            if singleton_local_shards:
+                expert_prefix = f"{global_expert_idx}.{prefix}"
+                new_sharded_offsets = sharded_offsets
+            else:
+                expert_prefix = prefix
+                new_sharded_offsets = (
+                    *sharded_offsets,
+                    (ep_axis, global_expert_idx, num_global_experts),
+                )
+            sub_sd = make_sharded_tensors_for_checkpoint(
+                state_dict,
+                "",
+                tp_axis_map,
+                new_sharded_offsets,
+                tp_group=self._tp_group,
+                dp_cp_group=metadata["dp_cp_group"],
+            )
+            replace_prefix_for_sharding(sub_sd, f"{gemm_idx}.", expert_prefix)
+            sharded_state_dict.update(
+                {
+                    f"{prefix}weight{gemm_idx}": sub_sd[f"{gemm_idx}.weight"],
+                    f"{prefix}_extra_state{'' if gemm_idx == 0 else gemm_idx}": sub_sd[
+                        f"{gemm_idx}._extra_state"
+                    ],
+                }
+            )
+            if self.use_bias:
+                sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
+
+        for sh_ten in sharded_state_dict.values():
+            replica_id = sh_ten.replica_id
+            assert len(replica_id) == 3, f"Unexpected replica_id: {replica_id}"
+            if getattr(sh_ten, "is_data_parallel_fully_shard", False):
+                edp_replica_id = 0
+            else:
+                edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
+            sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
+        return sharded_state_dict
 
     def set_extra_state(self, state):
         pass
 
     def get_extra_state(self):
-        return None
+        return self._empty_extra_state()
 
     def execute_deferred_wgrad(self):
-        """Execute any deferred weight gradient computation."""
         self._deferred_wgrad.execute()
 
     def backward_dw(self):
-        """Megatron-compatible API: execute deferred weight gradient."""
         self._deferred_wgrad.execute()
 
 
@@ -224,6 +274,8 @@ class LumenColumnParallelGroupedLinear(LumenGroupedLinear):
         is_expert: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection=None,
+        **kwargs,
     ):
         super().__init__(
             num_gemms=num_gemms,
@@ -237,14 +289,15 @@ class LumenColumnParallelGroupedLinear(LumenGroupedLinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            pg_collection=pg_collection,
+            **kwargs,
         )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        shard_map = {f"weights.{i}": 0 for i in range(self.num_gemms)}
-        if self.biases is not None:
-            shard_map.update({f"biases.{i}": 0 for i in range(self.num_gemms)})
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, shard_map, sharded_offsets)
+        tp_axis_map = {}
+        for gemm_idx in range(self.num_gemms):
+            tp_axis_map.update({f"{gemm_idx}.weight": 0, f"{gemm_idx}.bias": 0})
+        return self._sharded_state_dict_grouped(tp_axis_map, prefix, sharded_offsets, metadata)
 
 
 class LumenRowParallelGroupedLinear(LumenGroupedLinear):
@@ -263,6 +316,8 @@ class LumenRowParallelGroupedLinear(LumenGroupedLinear):
         is_expert: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection=None,
+        **kwargs,
     ):
         super().__init__(
             num_gemms=num_gemms,
@@ -276,9 +331,10 @@ class LumenRowParallelGroupedLinear(LumenGroupedLinear):
             is_expert=is_expert,
             tp_comm_buffer_name=tp_comm_buffer_name,
             tp_group=tp_group,
+            pg_collection=pg_collection,
+            **kwargs,
         )
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
-        state_dict = self.state_dict(prefix="", keep_vars=True)
-        shard_map = {f"weights.{i}": 1 for i in range(self.num_gemms)}
-        return make_sharded_tensors_for_checkpoint(state_dict, prefix, shard_map, sharded_offsets)
+        tp_axis_map = {f"{gemm_idx}.weight": 1 for gemm_idx in range(self.num_gemms)}
+        return self._sharded_state_dict_grouped(tp_axis_map, prefix, sharded_offsets, metadata)
