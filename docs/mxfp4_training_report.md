@@ -1080,7 +1080,8 @@ gbs 32, TP=1, 8×MI350X), median of the run's steps after the first 10:
 | BF16 baseline | 2803.8 ms | — | 1.80× |
 | Lumen MXFP4, stock AITER table | 2007.2 ms | 28.4% faster | 1.29× |
 | Lumen MXFP4, + extended table (§5.6) | 1900.0 ms | 32.2% faster | 1.22× |
-| **Lumen MXFP4, + fused rope (§5.7)** | **1804.8 ms** | **35.6% faster** | **1.16×** |
+| Lumen MXFP4, + fused rope (§5.7) | 1804.8 ms | 35.6% faster | 1.16× |
+| **Lumen MXFP4, + dual-layout quant (§5.11)** | **1791.6 ms** | **36.1% faster** | **1.15×** |
 | TE MXFP4, matched recipe (arm D) | 1555.3 ms | 44.5% faster | 1.00× |
 | TE MXFP4, stock recipe (arm B) | 1425.3 ms | 49.2% faster | 0.92× |
 
@@ -1093,6 +1094,158 @@ list: Hadamard as a separate kernel (+127.6), RMSNorm (+60.1), comm (+44.2) and
 quant/cast (+22.1) sum to 254 ms. Closing the quantization fusion and RMSNorm
 would put the two stacks at parity; nothing found so far suggests a structural
 reason Lumen has to stay behind.
+
+### 5.9 Two attempts on that remainder that did not work
+
+Both were tried end to end at 200 steps against the §5.8 baseline and both were
+reverted. They are recorded because the reasoning behind each looks sound enough
+to be attempted again.
+
+**Swapping the QK norm onto Lumen's kernel: 49.1 ms slower.** Qwen3 runs a norm on
+q and k as well as the two block norms, and `_patch_norms_in_spec` only walked the
+layer's own norms, so the QK pair stayed on Megatron's `WrappedTorchNorm` while
+everything else ran Lumen's. Teaching the walk to descend into the attention spec
+is a two-line change and it does reach them — and the step got *slower*, 1804.8 →
+1853.9 ms.
+
+The trace explains it. Per step both stacks run 288 norms. TE does all 288 in
+47.3 ms, a flat 0.164 ms each. Lumen's Triton kernel does the block norms
+(N=4096) in 0.160 ms each, matching TE exactly; the QK norms (N=128) cost 0.585
+ms each on torch, and *more* than that on Lumen's kernel. AITER's `rms_norm` uses
+a persistent grid with `BLOCK_SIZE = next_pow2(N)`, so at N=128 each iteration
+moves 256 bytes and most of the wavefront idles.
+
+So the whole 60.1 ms norm gap is QK norm at narrow N, and it is not reachable by
+re-pointing `LNImpl`: Lumen already owns the norms it is good at, and the one it
+is missing needs a kernel that tiles several rows per program. Until that kernel
+exists, torch is the better fallback for N=128 and the walk should stay as it is.
+
+**Loading the Hadamard tile transposed: no change at all.** The wgrad path calls
+`hadamard_quant_mxfp4(grad_flat.t(), ...)` on a view, so the kernel's innermost
+index carries the long stride. That looked like the reason the kernel spends half
+its 127.6 ms in 62 calls of ~1.0 ms — one per layer per micro-batch, matching
+fc1's (24576, 16384) gradient — which works out to ~0.8 TB/s against ~2 TB/s on
+the dense operands.
+
+Loading the tile as (BLOCK_N, BLOCK_M) and applying `tl.trans` moved neither the
+kernel (127.6 → 124.2 ms, inside run-to-run noise) nor the step (−0.1 ms), and the
+duration histogram kept the same 62 slow calls. The flag was confirmed to be set
+on the real shapes, so the new path did run.
+
+### 5.10 What actually limits the Hadamard+quant kernel
+
+`/tmp` benchmarks had been reporting 26 ms for a call the trace timed at 1.0 ms,
+which is what sent §5.9 after the wrong cause. Timing with CUDA events over
+tensors that stay allocated for the whole measurement reproduces the trace to
+within 0.2%: 127.8 ms/step against the trace's 127.6, per-call 1.029 ms on fc1's
+gradient. Every measurement below comes from that harness, which turns a
+10-minute training run into a 6-second one.
+
+The view penalty is real and shape-independent — the *same* (4096, 16384) operand
+runs at 1219 GB/s as a view and 2268 GB/s dense. But it is not the load, and it is
+not fixable from the wrapper:
+
+| | dense | transposed view |
+|---|---|---|
+| load alone (kernel stripped to a tile load + store) | 5129 GB/s | 3570 GB/s |
+| same load written as `tl.trans` of the swapped tile | — | 3512 GB/s |
+| full kernel | 1955 GB/s | 1150 GB/s |
+
+Three things follow. The kernel is nowhere near load-bound: dense loads sustain
+5129 GB/s while the full kernel manages 1955. `tl.trans` is indistinguishable from
+the plain strided load, so §5.9's rewrite never could have helped — Triton folds
+the transpose into layout inference and lands on the same access pattern. And the
+view costs 1.70× in the full kernel against 1.44× in the isolated load, so the
+layout the load forces on `x` is also making the Hadamard butterfly and `_pack_fp4`
+do more cross-lane work. Sweeping BLOCK_M from 32 to 512 does not move the view
+off ~1150 GB/s in either direction.
+
+That points at the fusion in §8.8 rather than at any repair of the present kernel.
+`grad_flat` is already read densely once per linear by DGrad's `convert_to_mxfp4`
+(55.7 ms/step) and then again as a view by the WGrad Hadamard (94.2 ms/step). One
+kernel reading it dense once and writing both layouts, transposing through LDS,
+drops per-element traffic from 5.06 to ~3.06 bytes and removes the view penalty
+outright. §5.11 built it.
+
+### 5.11 Dual-layout gradient quantization
+
+`dual_layout_quant_mxfp4` reads a tile of `grad_flat` once and emits both MXFP4
+layouts the backward needs: row-major along n for DGrad, and Hadamard-rotated,
+transposed, blocked along m for WGrad. Both outputs' scale blocks fall entirely
+inside the tile, so it needs no cross-tile reduction — only that BLOCK_M and
+BLOCK_N are whole numbers of quant blocks and BLOCK_M a whole number of Hadamard
+groups. With SR off it is bit-exact against both kernels it replaces, on all five
+shapes tested; with SR on it draws from its own philox stream, deliberately
+separate from the row-major one so the two GEMMs do not share rounding noise.
+
+It is a smaller win than the traffic reduction suggests:
+
+| | per element | per layer per micro-batch | achieved |
+|---|---|---|---|
+| `convert_to_mxfp4` + `hadamard_quant_mxfp4(x.t())` | 5.06 B | 2.356 ms | 1150–2268 GB/s |
+| `dual_layout_quant_mxfp4` at (128, 64) | 3.06 B | 2.030 ms | 850–990 GB/s |
+
+40% less traffic, but the fused kernel sustains roughly half the bandwidth —
+holding both quantization paths and the transposed tile at once costs more than
+the second read did. That leaves −20.2 ms/step predicted, and 1804.8 → **1791.6
+ms/step** measured, with loss tracking the baseline (6.8025 → 6.8012 at step 200).
+BLOCK_M was swept from 32 to 256: it sets the transposed output's contiguous write
+run, and (128, 64) beat (64, 64) by 5%.
+
+The remaining headroom is in that bandwidth number, not in further fusion — a
+dense read alone sustains 5129 GB/s (§5.10), so the kernel is compute- and
+register-bound, and the next thing to look at is its register pressure.
+
+### 5.12 WGrad's activation operand, emitted by the forward quantizer
+
+At parity (Lumen 1526.5 ms, TE 1526.5 ms median) the two stacks were profiled
+kernel-by-kernel over three steps of Qwen3-8B. Lumen was already ahead on the
+GEMMs (790.7 ms vs 816.1), the norms (103.0 vs 135.0) and attention (970.1 vs
+1004.3, TE paying an extra `dk_dv_reduce`); the whole remaining deficit sat in
+quantization, 286.6 ms against 205.6.
+
+The structural difference: TE's forward `cast_transpose` emits both operands at
+once, where Lumen's forward emitted only the row-major one and had backward
+rebuild WGrad's from the stored FP4 (`dequant_hadamard_quant_mxfp4`) — decode,
+rotate, requantize, a second full pass over the activation. Measured per layer
+per micro-batch at Qwen3-8B's shapes:
+
+| | (16384, 4096) ×3 | (16384, 12288) ×1 |
+|---|---|---|
+| forward `convert_to_mxfp4` | 68.3 us | 156.3 us |
+| backward `dequant_hadamard_quant` | 60.9 us | 174.4 us |
+| **current total** | **129.2 us** | **330.7 us** |
+| forward `dual_layout_quant` (both) | 79.4 us | 197.9 us |
+| | 1.63× | 1.67× |
+
+22.3 ms → 13.5 ms per micro-batch across 31 quantized layers, and 124 fewer
+kernel launches. The operand is also the WGrad GEMM's B, so the quantizer stores
+it pre-shuffled (`shuffle_col`, the same treatment §5.11's weights get) once the
+autotuner has picked the shape's backend.
+
+The activation is now quantized once instead of twice — WGrad no longer reads a
+value that has been through FP4 and back — so dW cannot match the old path
+bit-for-bit. Over 200 steps the loss difference against the previous code
+(mean 0.047, last-50 mean 0.016) is the same size as the difference between two
+runs of the new code against each other (0.047 / 0.015): run-to-run noise, no
+bias.
+
+Two side effects worth noting. The row-major activation stays saved for the BF16
+fallback, so activation memory grows by one FP4 copy: 144.0 → 150.4 GiB peak of
+the 251.7 GiB card. And the RTN quantizers stopped drawing philox counters they
+never read — an all-RTN call that draws from Python's RNG also shifts the stream
+every SR caller after it reads, which made the forward and backward operands
+impossible to compare.
+
+Paired against TE at 200 steps each (median of iterations 21–200):
+
+| | median | mean |
+|---|---|---|
+| TE (4 runs) | 1526.2–1526.7 ms | 1531.4–1538.3 ms |
+| Lumen before | 1526.3, 1526.8 ms | 1530.7, 1531.3 ms |
+| **Lumen after** | **1513.7, 1515.7 ms** | **1516.1, 1525.9 ms** |
+
+Lumen finishes 11–13 ms/step (0.7–0.8%) ahead of TransformerEngine.
 
 ---
 
@@ -1188,6 +1341,7 @@ Key insights:
 - [x] **Lumen MXFP4 vs TE MXFP4 on Megatron, 1000 steps** — held-out val_loss 5.7793 vs 5.8479 (Lumen better by 0.069 nats), step time 2007 vs 1425 ms (TE 1.41× faster), zero NaN in both (§4.6)
 - [x] **TransformerEngine built for gfx950 with CK fused attention** — required for any GQA model on ROCm; AOTriton rejects GQA outright (§4.6.2)
 - [x] **Recipe/implementation split resolved** — 4-arm ladder attributes 85% of Lumen's convergence advantage to the Hadamard, 9% to the BF16 tail, ~0.004 nats to everything else; TE remains 1.29× faster at matched recipe (§4.7)
+- [x] **Dual-layout gradient quantization** — `dual_layout_quant_mxfp4` emits both MXFP4 layouts from one dense read, bit-exact against the two kernels it replaces, −13.2 ms/step (§5.11)
 
 ### Open Issues
 
@@ -1214,12 +1368,20 @@ Key insights:
    −98 ms/step, GEMM now within +13.6 ms of TE (§5.6). Re-tune whenever the token
    count or TP width changes, since the rows key on the exact M/N/K.
 7. ~~**Enable rope fusion**~~ — done, −137.7 ms by passing `--lumen-fused-rope`
-   (§5.7). **A fused RMSNorm is still open** at +60 ms: without apex the layer
-   spec falls back to `WrappedTorchNorm`, and `TENorm` imports fine on this
-   branch, so swapping `LNImpl` is the likely route.
-8. **Fuse cast + transpose + Hadamard into one pass** — +142 ms (§5.5). The deepest
-   change, but it also removes `dequant_transpose_mxfp4` entirely, which only exists
-   because the WGrad operand has to be rebuilt from the saved FP4 activation.
+   (§5.7). **The +60 ms norm gap is still open, but it is not an `LNImpl` swap**
+   (§5.9): it is entirely QK norm at N=128, where AITER's `rms_norm` moves 256
+   bytes per iteration and loses to torch. It needs a Lumen RMSNorm that tiles
+   several rows per program; pointing the spec at the existing kernel costs
+   49.1 ms instead of saving 60.
+8. ~~**Fuse the gradient's two quantizations**~~ — done, −13.2 ms (§5.11). The
+   activation half is still open: `dequant_transpose_mxfp4` + `hadamard_quant_mxfp4`
+   remain two passes, and the first only exists because the WGrad operand has to be
+   rebuilt from the saved FP4 activation. Folding the dequant into the rotation
+   would remove a full BF16 (K, M) roundtrip. Before that, note §5.11's kernel only
+   sustains ~900 GB/s against a 5129 GB/s dense-read ceiling, so cutting its
+   register pressure is probably worth more than the next fusion. Use the
+   CUDA-event harness from §5.10, which reproduces the trace to 0.2% in 6 seconds,
+   rather than full training runs.
 9. **Gradient-accumulation fusion** — ~370 ms/step, the largest single kernel in
    both stacks' traces, currently disabled by `--no-gradient-accumulation-fusion`
    in the shared launcher config. Not a Lumen-vs-TE gap; it would pay in both.

@@ -15,11 +15,34 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
-(No open issues)
+### [2026-08-06 fp8-per-tensor-path-slower-than-bf16]
+- Symptom: Qwen3-8B FP8 (e4m3, delayed) ran at 3178 ms/step against MXFP4's 1521 ms on the same 8×MI350X, same everything else. Two separate causes found, one fixed, one still open.
+- Identified cause, deliberately left unfixed (worth ~166 ms/step of GPU plus the logging): `fast_transpose_fp8` falls back to `.t().contiguous()` because the installed aiter at `/home/xdai/aiter` has no `ops/triton/quant/fast_transpose.py` — Lumen vendors it under `third_party/aiter/` and nothing copies it over, the same gap the launcher already papers over for `cross_entropy`. The fallback is 3.8-4.2× slower than the kernel at the wgrad shapes (0.567 vs 2.296 ms for one layer's four linears), and it logs per call: 709k warnings, 78 MB log, ~3000 lines/step across 8 ranks. Copying the two vendored files in makes the probe return True and the kernel is bit-identical to `.t().contiguous()` at (16384,4096), (16384,12288) and (4096,16384) — but the copy was reverted and the fallback left as-is, because FP8 is being held fixed as the comparison baseline. Fix it only as a deliberate FP8 change, not as a side effect of MXFP4 work.
+- Second cause: even with the transpose kernel in place, one fwd+bwd through `quantized_linear` at Qwen3-8B shapes costs **21.8 ms in FP8 delayed against 16.4 ms in BF16 and 13.5 ms in MXFP4** (sum over qkv/attn_out/gate_up/down, 16384 tokens). FP8 is the only one of the three that loses to BF16. The GEMM is not the problem: `hipb_mm` on `float8_e4m3fn` does 16384×4096×4096 in 0.279 ms (1970 TFLOP/s). So the loss is in quantization, transposes, and amax bookkeeping around the GEMM, not in the GEMM.
+- Next check: profile one FP8 linear fwd+bwd kernel by kernel and compare against the MXFP4 breakdown in `docs/mxfp4_training_report.md` §5.12. The MXFP4 path got a fused dual-layout quantizer that emits both the DGrad and WGrad operands from one read; FP8 still quantizes, then transposes, then re-quantizes per operand, which is the shape of the gap.
+- Bearing on the MXFP4-vs-FP8 comparison: any "MXFP4 is N× faster than FP8" number from this stack is measured against an unoptimized FP8 path, not against FP8 as a format. State it that way.
+- Status: open
+
+### [2026-08-06 hybrid-fp8-wgrad-mixed-dtype-crash]
+- Symptom: Qwen3-8B with `--linear-fp8 --linear-fp8-format hybrid --linear-fp8-scaling delayed` dies in the first backward on all 8 ranks: `RuntimeError: expected mat1 and mat2 to have the same dtype, but got: c10::Float8_e5m2 != c10::Float8_e4m3fn`, at `lumen/ops/quantize/linear.py:840` (`gemm_wgrad_mixed` → `hipb_mm`).
+- Possible bug: `gemm_wgrad_mixed` is written for exactly this pair (docstring: "grad_fp8 is E5M2, input_fp8 is E4M3"), but its hipBLASLt path passes both operands to `hipb_mm`, which on the installed AITER rejects mismatched FP8 dtypes. The mixed-dtype Triton kernel (`gemm_a8w8_mixed`) sits below it as the `_probe_aiter_hipblas()`-false branch only, so a machine that *has* hipBLASLt can never reach the fallback. Hybrid FP8 backward therefore looks unreachable on this stack.
+- Evidence so far: 4-layer 5-step smoke, 8×MI350X, `/tmp/smoke_fp8.log` (first failure at line 1260). Same smoke with `--linear-fp8-format fp8_e4m3` (single dtype, everything else identical) completes 5/5 iterations, loss 12.0→11.3, 0 NaN.
+- Next check: confirm whether the installed `hipb_mm` binding ever accepted mixed FP8 dtypes, then either route mixed pairs to `gemm_a8w8_mixed` regardless of hipBLASLt, or catch the dtype RuntimeError as a logged fallback. Benchmark before adopting: the Triton mixed kernel may be slow enough that hybrid should instead be rejected at config time rather than silently made slow.
+- Not blocking the MXFP4-vs-FP8 comparison, which uses `fp8_e4m3` delayed.
+- Status: open
 
 ## Ruled Out
 
 Move disproved suspicions here instead of deleting them.
+
+### [2026-08-02 lumen-vs-te-mxfp4-convergence-gap]
+- Suspicion: Lumen's MXFP4 implementation converges better than TE's MXFP4. At each stack's own defaults Lumen led by 0.069 nats held-out at 1000 steps (Qwen3-8B, C4, 8×MI350X, seed/corpus/order shared), and the paired per-step gap widened monotonically.
+- Ruled out by: 4-arm ladder, all sharing seed 1234 and sample order. A = Lumen (tail 5, H on wgrad operands), B = TE (no tail, no H), C = TE (tail 5, no H), D = TE (tail 5, H on all operands via `NVTE_MXFP4_USE_HADAMARD=1`).
+- Evidence (paired Δ, second-half mean): C−B = −0.0058 (BF16 tail), D−C = −0.0565 (Hadamard), A−D = −0.0043 (everything else). Sums to the observed −0.0665. Held-out val@1k: A 5.7793 vs D 5.7833.
+- Conclusion: the gap was ~85% recipe (Hadamard), 9% BF16 tail, ~0.004 nats residual. No evidence of an implementation-level convergence advantage.
+- Secondary finding: TE rotates every operand (fprop activation/weight included), Lumen only the two WGrad operands, and the wider rotation did *not* help — D is 0.004 nats behind A. Consistent with FP4 range overflow being gradient-side. Do not widen Lumen's Hadamard scope on the theory that more rotation is better.
+- Still open (throughput, not correctness): TE is 1.29× faster per step at matched recipe (1555 vs 2007 ms); the fused norm/rope/attention gap is not separated from the quantized linears.
+- Status: ruled out
 
 ## Resolved
 
