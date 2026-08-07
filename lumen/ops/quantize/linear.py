@@ -1928,10 +1928,10 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 or (getattr(weight, "_lumen_frozen", False) and _skip_frozen_wgrad_enabled())
             )
             ctx.save_for_backward(
-                weight_desc.data,
-                weight_desc.scale,
                 input_desc.data,
                 input_desc.scale,
+                weight_desc.data,
+                weight_desc.scale,
             )
         elif scaling_type == "mxfp4":
             # Reuse pre-transposed weight from module cache if available.
@@ -1961,6 +1961,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 # The row-major activation stays saved for the BF16 fallback,
                 # which is the one WGrad path that cannot read the rotated form.
                 ctx.mxfp4_wgrad_activation_shuffled = _wg_shuffled
+                # Read both layouts off the operand rather than assuming what
+                # the quantizer chose: backward marks the scale from this, so a
+                # future unswizzled fused form would otherwise be mislabelled
+                # and read in the wrong order with no shape to catch it.
+                ctx.mxfp4_wgrad_activation_swizzled = _is_mxfp4_scale_swizzled(_wg_scale)
                 ctx.save_for_backward(
                     input_desc.data,
                     input_desc.scale,
@@ -2136,7 +2141,8 @@ class QuantizedLinearFunction(torch.autograd.Function):
                  _wg_fp4, _wg_scale) = ctx.saved_tensors
                 # Markers are Python attributes; save_for_backward need not carry
                 # them, so restore the layout this call recorded on ctx.
-                _mark_mxfp4_scale_swizzled(_wg_scale)
+                if ctx.mxfp4_wgrad_activation_swizzled:
+                    _mark_mxfp4_scale_swizzled(_wg_scale)
                 if ctx.mxfp4_wgrad_activation_shuffled:
                     _mark_mxfp4_data_shuffled(_wg_fp4)
                 wgrad_act = (_wg_fp4, _wg_scale)
@@ -2144,8 +2150,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
             if getattr(ctx, "mxfp4_input_scale_swizzled", False):
                 _mark_mxfp4_scale_swizzled(input_scale)
-        elif scaling_type in ("blockwise", "blockwise2d"):
-            weight_data, weight_scale, input_data, input_scale = ctx.saved_tensors
         else:
             input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
         fp8_dtype = ctx.fp8_dtype
