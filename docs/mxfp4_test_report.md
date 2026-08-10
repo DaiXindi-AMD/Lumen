@@ -85,16 +85,89 @@ Two things MXFP4 needs that the FP8 matrix does not contain at all:
 ### Determinism needs a different definition
 
 The FP8 row asks that repeated runs with the same seed produce identical
-results. For MXFP4 that gate is red by construction:
+results. For MXFP4 that gate is red by construction: WGrad uses stochastic
+rounding, and `philox_seed` falls back to `random.randint()` off Python's global
+RNG when the caller does not pin it. Runs are reproducible in where they land,
+not in the bits they get there with.
 
-- WGrad uses stochastic rounding, and `philox_seed` falls back to
-  `random.randint()` off Python's global RNG when the caller does not pin it.
-- Empirically, two 200-step runs of an identical configuration differ by 0.25%
-  relative in mean loss and 1.8 ms in median step time (2026-08-10).
+So the gate has to be **noise-floor-aware** — measure the run-to-run spread
+first, then set the threshold above it.
 
-So the useful gate is a **noise-floor-aware** one: measure the run-to-run spread
-first, then set the threshold above it. A bit-exactness requirement would either
-fail constantly or force SR off, which changes the numerics being shipped.
+### Which part of the curve to read
+
+Across two documented repeats of the current default (`ab_lumlinear`,
+`ab_lumlinear2`, identical config, 200 steps):
+
+| Metric | Spread between identical runs |
+|---|---:|
+| Loss at iteration 15 | 7.0% |
+| Whole-trajectory mean per-step deviation | 0.33% |
+| Final iteration alone | 0.104% |
+| **Mean of the last 50 iterations** | **0.096%** |
+
+The early curve is chaotic and a single final step is one sample, so both report
+noise. The tail mean is the metric worth gating on. The same pair on the previous
+linear path gives 0.056%, so the current path is noisier — the floor has to be
+re-measured when the path changes rather than carried over.
+
+### The floor, measured on five runs
+
+Two runs give a range, not a distribution. Extending to five (2026-08-10,
+`ab_lumlinear`, `ab_lumlinear2`, `noise1..3`, all `MBS=2 GBS=32 SEQ=8192 SEED=1234`
+on 8 GPUs) widened the range from 0.096% to 0.223% with nothing else changed,
+which is the argument for setting the threshold from the **standard deviation**
+rather than the range: the range is a function of how many runs were taken.
+
+| | mean | stdev | range | gate |
+|---|---:|---:|---:|---:|
+| Loss, tail-50 mean | 6.753586 | 0.088% | 0.223% | **±0.352%** (4 stdev) |
+| Median step time | 1430.3 ms | 0.093% | 0.210% | **+1.0%** |
+
+Baseline frozen at `examples/qwen3/configs/mxfp4_loss_baseline.json`. All five
+runs sit between -0.131% and +0.093% of it.
+
+### The harness
+
+```bash
+scripts/mxfp4_loss_regression.py calibrate LOG...            # spread across identical runs
+scripts/mxfp4_loss_regression.py record -o baseline.json LOG...
+scripts/mxfp4_loss_regression.py check -b baseline.json LOG  # non-zero on regression
+```
+
+It refuses to compare runs whose iteration counts differ, and fails on any NaN or
+skipped iteration. Only a slowdown counts against the step-time gate.
+
+### What the gate is proven to catch, and what it is not
+
+Verified against four controls:
+
+| Control | Loss delta | Step delta | Caught |
+|---|---:|---:|---|
+| Previous linear path (`ab_base`) | -0.118% | +5.8% | yes, on step |
+| `--grad-quant-type mxfp4` | -0.034% | +29.7% | yes, on step |
+| BF16 run, different config | -29.5% | +649% | yes, on both, plus iteration mismatch |
+| No BF16 tail (`TAIL_BF16=0`) | -0.058% | +0.064% | **no** |
+
+The step-time axis is proven. The loss axis is not, and the last row is why:
+dropping the BF16 tail puts five more layers of a 36-layer model into MXFP4, and
+at 200 steps that moves the tail mean by less than the noise floor. The training
+report has 8B diverging around step 1300 without that tail (§1.5, §6.3), so the
+change does matter — just not inside this horizon.
+
+**A 200-step gate cannot see a regression that takes 1300 steps to show.** It
+catches performance regressions, NaN, skipped iterations and gross divergence.
+Anything subtler needs a longer-horizon variant of the same baseline, which is
+the natural next step for this harness.
+
+Worth noting for anyone trying to build a better control: every MXFP4 env toggle
+that exists today (`LUMEN_MXFP4_ASM`, `_PRESHUFFLE`, `_AUTOTUNE`,
+`DISABLE_WEIGHT_CACHE`) is bit-exact by design, so none of them can produce a
+numerics-only perturbation. That is a good property of the code and an
+inconvenient one for validating this gate.
+
+Two side findings from the calibration runs, both inside the noise floor at this
+horizon rather than proven absent: `--grad-quant-type mxfp4` costs -0.034% of
+loss for +29.7% of step time, and the BF16 tail buys -0.058%.
 
 ## Defects found
 
@@ -131,6 +204,11 @@ Pinned by `test_mxfp4_1d_rtn_unaligned_rows_vs_torchao`,
 `test_mxfp4_quant_unaligned_rows_are_reproducible` and
 `test_mxfp4_dividing_block_keeps_full_tile_on_aligned_shapes`. All 13 of the new
 cases that can fail do fail on the pre-fix code.
+
+Confirmed neutral end to end, which is what the claim about training shapes
+requires: a 200-step run on the fixed code lands +0.087% in loss and -0.066% in
+step time against a baseline recorded before the fix — both inside the noise
+floor, on a config where both fixes should be no-ops by construction.
 
 ### 2026-08-10 — `test_mxfp4_backward_optimization.py` was never running
 
@@ -176,19 +254,18 @@ given a plausible-looking number.
 | Quantize vs torchAO | bit-exact, `atol=0 rtol=0` | Holds on every shape with a torchAO counterpart |
 | GEMM backends vs each other | bit-identical | Precondition for autotune; if it ever fails, disable autotune rather than loosen this |
 | Linear SNR, fwd / dX / dW | 12 / 12 / 10 dB | Measured 15.3 / 17.4-17.8 / 15.9-18.9 across `LINEAR_SHAPES` |
-| Step time regression | > 1% of 1429.0 ms | Noise floor is 1.8 ms on the current path (~0.13%), so 1% is comfortably outside it |
+| Step time regression | +1% of 1430.3 ms | Stdev over five runs is 0.093%, so 1% is well outside it |
+| Loss tail-50 mean | ±0.352% of 6.753586 | 4 stdev over the same five runs |
 | Peak memory | 150.4 GiB of 251.7 | Current 8-GPU Qwen3-8B measurement |
-| Loss drift vs BF16 | TBD | Needs the fixed-seed harness below; must be set above the 0.25% run-to-run spread |
 | Block scale saturation | TBD | Replaces FP8's overflow rate; needs instrumentation first |
 
 ## Gaps, in priority order
 
-1. **Fixed-seed loss regression with a noise-floor gate.** The highest-value
-   missing test and the only one that would catch a numerics regression that does
-   not crash. Needs the spread measured before the threshold is set.
-2. **Multi-GPU smoke.** 8-GPU Megatron, ~200 steps, asserting the run completes
-   and the loss lands in a band. Nothing multi-GPU covers MXFP4 today.
-3. **Tuned-table coverage.** An untuned shape is correct but silently falls back
+1. **A longer-horizon loss baseline.** The 200-step gate is calibrated and
+   working, but demonstrably cannot see a change that takes ~1300 steps to
+   surface. The same harness against a 1500-step baseline would close the one
+   class of regression nothing currently catches.
+2. **Tuned-table coverage.** An untuned shape is correct but silently falls back
    off the ASM path, so a change in TP width or sequence length can cost
    performance with nothing reporting it. A test that the shipped CSV covers the
    shapes the training scripts issue would catch it.
@@ -201,6 +278,14 @@ parametrization, which is what surfaced the row-padding defect.
 
 ## Changelog
 
+- **2026-08-10b** — Added the loss regression gate. Five same-config 200-step
+  runs put the tail-50 noise floor at 0.088% stdev, and the gate is set at
+  4 stdev (±0.352%) with step time at +1%. Baseline frozen at
+  `examples/qwen3/configs/mxfp4_loss_baseline.json`. Verified on four controls:
+  it catches the three that regress step time and misses the one that only
+  perturbs numerics, because at 200 steps that perturbation is itself inside the
+  noise. That bound is now written down rather than assumed away. Also confirmed
+  the day's two production fixes are neutral end to end.
 - **2026-08-10** — First edition. Established a 150-test baseline on 8x MI350X
   and added `scripts/run_mxfp4_tests.sh`. Recorded which rows of the FP8 CI
   matrix apply to MXFP4 and which two need redefining rather than adopting.
