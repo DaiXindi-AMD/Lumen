@@ -43,6 +43,59 @@ def _build(weight, gemm_rows):
     return (data, scale), (data_t, scale_t)
 
 
+def _operand_cache_inputs():
+    w = torch.zeros(64, 64, device="cuda", dtype=torch.uint8)
+    scale = torch.zeros(64, 2, device="cuda", dtype=torch.uint8)
+    return w, scale
+
+
+def test_operand_cache_refuses_to_memoize_a_view_of_the_weight():
+    """A reshape of an already-shuffled weight is a view, not a copy.
+
+    Memoizing it on the weight makes the weight reference itself. The cache
+    guarded against being handed the weight back, but not against being handed a
+    view of it, which leaked one copy of every quantized weight per iteration.
+    """
+    from lumen.ops.quantize.linear import _cached_weight_operands
+
+    w, scale = _operand_cache_inputs()
+    key = "_test_alias_operands"
+
+    data, _ = _cached_weight_operands(w, scale, key, lambda: (w.reshape(32, 128), scale))
+
+    assert data.data_ptr() == w.data_ptr(), "the build result should still be returned"
+    assert getattr(w, key, None) is None
+
+
+def test_operand_cache_lets_the_weight_die_by_refcount_alone():
+    """The leak was only visible as a leak because GPU bytes are invisible to gc.
+
+    With the cyclic collector off, a weight that the cache has put in a cycle
+    never goes away. That is the training behaviour: the collector's thresholds
+    count Python allocations, so a 2 GiB tensor never triggers one.
+    """
+    import gc
+    import weakref
+
+    from lumen.ops.quantize.linear import _cached_weight_operands
+
+    def build_and_drop():
+        w, scale = _operand_cache_inputs()
+        _cached_weight_operands(
+            w, scale, "_test_alias_lifetime", lambda: (w.reshape(32, 128), scale)
+        )
+        return weakref.ref(w)
+
+    gc_was_on = gc.isenabled()
+    gc.disable()
+    try:
+        ref = build_and_drop()
+        assert ref() is None
+    finally:
+        if gc_was_on:
+            gc.enable()
+
+
 @pytest.mark.parametrize(
     "N_out,K_in", [(6144, 4096), (4096, 12288)], ids=["qkv", "fc2"],
 )

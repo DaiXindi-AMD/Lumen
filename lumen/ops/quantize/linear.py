@@ -1373,6 +1373,11 @@ def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
     return shuffled.reshape(rows_pad, cols_pad).contiguous()
 
 
+def _aliases(t, w) -> bool:
+    """True when *t* is *w* or any view sharing its memory."""
+    return torch.is_tensor(t) and t.untyped_storage().data_ptr() == w.untyped_storage().data_ptr()
+
+
 def _cached_weight_operands(w_fp4, scale_w, key, build):
     """Memoize the weight-derived GEMM operands on the FP4 weight tensor.
 
@@ -1390,13 +1395,20 @@ def _cached_weight_operands(w_fp4, scale_w, key, build):
     if cached is not None and cached[0] == stamp:
         return cached[1]
     built = build()
-    if any(t is w_fp4 for t in built):
+    if any(_aliases(t, w_fp4) for t in built):
         # A quantizer that already stored this operand in the GEMM's layout gets
-        # the same tensor back, so there is nothing to memoize -- and hanging the
-        # result off it would make the tensor reference itself, which refcounting
-        # cannot free. GPU bytes are invisible to the cyclic collector's
-        # thresholds, so the weight would sit in memory until an unrelated gen-2
-        # collection happened to run.
+        # the weight's own memory back, so there is nothing to memoize -- and
+        # hanging the result off it would make the tensor reference itself, which
+        # refcounting cannot free. GPU bytes are invisible to the cyclic
+        # collector's thresholds, so the weight would sit in memory until an
+        # unrelated gen-2 collection happened to run.
+        #
+        # This has to compare storage, not identity: the shuffled-layout path
+        # reshapes what it gets back, and a reshape of an already-shuffled weight
+        # is a *view*, which is a different object pointing at the same bytes. It
+        # slipped through an identity check and leaked one copy of every
+        # quantized weight per iteration -- ~3.6 GiB/step at TP=1, enough to OOM
+        # an 8-GPU TP=2 run by step 10.
         return built
     setattr(w_fp4, key, (stamp, built))
     return built
