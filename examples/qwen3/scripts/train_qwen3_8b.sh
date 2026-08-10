@@ -81,20 +81,61 @@ fi
 export PYTHONPATH="${MEGATRON_ROOT}:${LUMEN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 python -c "import megatron" || { echo "ERROR: megatron not importable"; exit 1; }
 
-# lumen.ops.cross_entropy needs aiter's Triton cross-entropy kernels, which
-# upstream aiter dropped but Lumen still vendors. Without this the failure is a
-# ModuleNotFoundError from deep inside the lumen.models.megatron import chain.
-python -c "import aiter.ops.triton.cross_entropy" 2>/dev/null || {
-    cat <<EOF
-ERROR: the installed aiter has no ops/triton/cross_entropy.py.
-Copy the vendored ones over it:
-  cp ${LUMEN_ROOT}/third_party/aiter/aiter/ops/triton/cross_entropy.py \\
-     \$(python -c 'import aiter,os;print(os.path.dirname(aiter.__file__))')/ops/triton/
-  cp ${LUMEN_ROOT}/third_party/aiter/aiter/ops/triton/_triton_kernels/cross_entropy.py \\
-     \$(python -c 'import aiter,os;print(os.path.dirname(aiter.__file__))')/ops/triton/_triton_kernels/
-EOF
-    exit 1
+# Lumen vendors Triton kernels under third_party/aiter that the installed aiter
+# does not ship. They have to be copied over the installed tree rather than put
+# on PYTHONPATH: the submodule has no compiled extensions for hipbsolgemm (every
+# hipBLASLt GEMM) or the a4w4 GEMMs (all of MXFP4), so importing aiter from there
+# trades a missing Triton file for a missing .so.
+# `|| true` so a failed import reaches the message below instead of tripping
+# `set -e` on the command substitution's exit status.
+AITER_DIR="$(python -c 'import aiter,os;print(os.path.dirname(aiter.__file__))' 2>/dev/null || true)"
+[ -n "${AITER_DIR}" ] || { echo "ERROR: aiter not importable"; exit 1; }
+
+# Missing these surfaces as a ModuleNotFoundError from deep inside the
+# lumen.models.megatron import chain.
+AITER_REQUIRED=(
+    ops/triton/cross_entropy.py
+    ops/triton/_triton_kernels/cross_entropy.py
+)
+# Missing these still trains, which is exactly the problem. fast_transpose_fp8
+# falls back to .t().contiguous() and warns per call: the first FP8 baseline ran
+# that way and paid 166 ms/step plus 709k warnings into a 78 MB log, with nothing
+# in the run to say so. The quant kernels are reached only by the blockwise and
+# mxfp8 scaling types.
+AITER_OPTIONAL=(
+    ops/triton/quant/fast_transpose.py
+    ops/triton/_triton_kernels/quant/fast_transpose.py
+    ops/triton/_triton_kernels/quant/quant_fp8_blockwise.py
+    ops/triton/_triton_kernels/quant/quant_mxfp8.py
+)
+
+aiter_missing() {
+    local rel
+    for rel in "$@"; do
+        [ -f "${AITER_DIR}/${rel}" ] || echo "${rel}"
+    done
 }
+aiter_copy_hint() {
+    local rel
+    for rel in "$@"; do
+        echo "  cp ${LUMEN_ROOT}/third_party/aiter/aiter/${rel} ${AITER_DIR}/${rel}"
+    done
+}
+
+mapfile -t MISSING_REQUIRED < <(aiter_missing "${AITER_REQUIRED[@]}")
+if [ ${#MISSING_REQUIRED[@]} -gt 0 ]; then
+    echo "ERROR: the installed aiter (${AITER_DIR}) is missing kernels Lumen vendors:"
+    aiter_copy_hint "${MISSING_REQUIRED[@]}"
+    exit 1
+fi
+
+mapfile -t MISSING_OPTIONAL < <(aiter_missing "${AITER_OPTIONAL[@]}")
+if [ ${#MISSING_OPTIONAL[@]} -gt 0 ]; then
+    echo "[setup] WARNING: the installed aiter (${AITER_DIR}) is missing vendored kernels."
+    echo "[setup] Training will run, but FP8 transposes fall back to .t().contiguous()"
+    echo "[setup] and any step time measured here is not comparable to a complete run:"
+    aiter_copy_hint "${MISSING_OPTIONAL[@]}"
+fi
 
 # The RMSNorm layer-spec patch rewrites Megatron to use apex's FusedRMSNorm, so
 # it only applies where apex exists. Without apex Megatron already falls back to
