@@ -492,6 +492,21 @@ def _probe_aiter_fp4_utils() -> bool:
     return _AITER_FP4_UTILS_AVAILABLE
 
 
+def _dividing_block(dim: int, cap: int, floor: int = 1) -> int:
+    """Largest power-of-two block ``<= cap`` that divides *dim*.
+
+    The MXFP4 quantize kernels address their tiles without bounds masks, so a
+    grid built with ``cdiv`` over a block that does not divide the dimension
+    leaves the last program reading past the input and writing past the scale
+    tensor. Shrinking the block keeps every program wholly in range. Training
+    shapes are multiples of the cap and are unaffected.
+    """
+    block = 1 << (min(cap, dim).bit_length() - 1)
+    while block > floor and dim % block:
+        block >>= 1
+    return max(block, floor)
+
+
 def convert_to_mxfp4(
     data_hp: torch.Tensor,
     block_size: int = 32,
@@ -569,9 +584,8 @@ def convert_to_mxfp4(
             dtype=torch.uint8, device=data_2d.device,
         )
 
-        BLOCK_M = min(64, M) if M >= 64 else M
-        BLOCK_N = min(64, N) if N >= 64 else N
-        BLOCK_N = max(BLOCK_N, block_size)
+        BLOCK_M = _dividing_block(M, 64)
+        BLOCK_N = _dividing_block(N, 64, floor=block_size)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
         _convert_to_mxfp4_kernel[grid](
@@ -661,10 +675,8 @@ def convert_to_mxfp4_2d(
     fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=data_2d.device)
     scales_2d = torch.empty((sm, sn), dtype=torch.uint8, device=data_2d.device)
 
-    BLOCK_M = min(64, M) if M >= 64 else M
-    BLOCK_N = min(64, N) if N >= 64 else N
-    BLOCK_M = max(BLOCK_M, block_size)
-    BLOCK_N = max(BLOCK_N, block_size)
+    BLOCK_M = _dividing_block(M, 64, floor=block_size)
+    BLOCK_N = _dividing_block(N, 64, floor=block_size)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     _convert_to_mxfp4_kernel[grid](
@@ -988,9 +1000,8 @@ def hadamard_quant_mxfp4(
     fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     scales_e8m0 = torch.empty((M, N // block_size), dtype=torch.uint8, device=x.device)
 
-    BLOCK_M = min(64, M) if M >= 64 else M
-    BLOCK_N = min(64, N) if N >= 64 else N
-    BLOCK_N = max(BLOCK_N, max(block_size, g))
+    BLOCK_M = _dividing_block(M, 64)
+    BLOCK_N = _dividing_block(N, 64, floor=max(block_size, g))
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     from lumen.kernels.mxfp4 import _fused_hadamard_quant_mxfp4_kernel
@@ -1104,8 +1115,8 @@ def dual_layout_quant_mxfp4(
     # measured fastest across Qwen3-8B's wgrad shapes once the rotation moved
     # to the matrix unit; before that the wider tile's register pressure cost
     # more occupancy than the longer runs bought.
-    BLOCK_M = max(min(256, M), max(block_size, g))
-    BLOCK_N = max(min(32, N), block_size)
+    BLOCK_M = _dividing_block(M, 256, floor=max(block_size, g))
+    BLOCK_N = _dividing_block(N, 32, floor=block_size)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     from lumen.kernels.mxfp4 import _dual_layout_quant_mxfp4_kernel
@@ -1221,8 +1232,8 @@ def dequant_hadamard_quant_mxfp4(
     # fastest across Qwen3-8B's activation shapes, 5-9% ahead of (128, 32):
     # this kernel reads and writes FP4 on both sides, so it is short of bytes to
     # hide latency behind and wants the wider tile more than the taller one.
-    BLOCK_M = max(min(128, M), max(block_size, g))
-    BLOCK_K = max(min(64, K), block_size)
+    BLOCK_M = _dividing_block(M, 128, floor=max(block_size, g))
+    BLOCK_K = _dividing_block(K, 64, floor=block_size)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(K, BLOCK_K))
 
     _dequant_hadamard_quant_mxfp4_kernel[grid](

@@ -512,6 +512,25 @@ def test_mxfp8_dtype_variants(fp8_dtype, shape, block_size):
 MXFP4_BLOCK_SIZE = 32
 MXFP4_SHAPES = [(64, 128), (128, 256)]
 
+# Every shape above has a row count that is a multiple of 64, the tile height
+# the quantize kernels pick for anything that large. The kernels address their
+# tiles without bounds masks, so a row count that is not a multiple of the tile
+# used to leave the last program reading past the input and writing past the
+# scale tensor -- silently, and only visible as a scale that changed between two
+# identical calls.
+MXFP4_UNALIGNED_ROWS = [96, 160, 224]
+
+
+def _poison_free_blocks():
+    """Recycle the allocator's free blocks with non-zero bytes.
+
+    An unwritten output is only detectable if the memory it lands on differs
+    between the two calls, so it has to be dirtied in between.
+    """
+    for _ in range(3):
+        junk = torch.full((8 << 20,), 0xAB, dtype=torch.uint8, device="cuda")
+        del junk
+
 
 def _require_mxfp4_dtype():
     if not hasattr(torch, "float4_e2m1fn_x2"):
@@ -526,6 +545,96 @@ def _torchao_mxfp4_dequant(data_fp4, scales, block_size=MXFP4_BLOCK_SIZE):
         block_size,
         torch.float32,
     )
+
+
+@pytest.mark.parametrize(
+    "dim,cap,floor,expected",
+    [
+        (8192, 64, 1, 64),
+        (4096, 64, 32, 64),
+        (12288, 64, 32, 64),
+        (8192, 256, 32, 256),
+        (8192, 128, 32, 128),
+        (96, 64, 32, 32),
+        (224, 64, 32, 32),
+        (300, 64, 1, 4),
+    ],
+)
+def test_mxfp4_dividing_block_keeps_full_tile_on_aligned_shapes(dim, cap, floor, expected):
+    """The tile only shrinks for shapes it would otherwise overrun.
+
+    Every training shape is a multiple of the cap, so shrinking must not cost
+    them anything -- that is what makes fitting the tile preferable to masking
+    every load and store in the kernel.
+    """
+    from lumen.ops.quantize.ops import _dividing_block
+
+    block = _dividing_block(dim, cap, floor)
+    assert block == expected
+    assert dim % block == 0
+
+
+@pytest.mark.parametrize("M", MXFP4_UNALIGNED_ROWS)
+def test_mxfp4_1d_rtn_unaligned_rows_vs_torchao(M):
+    """A row count that does not divide the kernel tile must still be exact."""
+    _require_mxfp4_dtype()
+    N = 256
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+
+    try:
+        data_fp4, scales = convert_to_mxfp4(
+            x.float(), block_size=MXFP4_BLOCK_SIZE, axis=-1, use_sr=False,
+        )
+    except (AssertionError, RuntimeError) as e:
+        pytest.skip(f"Lumen MXFP4 RTN quant unavailable on this hardware/build: {e}")
+
+    mx_ref = MXTensor.to_mx(
+        x.float().cpu().contiguous(),
+        torch.float4_e2m1fn_x2,
+        MXFP4_BLOCK_SIZE,
+        scaling_mode=ScaleCalculationMode.EVEN,
+    )
+    torch.testing.assert_close(scales.cpu(), mx_ref.scale.view(torch.uint8), atol=0, rtol=0)
+    torch.testing.assert_close(data_fp4.cpu(), mx_ref.qdata.view(torch.uint8), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("M", MXFP4_UNALIGNED_ROWS)
+def test_mxfp4_quant_unaligned_rows_are_reproducible(M):
+    """Two identical quantize calls must agree byte for byte on every path.
+
+    Covers the paths torchAO has no counterpart for -- 2D tiles, fused Hadamard,
+    dual layout -- where writing past the output shows up only as a result that
+    moves when the allocator hands back different memory.
+    """
+    N = 256
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
+    sign = torch.randint(0, 2, (N // 16, 16), device="cuda", dtype=torch.bfloat16) * 2 - 1
+
+    paths = {
+        "1d": lambda: convert_to_mxfp4(x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False),
+        "2d": lambda: convert_to_mxfp4_2d(x.float(), block_size=MXFP4_BLOCK_SIZE),
+        "hadamard": lambda: hadamard_quant_mxfp4(
+            x, sign, block_size=MXFP4_BLOCK_SIZE, use_sr=False,
+        ),
+        "dual_layout": lambda: dual_layout_quant_mxfp4(
+            x, sign, block_size=MXFP4_BLOCK_SIZE,
+            use_sr_row=False, use_sr_transposed=False,
+        ),
+    }
+
+    for name, run in paths.items():
+        _poison_free_blocks()
+        first = tuple(t.clone() for t in run())
+        _poison_free_blocks()
+        second = run()
+        for i, (a, b) in enumerate(zip(first, second)):
+            assert torch.equal(a, b), (
+                f"{name} output {i} changed between two identical calls at M={M}"
+            )
 
 
 @pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])
