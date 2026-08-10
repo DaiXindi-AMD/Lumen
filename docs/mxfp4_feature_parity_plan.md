@@ -173,6 +173,14 @@ not wired, or wired but never validated), **MISSING**, **DEFERRED** (with reason
 | BF16 tail layers | Configurable | Last ~15% by default | SUPPORTED |
 | Dual-layout gradient quantization | — (folded into `cast_transpose`) | `dual_layout_quant_mxfp4`, one read emits both layouts | SUPPORTED (Lumen-only) |
 | NVFP4 (E4M3 second-level scale) | `nvfp4` (TE ≥ 2.7) | `QuantFormat.FP4` is a placeholder, raises `NotImplementedError` | MISSING |
+| Gradient quantization round-trip (`--grad-quant-type mxfp4`) | — | Exposed on both parsers, applies inside the Linear / attention / norm backwards | SUPPORTED |
+
+`--grad-quant-type` is easy to mistake for a communication feature and is not one:
+`quantize_grad_tensor` quantizes and dequantizes back to BF16 in place, so no tensor
+travels smaller. The 200-step A/B prices it at **1855.4 vs 1513.4 ms/step (+22.6%)** with the
+loss curve indistinguishable from the baseline's own run-to-run noise. It is a tool for
+studying what gradient precision costs, not a throughput or bandwidth feature, and nothing
+should turn it on expecting either.
 
 The Hadamard scope difference is a deliberate divergence, not a gap: the 4-arm ablation shows
 TE's all-operand rotation does **not** beat Lumen's WGrad-only rotation on convergence.
@@ -183,7 +191,7 @@ TE's all-operand rotation does **not** beat Lumen's WGrad-only rotation on conve
 |---|---|---|
 | Megatron stock `Column/RowParallelLinear` | `quant.enable()` patch — this is the official path | SUPPORTED |
 | HF `nn.Linear` under FSDP2 | Same patch | SUPPORTED |
-| `LumenColumn/RowParallelLinear` | The enable path now passes the resolved recipe, so `--lumen-linear` routes MXFP4 instead of silently running FP8 blockwise; unit-tested, but the launcher still defaults to the patched Megatron linears until a 200-step A/B clears the native ones | PARTIAL |
+| `LumenColumn/RowParallelLinear` | The enable path passes the resolved recipe, so `--lumen-linear` routes MXFP4 rather than silently running FP8 blockwise. The 200-step A/B made it the launcher default: 1429.0 vs 1513.4 ms/step (−5.6%), less memory, loss within noise | SUPPORTED |
 | `LumenLayerNormLinear` | GEMM side works; fused norm→quant supports FP8 delayed only | PARTIAL |
 | `LumenGroupedLinear` / MoE | API accepts a scaling type, defaults to `none`, no end-to-end validation | PARTIAL |
 | `LumenFusedMLP` / `LumenGatedMLP` | BF16 / FP8 branches only | MISSING |
@@ -197,7 +205,7 @@ TE's all-operand rotation does **not** beat Lumen's WGrad-only rotation on conve
 | Feature | Lumen MXFP4 | Status |
 |---|---|---|
 | MXFP4 DPA / MHA | No MXFP4 reference anywhere in the attention modules; only `--lumen-fp8-attn` exists | MISSING |
-| Attention gradient quantization to MXFP4 | `--grad-quant-type mxfp4` now reaches the attention and norm backward paths; default stays `None` and no run has enabled it | PARTIAL |
+| Attention gradient quantization to MXFP4 | Reachable via `--grad-quant-type mxfp4` and priced only in aggregate with the Linear and norm paths (§6.1); the attention share has not been isolated | PARTIAL |
 
 ### 6.4 Normalization
 
@@ -221,8 +229,8 @@ one of the largest single wins recorded in §10, so it belongs in the table.
 |---|---|---|
 | FSDP2 FP4 parameter all-gather (`MXFP4CommTensor`) | Implemented, 3.99× less wire traffic on paper; the **net** effect has never been isolated | PARTIAL |
 | Megatron FP4 parameter all-gather | No equivalent path | MISSING |
-| TP comm-GEMM overlap × MXFP4 | Overlap lives in the Lumen native parallel modules; MXFP4 runs on the stock ones | MISSING |
-| Gradient communication quantization | `--grad-quant-type mxfp4` is now accepted by both the Megatron and FSDP parsers and reaches `ScalingManager._round_to_mxfp4` (round-trip measures 15.8 dB SNR); no training run has used it yet | PARTIAL |
+| TP comm-GEMM overlap × MXFP4 | The blocker is gone — MXFP4 now runs on the Lumen native modules, where the overlap lives — but it is untested and does nothing until TP > 1 | MISSING |
+| Gradient communication quantization | Nothing shrinks the DP gradient all-reduce. `--grad-quant-type` is not this feature despite the name — it round-trips through BF16 and moves no fewer bytes (§6.1) | MISSING |
 
 ### 6.7 Parallelism and runtime
 
@@ -243,17 +251,20 @@ one of the largest single wins recorded in §10, so it belongs in the table.
 
 | Category | Features | Supported | Partial | Missing | N/A |
 |---|---|---|---|---|---|
-| Quantization recipe | 6 | 5 | 0 | 1 | 0 |
-| Linear / GEMM | 10 | 5 | 3 | 2 | 0 |
+| Quantization recipe | 7 | 6 | 0 | 1 | 0 |
+| Linear / GEMM | 10 | 6 | 2 | 2 | 0 |
 | Attention | 2 | 0 | 1 | 1 | 0 |
 | Normalization | 2 | 1 | 0 | 1 | 0 |
 | Cross-entropy | 1 | 0 | 0 | 0 | 1 |
-| Communication | 4 | 0 | 2 | 2 | 0 |
+| Communication | 4 | 0 | 1 | 3 | 0 |
 | Parallelism / runtime | 8 | 2 | 3 | 3 | 0 |
-| **Total** | **33** | **13 (39%)** | **9** | **10** | **1** |
+| **Total** | **34** | **15 (44%)** | **7** | **11** | **1** |
 
-The 39% is not comparable to FP8's 80%: the denominators are different feature sets, and
-MXFP4's supported 39% is the part that has been benchmarked against a production competitor.
+The 44% is not comparable to FP8's 80%: the denominators are different feature sets, and
+MXFP4's supported 44% is the part that has been benchmarked against a production competitor.
+Two of those cells moved on 8/10 without any new capability being written — the native
+parallel linears and the gradient round-trip were both already implemented and simply could
+not be reached from the command line.
 
 ---
 
@@ -298,9 +309,8 @@ MXFP4's supported 39% is the part that has been benchmarked against a production
 
 | # | Feature | Remaining work | Cost |
 |---|---|---|---|
-| 1 | `--grad-quant-type mxfp4` | Wiring done. Needs a training run to find out what gradient quantization costs in loss | A 200-step A/B |
-| 2 | Native parallel linears + MXFP4 | Wiring done. Needs the A/B against the patched Megatron linears before `--lumen-linear` goes back in the launcher; that is also what unblocks TP comm-GEMM overlap, which only exists on the native modules | A 200-step A/B |
-| 3 | FSDP2 FP4 all-gather | Isolate with a dedicated A/B on an idle machine; port `convert_from_mxfp4_2d` to Triton if the gather turns out bandwidth-bound | Days |
+| 1 | FSDP2 FP4 all-gather | Isolate with a dedicated A/B on an idle machine; port `convert_from_mxfp4_2d` to Triton if the gather turns out bandwidth-bound | Days |
+| 2 | Loss effect of the gradient round-trip | 200 steps could not separate it from run-to-run noise (0.40% vs a 0.25% floor). Resolving it needs several seeds or a longer run, and is only worth doing if something is going to use the feature | Days |
 
 ---
 
@@ -334,6 +344,27 @@ iteration at N=128), and loading the Hadamard tile transposed (no change — Tri
 
 Correctness work completed earlier: 12/12 ops bit-exact vs torchAO, 8B stable for 5000 steps,
 convergence attribution across a 4-arm recipe ladder, dispatch-routing and FSDP2 NaN fixes.
+
+**8/10 — the two CLI gaps, measured.** Both features existed and neither could be reached from
+the command line; closing that took a day and one of them turned out to be worth 5.6%.
+
+| Arm | ms/step | vs baseline | loss @200 |
+|---|---|---|---|
+| Baseline (patched Megatron linears) | 1513.4 | — | 6.7992 |
+| Baseline, repeated | 1514.0 | +0.6 | 6.8019 |
+| `--lumen-linear` (native parallel linears) | 1429.0 | **−84.4 (−5.6%)** | 6.8054 |
+| `--grad-quant-type mxfp4` | 1855.4 | **+342.0 (+22.6%)** | 6.8051 |
+
+The repeated baseline is what makes the rest readable. Step time is nearly noise-free between
+identical runs (0.6 ms, 0.04%), so both deltas are real by a wide margin. Loss is not: the two
+identical baselines already differ by 0.25% mean relative across the curve, and neither arm
+exceeds that in a way n=1 can distinguish. The honest reading is that no arm shows a loss
+effect at 200 steps, not that the arms converge identically.
+
+`--lumen-linear` is now the launcher default. It also uses slightly less memory (0.6414 vs
+0.6556), and it puts MXFP4 on the modules where TP comm-GEMM overlap lives. Note that every
+step time recorded before 8/10, including the 1513.7 at the top of this section, was measured
+on the patched-Megatron path and is 5.6% slower for that reason alone.
 
 ---
 

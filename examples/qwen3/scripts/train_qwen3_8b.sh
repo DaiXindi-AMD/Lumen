@@ -194,13 +194,15 @@ fi
 # FP4 papers find the tail layers are the sensitive ones, and 8B diverged around
 # step 1300 without this (docs/mxfp4_training_report.md §1.5, §6.3).
 #
-# --lumen-linear is left off here. It used to be unsafe: enable_fp8_for_parallel_linear
-# configured LumenColumnParallelLinear from the --linear-fp8-scaling string
-# ("blockwise") rather than the resolved recipe, so the run silently executed FP8
-# blockwise. That is fixed, but the native linears have not been A/B'd against the
-# patched Megatron ones at this scale yet, so the measured path stays the default:
-# without the flag, quant.enable() patches Megatron's ColumnParallelLinear /
-# RowParallelLinear, which routes MXFP4 correctly.
+# --lumen-linear swaps Megatron's ColumnParallelLinear / RowParallelLinear for the
+# Lumen native ones. It was banned here until 8/10 because
+# enable_fp8_for_parallel_linear configured them from the --linear-fp8-scaling
+# string ("blockwise") rather than the resolved recipe, so the run silently
+# executed FP8 blockwise. With that fixed, the 200-step A/B says the native path
+# is worth having: 1429.0 vs 1513.4 ms/step (-5.6%) and 0.6414 vs 0.6556 mem, with
+# the loss curve inside the run-to-run noise floor (two identical baselines differ
+# by 0.25% mean, the native arm by 0.37%). Numbers from before this date were
+# measured on the patched-Megatron path and are 5.6% slower for that reason alone.
 QUANT_ARGS=()
 if [ "${PRECISION}" = "mxfp4" ]; then
     QUANT_ARGS=(
@@ -208,6 +210,7 @@ if [ "${PRECISION}" = "mxfp4" ]; then
         --linear-fp8-format mxfp4
         --linear-fp8-scaling blockwise
         --linear-fp8-block-size 32
+        --lumen-linear
         --first-last-layers-bf16
         --num-layers-at-start-in-bf16 0
         --num-layers-at-end-in-bf16 "${TAIL_BF16}"
