@@ -58,7 +58,9 @@ RUNTIME_ENV=(
     NCCL_IB_DISABLE=1
     NCCL_SOCKET_IFNAME=lo
     NCCL_DEBUG=WARN
-    CUDA_DEVICE_MAX_CONNECTIONS=8
+    # 8 is a TP=1 tuning value. Megatron asserts this is exactly 1 as soon as
+    # tensor or context parallelism is on, so a TP>1 run has to override it.
+    CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-8}"
     OMP_NUM_THREADS=1
     TORCHDYNAMO_DISABLE=1
     USE_HIPBLASLT=1
@@ -85,9 +87,16 @@ if [ "${LAUNCH}" = "native" ]; then
     # reproducible across processes. Every MXFP4 backend is bit-identical, so both
     # affect speed only (docs/mxfp4_training_report.md §2.2).
     if [ "${PRECISION}" = "mxfp4" ]; then
+        # AITER_CONFIG_GEMM_A4W4 is deliberately left alone. Setting it here to
+        # the generic table shadowed the list train_qwen3_8b.sh builds, which is
+        # the only one carrying Qwen3-8B's fused qkv/gate_up shapes -- every
+        # MXFP4 GEMM then missed the ASM kernels and fell back to Triton.
+        # The autotune cache has to stay overridable: its decisions are recorded
+        # under whatever kernels were reachable at the time, so a run made with
+        # the tuned table missing pins "use Triton" for every shape and later
+        # runs inherit it. A/B work needs to be able to point somewhere fresh.
         RUNTIME_ENV+=(
-            AITER_CONFIG_GEMM_A4W4="${SCRIPT_DIR}/configs/a4w4_blockscale_tuned_gemm.csv"
-            LUMEN_MXFP4_AUTOTUNE_CACHE="${RESULTS_DIR}/mxfp4_autotune_qwen3_8b.json"
+            LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${RESULTS_DIR}/mxfp4_autotune_qwen3_8b.json}"
             LUMEN_FAST_QUANT_DISPATCH=1
         )
     fi
