@@ -2,6 +2,10 @@
 
 By Dai, Xindi — last audit **2026-08-10** against `feature/mxfp4` @ `3ae8c92`.
 
+Test status, coverage gaps and release gates are tracked in
+[`mxfp4_test_report.md`](mxfp4_test_report.md), which is the only place MXFP4
+test results are recorded.
+
 ---
 
 ## 0. How this document differs from the FP8 one

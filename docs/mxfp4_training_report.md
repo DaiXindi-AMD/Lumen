@@ -2,6 +2,10 @@
 
 By Dai, Xindi
 
+Test status, coverage gaps and release gates live in
+[`mxfp4_test_report.md`](mxfp4_test_report.md), which is the only place MXFP4
+test results are recorded.
+
 ---
 
 ## 1. Design Overview
