@@ -36,11 +36,11 @@ Two environment facts that cost time when they are missed:
 | `test_mxfp4_fused_act_scale.py` | 2 | pass |
 | `test_mxfp4_fwd_wgrad_operand.py` | 3 | pass |
 | `test_mxfp4_weight_cache_hook.py` | 5 | pass |
-| `test_mxfp4_weight_operand_fusion.py` | 2 | pass |
+| `test_mxfp4_weight_operand_fusion.py` | 4 | pass |
 | `test_mxfp4_backward_optimization.py` | 5 | pass |
 | `test_grad_quant.py` (whole file) | 14 | pass |
 | `tests/models/ -k mxfp4` | 3 | pass |
-| **Total** | **150** | **pass**, 84 s |
+| **Total** | **152** | **pass**, 85 s |
 
 Known unrelated breakage on the same machine, present on `HEAD` with no local
 changes, so not an MXFP4 regression:
@@ -63,7 +63,7 @@ fallback and report green.
 | Edge values | **Need it** | The one gap that has already cost us a real defect — see below |
 | Quantization lifecycle | **Have it** | RTN, SR, 1D/2D tiles, dual layout, Hadamard fusion |
 | FSDP + Megatron (2+ GPU) | **Need it** | Nothing multi-GPU exists; `tests/env/` has no MXFP4 |
-| TP + SP | **Need it** | Never run with MXFP4; blocks the TP comm-GEMM overlap work |
+| TP + SP | **Ran it once** | TP=2+SP now trains 20 steps clean (2026-08-10c). It was never run before, and the first attempt is what surfaced the operand-cache leak below. Still no automated test |
 | CP (A2A, P2P) | Not yet | MXFP4 has never run under CP; no subject to test |
 | Comm overlap | Not yet | Same |
 | Fixed-seed loss regression | **Need it** | Highest-value missing gate |
@@ -146,18 +146,31 @@ Verified against four controls:
 | Previous linear path (`ab_base`) | -0.118% | +5.8% | yes, on step |
 | `--grad-quant-type mxfp4` | -0.034% | +29.7% | yes, on step |
 | BF16 run, different config | -29.5% | +649% | yes, on both, plus iteration mismatch |
-| No BF16 tail (`TAIL_BF16=0`) | -0.058% | +0.064% | **no** |
+| No BF16 tail (`TAIL_BF16=0`) | -0.058% | +0.064% | ~~no~~ **void** |
 
-The step-time axis is proven. The loss axis is not, and the last row is why:
-dropping the BF16 tail puts five more layers of a 36-layer model into MXFP4, and
-at 200 steps that moves the tail mean by less than the noise floor. The training
-report has 8B diverging around step 1300 without that tail (§1.5, §6.3), so the
-change does matter — just not inside this horizon.
+The step-time axis is proven. The loss axis is **not tested at all**, and the
+last row is why — but not for the reason first written here.
 
-**A 200-step gate cannot see a regression that takes 1300 steps to show.** It
-catches performance regressions, NaN, skipped iterations and gross divergence.
-Anything subtler needs a longer-horizon variant of the same baseline, which is
-the natural next step for this harness.
+That control was void. `--first-last-layers-bf16` did nothing on the
+`--lumen-linear` path (see the defect below), so `TAIL_BF16=0` and the default
+`TAIL_BF16=5` were the *same run*: both quantized all 144 linears. The -0.058% is
+run-to-run noise between two identical configurations, and it measures the gate's
+sensitivity to nothing. The earlier conclusion drawn from it — "a 200-step gate
+cannot see a regression that takes 1300 steps to show" — may well be true, but
+this experiment is not evidence for it. It has to be re-run now that the flag
+works.
+
+Two consequences worth being explicit about:
+
+- **The frozen baseline no longer describes the default config.** 6.753586 was
+  recorded across five runs that all quantized 144 modules. The default now
+  quantizes 124 and leaves 20 in BF16, which is a real numerics change, so the
+  baseline has to be re-recorded before the loss gate means anything. The noise
+  floor itself (0.088% stdev) is a property of the harness and carries over; the
+  centre does not.
+- **The loss axis still has no passing control.** Of the four, three are caught
+  on step time alone and the fourth turned out to be a no-op. Nothing yet
+  demonstrates that the loss gate catches a loss-only regression.
 
 Worth noting for anyone trying to build a better control: every MXFP4 env toggle
 that exists today (`LUMEN_MXFP4_ASM`, `_PRESHUFFLE`, `_AUTOTUNE`,
@@ -170,6 +183,107 @@ horizon rather than proven absent: `--grad-quant-type mxfp4` costs -0.034% of
 loss for +29.7% of step time, and the BF16 tail buys -0.058%.
 
 ## Defects found
+
+### 2026-08-10c — the shuffled GEMM path leaked one copy of every quantized weight per iteration
+
+**Severity: OOM under TP, and a slow bleed at TP=1 that looks like fragmentation.**
+Fixed.
+
+`_cached_weight_operands` memoizes the shuffled weight and swizzled scales by
+hanging them off the FP4 weight tensor, so the cache dies with the tensor. It
+guarded against the obvious self-reference with `any(t is w_fp4 for t in built)`,
+and the comment above that guard describes the exact hazard it was meant to
+prevent. The guard was one step too narrow.
+
+When the quantizer has already emitted the shuffled layout,
+`_shuffle_mxfp4_weight` returns `w_fp4` **itself**. The shuffled-layout path then
+reshapes what it gets back, and a reshape of a contiguous tensor is a *view* — a
+different Python object over the same bytes. `t is w_fp4` is false for it, so the
+view was stored as an attribute of the very tensor it points into:
+
+```
+w_fp4 → __dict__ → (stamp, (view, scales)) → view → .base → w_fp4
+```
+
+Reference counting can never free that cycle. The cyclic collector can, but its
+thresholds count Python allocations, and a 2 GiB tensor is a few hundred bytes to
+them — the case the original comment called out and then did not cover. MXFP4
+weight caching allocates a fresh `w_fp4` each iteration and drops it on
+`optimizer.step()`, so exactly one full set of quantized weights leaked per step.
+
+Isolated by pinning the autotune cache to a single backend and reading
+`mem usages` over 12 iterations, which separates the three kernels cleanly:
+
+| Backend pinned | Memory over 12 iterations |
+|---|---|
+| `plain` | flat at 0.6386 |
+| `asm` | flat |
+| `shuffled` | 0.6443 → 0.9660 by iteration 5, **+0.073/iter (~18 GiB)**, OOM after |
+| `shuffled`, after fix | flat at 0.6387 |
+
+The ASM path shares the same cache and never leaked, which is what pointed at the
+reshape: its `_build` returns `_shuffle_mxfp4_weight(...)` directly, so on an
+already-shuffled weight it hands back `w_fp4` itself and the identity guard fires.
+Only the shuffled path wrapped that return value in a view.
+
+The fix compares storage rather than identity (`_aliases`), so any view of the
+weight is treated the same as the weight. On an aliasing build the operands are
+rebuilt per call, which for this path is a reshape plus one scale swizzle.
+
+This is why TP > 1 had never worked: TP=2 shapes are absent from the TP=1 tuned
+table, so more of them fall to Triton, and the leak scales with how many. TP=2+SP
+OOM'd in vocab-parallel cross entropy at iteration 10 before the fix; after it,
+20 steps at a flat 0.3741 with loss descending to 9.49. Half that run's twelve
+shapes autotuned to `shuffled`, so it exercises the fixed path rather than
+side-stepping it.
+
+### 2026-08-10c — `--first-last-layers-bf16` was silently ignored on the `--lumen-linear` path
+
+**Severity: silent — the intended config never ran.** Fixed.
+
+`enable_fp8_for_parallel_linear` never consulted the flag. The function that does
+honour it, `quantize._patch_linear_layers`, only recognises Megatron's own linear
+types, and `--lumen-linear` has already swapped those out by the time it runs. So
+the tail-BF16 setting had no effect on the path that is now the default.
+
+Both arms of the historical A/B say so directly:
+
+| Run | `num_layers_at_end_in_bf16` | Modules quantized |
+|---|---:|---:|
+| `ab_lumlinear` | 5 | 144 |
+| `tailbf16_0` | 0 | 144 |
+
+The fix rebuilds the skip set with `_build_bf16_skip_prefixes` and filters by
+module name, giving `124 ... 20 left in BF16` at the default setting.
+
+Two things follow. Every MXFP4 training number on the `--lumen-linear` path was
+measured with *no* BF16 tail, whatever the flag said — including the frozen loss
+baseline, which now has to be re-recorded. And the gate's fourth control was
+void, as noted above.
+
+### 2026-08-10c — the launcher shadowed the tuned GEMM table, then the autotuner cached the damage
+
+**Severity: performance, and it is what exposed the leak above.** Fixed.
+
+`run_pretrain_qwen3_8b_mxfp4.sh` set `AITER_CONFIG_GEMM_A4W4` to the stock CSV.
+The inner `train_qwen3_8b.sh` only assembles its merged Qwen3-plus-stock table
+when that variable is *empty*, so setting it turned the Qwen3 shapes off. Fused
+qkv (N=6144) and friends then matched no ASM config and fell back to Triton.
+
+The autotuner did its job on the choices it was offered and wrote "Triton" into
+`mxfp4_autotune_qwen3_8b.json` — 19 shapes, zero ASM. That file then outlived the
+cause: restoring the table alone changes nothing, because the cache is consulted
+before any measurement. Both had to be cleared together, after which the same
+shape measures `asm=0.462 ms` against `plain=0.731` and `shuffled=0.780`.
+
+A cache that records a decision made under a broken environment, and is trusted
+afterwards, turns a transient misconfiguration into a permanent one. Worth
+remembering when adding the next autotuned choice.
+
+Also fixed there: `CUDA_DEVICE_MAX_CONNECTIONS` was pinned to 8 as a TP=1
+optimization, which trips Megatron's assertion that it must be 1 under TP, and
+the autotune cache path was not overridable, which is what A/B-ing backends
+needs. Both now take an override.
 
 ### 2026-08-10 — out-of-bounds read and write in the MXFP4 quantize kernels
 
@@ -250,34 +364,62 @@ given a plausible-looking number.
 
 | Metric | Threshold | Basis |
 |---|---|---|
-| Test pass rate | 100% on gfx950 | 150/150 today |
+| Test pass rate | 100% on gfx950 | 152/152 today |
 | Quantize vs torchAO | bit-exact, `atol=0 rtol=0` | Holds on every shape with a torchAO counterpart |
 | GEMM backends vs each other | bit-identical | Precondition for autotune; if it ever fails, disable autotune rather than loosen this |
 | Linear SNR, fwd / dX / dW | 12 / 12 / 10 dB | Measured 15.3 / 17.4-17.8 / 15.9-18.9 across `LINEAR_SHAPES` |
 | Step time regression | +1% of 1430.3 ms | Stdev over five runs is 0.093%, so 1% is well outside it |
-| Loss tail-50 mean | ±0.352% of 6.753586 | 4 stdev over the same five runs |
+| Loss tail-50 mean | ±0.352% of ~~6.753586~~ | Width still valid (4 stdev over five runs); **centre stale** — those runs predate the tail-BF16 fix and quantized 144 modules, not 124 |
 | Peak memory | 150.4 GiB of 251.7 | Current 8-GPU Qwen3-8B measurement |
 | Block scale saturation | TBD | Replaces FP8's overflow rate; needs instrumentation first |
 
 ## Gaps, in priority order
 
-1. **A longer-horizon loss baseline.** The 200-step gate is calibrated and
-   working, but demonstrably cannot see a change that takes ~1300 steps to
-   surface. The same harness against a 1500-step baseline would close the one
-   class of regression nothing currently catches.
-2. **Tuned-table coverage.** An untuned shape is correct but silently falls back
+1. **Re-record the loss baseline.** The frozen centre was measured on a config
+   that no longer exists. Until it is re-recorded on the fixed tail-BF16 path,
+   the loss gate cannot be run at all — five fresh runs of the default config.
+2. **A control that the loss gate actually catches.** The one candidate turned
+   out to be a no-op, so the loss axis is unvalidated. Re-running `TAIL_BF16=0`
+   against `TAIL_BF16=5` is now a genuine perturbation and is the obvious first
+   attempt; if it still lands inside the noise at 200 steps, that finally is
+   evidence for the longer-horizon argument below.
+3. **A longer-horizon loss baseline.** The training report has 8B diverging
+   around step 1300 without the BF16 tail (§1.5, §6.3), which a 200-step gate is
+   unlikely to reach. Suspected rather than shown, for the reason above.
+4. **Tuned-table coverage.** An untuned shape is correct but silently falls back
    off the ASM path, so a change in TP width or sequence length can cost
    performance with nothing reporting it. A test that the shipped CSV covers the
-   shapes the training scripts issue would catch it.
-4. **TP > 1 correctness.** Prerequisite for the comm-GEMM overlap work.
-5. `torch.compile` compatibility — no MXFP4 coverage, low priority until
+   shapes the training scripts issue would catch it. TP=2 makes this concrete:
+   six of its twelve shapes have no ASM config.
+5. **Multi-GPU coverage in CI.** TP=2+SP has now been run once by hand and
+   passes; nothing automated exercises TP > 1, FSDP or Megatron, so the leak
+   above could only be found by running training. A short multi-GPU smoke test
+   asserting flat memory across ~10 iterations would have caught it directly.
+6. `torch.compile` compatibility — no MXFP4 coverage, low priority until
    something depends on it.
 
 Closed: MXFP4 now runs through `tests/ops/test_linear.py`'s scaling-type
-parametrization, which is what surfaced the row-padding defect.
+parametrization, which is what surfaced the row-padding defect. TP > 1
+correctness is no longer blocked — it runs, and the comm-GEMM overlap work can
+proceed on it.
 
 ## Changelog
 
+- **2026-08-10c** — Ran MXFP4 under tensor parallelism for the first time, which
+  turned up three defects. TP=2+SP OOM'd at iteration 10; the cause was the
+  shuffled GEMM path memoizing a *view* of the FP4 weight onto that same weight,
+  a reference cycle that leaked one full set of quantized weights per iteration
+  and that the cyclic collector never sees because GPU bytes do not move its
+  thresholds. Pinning each backend in turn isolated it — `plain` and `asm` flat,
+  `shuffled` +18 GiB/iteration — and the guard now compares storage rather than
+  identity. TP=2+SP then runs 20 steps at flat memory, with half its shapes on
+  the repaired path. Separately, `--first-last-layers-bf16` turned out to have
+  been a no-op on the `--lumen-linear` path all along (144 modules quantized at
+  both settings), which retroactively voids the gate's fourth control and stales
+  the frozen loss baseline — both now recorded as gaps rather than quietly fixed
+  numbers. The launcher was also shadowing the Qwen3 tuned GEMM table, and the
+  autotuner had cached the resulting all-Triton choices into a file that survived
+  the fix. Suite is 152/152 with two new cases that fail on the pre-fix guard.
 - **2026-08-10b** — Added the loss regression gate. Five same-config 200-step
   runs put the tail-50 noise floor at 0.088% stdev, and the gate is set at
   4 stdev (±0.352%) with step time at +1%. Baseline frozen at
