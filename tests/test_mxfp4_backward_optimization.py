@@ -1,236 +1,36 @@
-"""Standalone test for MXFP4 backward optimizations.
+"""Tests for the MXFP4 backward optimizations.
 
-Tests the three key optimizations:
+Covers the three key optimizations:
 1. Forward FP4 weight caching + pre-transpose for DGrad
 2. Fused Hadamard+Quant kernel equivalence
 3. 2D block scale transpose invariance
 
-Bypasses the lumen import chain (which has a pre-existing AITER API
-breakage) by importing kernels and ops functions directly.
+These drive the production ops directly rather than reimplementing them, so a
+signature or layout change in `lumen.ops.quantize.ops` surfaces here.
 """
 
-import random
 import sys
 import math
 
+import pytest
 import torch
-import triton
 
-# Skip lumen.__init__.py which triggers the broken import chain
-sys.modules['lumen'] = type(sys)('lumen')
-sys.modules['lumen'].__path__ = ['/home/xdai/Lumen/.claude/worktrees/mxfp4-perf-optimization/lumen']
-
-from lumen.kernels.mxfp4 import (
-    _convert_to_mxfp4_kernel,
-    _transpose_packed_fp4_kernel,
-    _fused_hadamard_quant_mxfp4_kernel,
-    _hadamard16_butterfly,
+from lumen.ops.quantize.ops import (
+    convert_to_mxfp4,
+    convert_to_mxfp4_2d,
+    convert_from_mxfp4,
+    convert_from_mxfp4_2d,
+    transpose_packed_fp4,
+    hadamard_quant_mxfp4,
 )
 
+_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
-def is_cdna4():
-    if not torch.cuda.is_available():
-        return False
-    props = torch.cuda.get_device_properties(0)
-    return hasattr(props, 'gcnArchName') and 'gfx950' in props.gcnArchName
+pytestmark = _CUDA
 
 
-def convert_to_mxfp4(data_hp, block_size=32, axis=-1, use_sr=False):
-    """Minimal MXFP4 quantization (Lumen kernel, no AITER dependency)."""
-    if axis == 0 or axis == -2:
-        data_hp = data_hp.transpose(-2, -1).contiguous()
-
-    orig_shape = data_hp.shape
-    data_2d = data_hp.reshape(-1, orig_shape[-1]).contiguous()
-    M, N = data_2d.shape
-    use_asm = is_cdna4()
-
-    philox_seed = random.randint(0, 2**31 - 2)
-    philox_offset = random.randint(0, 2**31 - 2)
-
-    fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=data_2d.device)
-    scales = torch.empty((M, N // block_size), dtype=torch.uint8, device=data_2d.device)
-
-    BLOCK_M = min(64, M) if M >= 64 else M
-    BLOCK_N = min(64, N) if N >= 64 else N
-    BLOCK_N = max(BLOCK_N, block_size)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
-    _convert_to_mxfp4_kernel[grid](
-        data_2d, fp4_packed, scales,
-        data_2d.stride(0), data_2d.stride(1),
-        fp4_packed.stride(0), fp4_packed.stride(1),
-        scales.stride(0), scales.stride(1),
-        philox_seed, philox_offset,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        QUANT_BLOCK_SIZE=block_size,
-        IS_2D_BLOCK=False,
-        USE_SR=use_sr,
-        USE_ASM=use_asm,
-        SWIZZLE_SCALE=False,
-        NUM_SCALE_COLS=N // block_size,
-    )
-
-    out_shape = (*orig_shape[:-1], N // 2)
-    scale_shape = (*orig_shape[:-1], N // block_size)
-
-    if axis == 0 or axis == -2:
-        return fp4_packed.reshape(out_shape).transpose(-2, -1).contiguous(), \
-               scales.reshape(scale_shape).transpose(-2, -1).contiguous()
-    return fp4_packed.reshape(out_shape), scales.reshape(scale_shape)
-
-
-def convert_to_mxfp4_2d(data_hp, block_size=32, use_sr=False):
-    """Minimal MXFP4 2D block quantization."""
-    orig_shape = data_hp.shape
-    data_2d = data_hp.reshape(-1, orig_shape[-1]).contiguous()
-    M, N = data_2d.shape
-    sm, sn = M // block_size, N // block_size
-    use_asm = is_cdna4()
-
-    philox_seed = random.randint(0, 2**31 - 2)
-    philox_offset = random.randint(0, 2**31 - 2)
-
-    fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=data_2d.device)
-    scales_2d = torch.empty((sm, sn), dtype=torch.uint8, device=data_2d.device)
-
-    BLOCK_M = block_size
-    BLOCK_N = max(min(64, N), block_size)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
-    _convert_to_mxfp4_kernel[grid](
-        data_2d, fp4_packed, scales_2d,
-        data_2d.stride(0), data_2d.stride(1),
-        fp4_packed.stride(0), fp4_packed.stride(1),
-        scales_2d.stride(0), scales_2d.stride(1),
-        philox_seed, philox_offset,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        QUANT_BLOCK_SIZE=block_size,
-        IS_2D_BLOCK=True,
-        USE_SR=use_sr,
-        USE_ASM=use_asm,
-        SWIZZLE_SCALE=False,
-        NUM_SCALE_COLS=sn,
-    )
-
-    out_shape = (*orig_shape[:-1], N // 2)
-    return fp4_packed.reshape(out_shape), scales_2d
-
-
-def convert_from_mxfp4(data_fp4, scales, output_dtype=torch.bfloat16, block_size=32):
-    """Minimal MXFP4 dequantization via LUT."""
-    orig_packed_shape = data_fp4.shape
-    data_flat = data_fp4.reshape(-1, orig_packed_shape[-1])
-    scales_flat = scales.reshape(-1, scales.shape[-1])
-    M, N_packed = data_flat.shape
-    N = N_packed * 2
-
-    _mxfp4_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        dtype=torch.float32, device=data_flat.device,
-    )
-    unpacked = data_flat.view(torch.uint8).repeat_interleave(2, dim=-1)
-    unpacked[..., ::2] = unpacked[..., ::2] & 0xF
-    unpacked[..., 1::2] = unpacked[..., 1::2] >> 4
-    values = _mxfp4_lut[unpacked.long()]
-
-    scale_f32 = torch.pow(2.0, scales_flat.view(torch.uint8).to(torch.float32) - 127.0)
-    scale_expanded = scale_f32.unsqueeze(-1).expand(
-        M, N // block_size, block_size
-    ).reshape(M, N)
-    result = (values * scale_expanded).to(output_dtype)
-
-    out_shape = (*orig_packed_shape[:-1], N)
-    return result.reshape(out_shape)
-
-
-def convert_from_mxfp4_2d(data_fp4, scales_2d, output_dtype=torch.bfloat16, block_size=32):
-    """Minimal MXFP4 2D dequantization."""
-    orig_packed_shape = data_fp4.shape
-    data_flat = data_fp4.reshape(-1, orig_packed_shape[-1])
-    M, N_packed = data_flat.shape
-    N = N_packed * 2
-    sm, sn = scales_2d.shape[-2], scales_2d.shape[-1]
-
-    _mxfp4_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
-         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        dtype=torch.float32, device=data_flat.device,
-    )
-    unpacked = data_flat.view(torch.uint8).repeat_interleave(2, dim=-1)
-    unpacked[..., ::2] = unpacked[..., ::2] & 0xF
-    unpacked[..., 1::2] = unpacked[..., 1::2] >> 4
-    values = _mxfp4_lut[unpacked.long()]
-
-    scale_f32 = torch.pow(2.0, scales_2d.view(torch.uint8).to(torch.float32) - 127.0)
-    scale_expanded = (
-        scale_f32.view(sm, 1, sn, 1)
-        .expand(sm, block_size, sn, block_size)
-        .reshape(M, N)
-    )
-    result = (values * scale_expanded).to(output_dtype)
-    out_shape = (*orig_packed_shape[:-1], N)
-    return result.reshape(out_shape)
-
-
-def transpose_packed_fp4(data_fp4):
-    """Minimal packed FP4 transpose."""
-    M, N_packed = data_fp4.shape
-    N = N_packed * 2
-    output = torch.empty((N, M // 2), dtype=torch.uint8, device=data_fp4.device)
-
-    BLOCK_M = min(32, M)
-    BLOCK_N_PACKED = min(16, N_packed)
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N_packed, BLOCK_N_PACKED))
-
-    _transpose_packed_fp4_kernel[grid](
-        data_fp4, output,
-        M, N_packed,
-        data_fp4.stride(0), data_fp4.stride(1),
-        output.stride(0), output.stride(1),
-        BLOCK_M=BLOCK_M, BLOCK_N_PACKED=BLOCK_N_PACKED,
-    )
-    return output
-
-
-def hadamard_quant_mxfp4(x, sign_vector, block_size=32, g=16, use_sr=True):
-    """Minimal fused Hadamard+Quant."""
-    orig_shape = x.shape
-    x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
-    M, N = x_2d.shape
-    use_asm = is_cdna4()
-
-    philox_seed = random.randint(0, 2**31 - 2)
-    philox_offset = random.randint(0, 2**31 - 2)
-
-    fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
-    scales = torch.empty((M, N // block_size), dtype=torch.uint8, device=x.device)
-
-    BLOCK_M = min(64, M) if M >= 64 else M
-    BLOCK_N = min(64, N) if N >= 64 else N
-    BLOCK_N = max(BLOCK_N, max(block_size, g))
-    grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
-
-    _fused_hadamard_quant_mxfp4_kernel[grid](
-        x_2d, fp4_packed, scales, sign_vector,
-        x_2d.stride(0), x_2d.stride(1),
-        fp4_packed.stride(0), fp4_packed.stride(1),
-        scales.stride(0), scales.stride(1),
-        philox_seed, philox_offset,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        QUANT_BLOCK_SIZE=block_size,
-        USE_SR=use_sr,
-        USE_ASM=use_asm,
-    )
-
-    out_shape = (*orig_shape[:-1], N // 2)
-    scale_shape = (*orig_shape[:-1], N // block_size)
-    return fp4_packed.view(out_shape), scales.view(scale_shape)
-
-
-def hadamard_transform(x, sign_vector, g=16):
-    """Minimal Hadamard transform via matmul."""
+def _hadamard_transform_ref(x, sign_vector, g=16):
+    """Reference Hadamard transform: build H explicitly and matmul."""
     orig_shape = x.shape
     x_2d = x.reshape(-1, orig_shape[-1]).contiguous()
     M, N = x_2d.shape
@@ -309,7 +109,7 @@ def test_fused_hadamard_quant_equivalence():
     sign = torch.ones(16, device='cuda', dtype=torch.float32)
 
     # Path A: separate Hadamard then RTN quant (deterministic)
-    x_had = hadamard_transform(x, sign, g=16)
+    x_had = _hadamard_transform_ref(x, sign, g=16)
     x_fp4_sep, x_scale_sep = convert_to_mxfp4(x_had.float(), block_size=32, use_sr=False)
 
     # Path B: fused kernel (RTN mode)
