@@ -15,8 +15,9 @@ arguments) remains in the per-model subpackages.
 
 import logging
 import os
+import warnings
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 import torch
 
@@ -826,11 +827,37 @@ def enable_fp8_for_parallel_linear(
 
     set_fused_swiglu_scaling(scaling_type, block_size)
 
+    # --first-last-layers-bf16 has to be applied here as well. The other place
+    # that honours it, quantize._patch_linear_layers, only ever sees Megatron's
+    # own linear types, and --lumen-linear has already swapped those out by the
+    # time it runs -- so on this path the flag used to select nothing at all and
+    # every layer went to MXFP4 regardless.
+    bf16_prefixes: Set[str] = set()
+    if quant_config is not None and quant_config.first_last_layers_bf16:
+        from lumen.quantize import _build_bf16_skip_prefixes
+
+        if quant_config.num_layers > 0:
+            bf16_prefixes = _build_bf16_skip_prefixes(model, quant_config)
+        else:
+            # Without the layer count the tail is unidentifiable, and the skip
+            # rule would read as "every layer". Quantizing everything is the
+            # documented-but-wrong behaviour; silently running the whole model
+            # in BF16 would be worse and much harder to notice.
+            warnings.warn(
+                "first_last_layers_bf16 is set but num_layers is 0, so the BF16 "
+                "tail cannot be located; quantizing every Lumen parallel linear.",
+                stacklevel=2,
+            )
+
     count = 0
-    for module in model.modules():
+    skipped = 0
+    for name, module in model.named_modules():
         if isinstance(
             module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
         ):
+            if any(name.startswith(p) for p in bf16_prefixes):
+                skipped += 1
+                continue
             _mgr = scaling_manager
             if _mgr is None and quant_config is not None:
                 from lumen.quantize import ScalingManager
@@ -860,7 +887,8 @@ def enable_fp8_for_parallel_linear(
             print_rank_0(f"> Attached Blockwise2DScaleManager to {attn_count} attention modules for FP8 MHA")
 
     if count > 0:
-        print_rank_0(f"> Enabled FP8 (scaling={scaling_type}) on {count} Lumen parallel linear modules")
+        note = f", {skipped} left in BF16" if skipped else ""
+        print_rank_0(f"> Enabled FP8 (scaling={scaling_type}) on {count} Lumen parallel linear modules{note}")
 
 
 # ---------------------------------------------------------------------------
