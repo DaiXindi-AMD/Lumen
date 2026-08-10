@@ -123,7 +123,7 @@ def add_common_fsdp_args(parser):
         "--grad-quant-type",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "fp4"],
+        choices=["fp8", "mxfp8", "mxfp4"],
         help="Gradient quantization type (None=disabled). " "Applies to Linear, Attention, and RMSNorm.",
     )
     lfp8.add_argument(

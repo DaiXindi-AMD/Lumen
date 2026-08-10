@@ -1174,7 +1174,10 @@ def make_lumen_model_provider(
 
         # 3. Megatron-specific parallel linear FP8 (not covered by LumenConfig)
         if getattr(args, "linear_fp8", False) and getattr(args, "lumen_linear", False):
-            scaling_type = getattr(args, "linear_fp8_scaling", "dynamic")
+            # The resolved recipe, not the raw --linear-fp8-scaling string: MX
+            # formats carry scaling in the format, so an MXFP4 run passes
+            # "blockwise" here and would silently run FP8 blockwise instead.
+            scaling_type = cfg.quant_config.recipe
             enable_fp8_for_parallel_linear(
                 model,
                 scaling_type=scaling_type,
@@ -2490,7 +2493,7 @@ def add_common_megatron_args(parser):
         "--grad-quant-type",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "fp4"],
+        choices=["fp8", "mxfp8", "mxfp4"],
         help="Gradient quantization type (None=disabled). Applies to Linear, Attention, and RMSNorm.",
     )
 

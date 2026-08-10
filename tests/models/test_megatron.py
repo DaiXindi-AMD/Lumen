@@ -899,6 +899,13 @@ class TestAddCommonMegatronArgs:
             args = self._parse(["--lumen-fp8-attn", scope])
             assert args.lumen_fp8_attn == scope
 
+    def test_grad_quant_type_choices(self):
+        # Kept in step with the FSDP parser's --grad-quant-type: a recipe that
+        # reaches only one of the two backends is the harder bug to spot.
+        for gq in ["fp8", "mxfp8", "mxfp4"]:
+            args = self._parse(["--grad-quant-type", gq])
+            assert args.grad_quant_type == gq
+
     def test_lumen_fp8_quant_type_default(self):
         args = self._parse()
         assert args.lumen_fp8_quant_type == "blockwise"
@@ -1163,6 +1170,59 @@ class TestEnableFP8ForParallelLinear:
         model = nn.Sequential(nn.Linear(16, 16), nn.Linear(16, 16))
         enable_fp8_for_parallel_linear(model)
         mock_print.assert_not_called()
+
+
+# ===================================================================
+# model_provider -> parallel linear recipe
+# ===================================================================
+
+
+class TestModelProviderParallelLinearRecipe:
+    """The native parallel linears must be configured from the resolved recipe.
+
+    MX formats carry their scaling inside the format, so --linear-fp8-scaling
+    still reads "blockwise" on an MXFP4 run. Forwarding that raw string made the
+    native linears execute FP8 blockwise while the launcher believed it had
+    asked for MXFP4 — a silent precision swap that raises nothing and only shows
+    up as an unexplained loss curve.
+    """
+
+    @staticmethod
+    def _args(fmt):
+        return SimpleNamespace(
+            linear_fp8=True,
+            lumen_linear=True,
+            linear_fp8_format=fmt,
+            linear_fp8_scaling="blockwise",
+            linear_fp8_block_size=32,
+            lora_rank=0,
+            num_layers=4,
+        )
+
+    def _captured_scaling_type(self, fmt):
+        from lumen.models.megatron import make_lumen_model_provider
+
+        provider = make_lumen_model_provider(
+            lambda args, pre_process, post_process, vp_stage, config=None: nn.Sequential(
+                nn.Linear(16, 16)
+            )
+        )
+        captured = {}
+        with mock.patch("lumen.models.megatron.get_args", return_value=self._args(fmt)), mock.patch(
+            "lumen.models.megatron.enable_fp8_for_parallel_linear",
+            side_effect=lambda model, **kw: captured.update(kw),
+        ):
+            provider()
+        return captured["scaling_type"]
+
+    def test_mxfp4_run_configures_linears_for_mxfp4(self):
+        assert self._captured_scaling_type("mxfp4") == "mxfp4"
+
+    def test_mxfp8_run_configures_linears_for_mxfp8(self):
+        assert self._captured_scaling_type("mxfp8") == "mxfp8"
+
+    def test_fp8_run_still_uses_its_scaling_string(self):
+        assert self._captured_scaling_type("fp8_e4m3") == "blockwise"
 
 
 # ===================================================================

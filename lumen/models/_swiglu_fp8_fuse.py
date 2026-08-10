@@ -64,6 +64,11 @@ def try_fused_swiglu_fp8(swiglu_input: torch.Tensor, bf16_output: torch.Tensor) 
 
     scaling_type = _fused_scaling["type"]
 
+    if scaling_type in ("mxfp4", "mxfp8"):
+        # This bridge only emits FP8 with a float scale; an MX GEMM needs E8M0
+        # block scales and would have to discard it. Skip the quant pass.
+        return
+
     if scaling_type in ("blockwise", "blockwise2d"):
         # blockwise activation quant: 1×block scale, matching
         # _quant_blockwise2d_activation so the consuming fc2 blockscale GEMM

@@ -1813,6 +1813,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
             # produces a per-tensor 1D scale — discard and re-quantize correctly.
             if scaling_type in ("blockwise", "blockwise2d") and _pqi_scale.dim() < 2:
                 pre_quantized_input = None
+            # MX recipes need FP4/FP8 elements paired with E8M0 block scales, and
+            # every producer of a pre-quantized input emits plain FP8 with a float
+            # scale, so there is no layout in which one can be reused here.
+            elif scaling_type in ("mxfp4", "mxfp8"):
+                pre_quantized_input = None
         if pre_quantized_input is not None:
             from lumen.quantize.descriptor import FP8Descriptor
             input_fp8, input_scale = pre_quantized_input

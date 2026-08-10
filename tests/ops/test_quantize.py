@@ -1668,6 +1668,35 @@ def test_mxfp4_backward_gradients_track_the_bf16_reference(m, n, k):
     assert compute_snr(x_ref.grad, x.grad) > 11.0
 
 
+def test_mxfp4_ignores_a_pre_quantized_fp8_activation():
+    """An FP8 activation cache must never reach the MXFP4 GEMM.
+
+    The fused SwiGLU bridge hands the next GEMM a per-tensor FP8 activation to
+    reuse. MXFP4 needs FP4 elements paired with E8M0 block scales, so the cache
+    is unusable here; taking it anyway drops an IndexError on the scale's rank
+    inside AITER's afp4wfp4 GEMM, several frames from the cause. The result must
+    match the run that was given no cache at all.
+    """
+    _require_mxfp4_dtype()
+    from lumen.ops.quantize.linear import quantized_linear
+    from lumen.quantize.config import _get_float8_e4m3
+
+    torch.manual_seed(0)
+    m, n, k = 512, 512, 256
+    x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16) * 0.05
+    w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16) * 0.02
+
+    fp8_dtype = _get_float8_e4m3()
+    fp8_max = torch.finfo(fp8_dtype).max
+    scale = (x.abs().max().float() / fp8_max).reshape(1)
+    x_fp8 = (x.float() / scale).clamp(-fp8_max, fp8_max).to(fp8_dtype)
+
+    got = quantized_linear(x, w, scaling_type="mxfp4", pre_quantized_input=(x_fp8, scale))
+    expected = quantized_linear(x, w, scaling_type="mxfp4")
+
+    torch.testing.assert_close(got, expected, atol=0, rtol=0)
+
+
 @pytest.mark.parametrize(
     "n,k",
     [

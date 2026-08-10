@@ -194,12 +194,13 @@ fi
 # FP4 papers find the tail layers are the sensitive ones, and 8B diverged around
 # step 1300 without this (docs/mxfp4_training_report.md §1.5, §6.3).
 #
-# Do NOT add --lumen-linear. It swaps in LumenColumnParallelLinear, which
-# enable_fp8_for_parallel_linear configures from the --linear-fp8-scaling string
-# ("blockwise") rather than the resolved recipe ("mxfp4"), so the run would
-# silently execute FP8 blockwise instead. Without the flag Megatron's
-# ColumnParallelLinear / RowParallelLinear are patched by quant.enable(), which
-# does route MXFP4 correctly.
+# --lumen-linear is left off here. It used to be unsafe: enable_fp8_for_parallel_linear
+# configured LumenColumnParallelLinear from the --linear-fp8-scaling string
+# ("blockwise") rather than the resolved recipe, so the run silently executed FP8
+# blockwise. That is fixed, but the native linears have not been A/B'd against the
+# patched Megatron ones at this scale yet, so the measured path stays the default:
+# without the flag, quant.enable() patches Megatron's ColumnParallelLinear /
+# RowParallelLinear, which routes MXFP4 correctly.
 QUANT_ARGS=()
 if [ "${PRECISION}" = "mxfp4" ]; then
     QUANT_ARGS=(
