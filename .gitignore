@@ -23,3 +23,5 @@ examples/qwen3/results/c4_data/
 # run, and the numbers worth keeping are quoted in docs/mxfp4_training_report.md.
 examples/qwen3/results/*.log
 examples/qwen3/results/mxfp4_autotune_*.json
+# Event files the --tensorboard-dir flag writes; wandb already has the curves.
+examples/qwen3/results/tensorboard/
