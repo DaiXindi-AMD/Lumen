@@ -1245,7 +1245,53 @@ Paired against TE at 200 steps each (median of iterations 21–200):
 | Lumen before | 1526.3, 1526.8 ms | 1530.7, 1531.3 ms |
 | **Lumen after** | **1513.7, 1515.7 ms** | **1516.1, 1525.9 ms** |
 
-Lumen finishes 11–13 ms/step (0.7–0.8%) ahead of TransformerEngine.
+Lumen finishes 11–13 ms/step (0.7–0.8%) ahead of TransformerEngine. Superseded on
+8/10 by §5.13 — every Lumen number above was measured on the patched-Megatron
+linears, which the launcher no longer uses.
+
+### 5.13 Re-measured on the native parallel linears (8/10)
+
+`--lumen-linear` became the launcher default once the recipe-routing fix made it
+safe (it had been configuring the native modules from the `--linear-fp8-scaling`
+string, so an MXFP4 run silently executed FP8 blockwise). That moves the whole
+ladder's reference point, so the numbers that anyone still cites were re-measured
+against it. Same protocol throughout: 200 steps, GBS 32, seq 8192, 36 layers, c4,
+median over iterations 2–200.
+
+| Arm | median | vs new default |
+|---|---|---|
+| **Lumen, native linears (new default)** | **1429.0, 1430.8 ms** | — |
+| Lumen, patched Megatron linears (the old default) | 1513.4, 1514.0 ms | +84 |
+| TE, re-run today | 1528.5 ms | +99 |
+
+TE reproduces its recorded 1526.2–1526.7 to within 2 ms, which is what licenses
+comparing today's Lumen numbers to the rest of this section. **Lumen now finishes
+~99 ms/step (6.5%) ahead of TransformerEngine**, up from 0.8%, without any new
+kernel work — the gap was sitting behind a CLI flag.
+
+The four ladder rungs that are still a runtime toggle were re-priced on the new
+default. The rest are code commits from 8/3–8/5 that all predate the routing fix,
+so `--lumen-linear` on them runs FP8 blockwise and their deltas cannot be
+re-measured without backporting the fix to each one; those rows stand as measured
+on the old path.
+
+| Rung | Toggle | Old path | New default |
+|---|---|---|---|
+| 1 | `--lumen-fused-rope` | −95.2 | **−88.4** |
+| 5 | Cross-micro-batch weight cache | −25.5 | −2.2 (noise) |
+| 8 | Cached scale swizzle | −15.6 | −1.5 (noise) |
+| 13 | `gc.freeze()` after warmup | −5.1 | −1.1 (noise) |
+
+Read the last three as *unresolvable*, not as zero. Two identical runs of the new
+default differ by 1.8 ms in the median — three times the 0.6 ms spread the old
+path showed — and all three deltas sit inside that. What can be said is that
+their effect fell from tens of milliseconds to below what a 200-step median can
+see, which is consistent with the native modules not doing the redundant work
+those caches existed to absorb. Separating them now needs a profiler or many
+seeds, not another A/B. `gc.freeze()` is additionally the wrong thing to judge by
+median, since its documented effect is tail latency; its mean is 14 ms above the
+new default's, against an 8 ms mean spread between identical runs, so even that
+is only suggestive.
 
 ---
 

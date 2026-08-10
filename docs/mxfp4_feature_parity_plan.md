@@ -34,7 +34,7 @@ rather than buried in an appendix:
 
 MXFP4 trains Qwen3-8B end to end on 8×MI350X through two backends (Megatron with stock
 parallel linears, and FSDP2 with HF `nn.Linear`). At a matched recipe against ROCm
-TransformerEngine's MXFP4 it is **1513.7 ms/step against TE's 1526.2** and converges
+TransformerEngine's MXFP4 it is **1429.0 ms/step against TE's 1528.5** and converges
 **0.069 nats better** at 1000 steps, with zero NaN in either arm. Everything outside the
 linear layer — attention, normalization fusion, MoE, fused MLP — has no MXFP4 path. Only
 TP=PP=CP=1 has ever been run. No CI executes a single MXFP4 test.
@@ -140,8 +140,8 @@ tokens/s, peak VRAM, and the per-category kernel breakdown from a profiled run.
 
 | Metric | Threshold |
 |---|---|
-| Step time vs BF16 | Must stay ahead; currently 1513.7 vs 2803.8 ms |
-| Step time vs TE matched recipe | Must not regress below parity; currently ahead by 0.8% |
+| Step time vs BF16 | Must stay ahead; currently 1429.0 vs 2803.8 ms |
+| Step time vs TE matched recipe | Must not regress below parity; currently ahead by 6.5% |
 | Peak VRAM | Must fit the card with headroom; currently 150.4 of 251.7 GiB |
 | Regression per change | Any change is A/B'd at 200 steps against the immediately preceding config, one variable at a time |
 
@@ -152,7 +152,14 @@ tokens/s, peak VRAM, and the per-category kernel breakdown from a profiled run.
   optimization down the wrong path.
 - Take the **median**, not the mean.
 - Re-run the TE control arm in the same session. Over 8/4–8/5 it stayed at 1526–1527 ms
-  across seven runs, which is what makes the comparison trustworthy.
+  across seven runs, and a re-run on 8/10 landed at 1528.5, which is what makes numbers
+  taken days apart comparable at all.
+- Re-run the arm you are comparing *against*, too, not just the new one. The noise floor is
+  not a constant: identical runs differ by 0.6 ms on the patched-Megatron path and 1.8 ms on
+  the native linears, and three of the 8/10 toggle deltas were smaller than the second figure.
+- Note the TE arm needs `MEGATRON_ROOT=/home/xdai/Megatron-LM-rocm_dev`. On the
+  `core_r0.15.0_rocm` checkout the Lumen arm uses, `--fp4-recipe` offers only `nvfp4` and the
+  launcher dies in argparse.
 - Check the vendored AITER kernels are actually present. A missing `fast_transpose` cost the
   FP8 baseline 166 ms/step while only emitting warnings; the launcher now checks for this.
 
@@ -319,7 +326,9 @@ not be reached from the command line.
 Performance work, 8/3 – 8/5, all measured as 200-step medians with one variable per run.
 Cumulative **1900.0 → 1513.7 ms/step (−20.3%)**, which moved TE from 1.22× ahead to 0.8%
 behind. The table lists the changes that paid; two that measured neutral are omitted here and
-covered below. Full ladder in `mxfp4_training_report.md` §5.7–§5.12.
+covered below. Full ladder in `mxfp4_training_report.md` §5.7–§5.12. All of it was measured on
+the patched-Megatron linears, which stopped being the default on 8/10 — see the re-measurement
+below and `mxfp4_training_report.md` §5.13.
 
 | # | Change | Δ ms/step |
 |---|---|---|
@@ -366,13 +375,36 @@ effect at 200 steps, not that the arms converge identically.
 step time recorded before 8/10, including the 1513.7 at the top of this section, was measured
 on the patched-Megatron path and is 5.6% slower for that reason alone.
 
+**The ladder, re-priced on the new default.** TE re-ran at 1528.5 against its recorded
+1526.2–1526.7, so the two dates are comparable, and **Lumen is now ~99 ms/step (6.5%) ahead of
+TE rather than 0.8%** — a gap that was sitting behind a CLI flag, not behind any missing
+kernel. Of the four rungs that are still a runtime toggle, only the fused rope survives as an
+individually measurable win:
+
+| Rung | Old path | New default |
+|---|---|---|
+| `--lumen-fused-rope` | −95.2 | **−88.4** |
+| Cross-micro-batch weight cache | −25.5 | −2.2 (noise) |
+| Cached scale swizzle | −15.6 | −1.5 (noise) |
+| `gc.freeze()` after warmup | −5.1 | −1.1 (noise) |
+
+"Noise" is literal: two identical runs of the new default differ by 1.8 ms, and all three sit
+inside that. Their effect has fallen below what a 200-step median resolves, which is not the
+same as having fallen to zero. The weight cache is the one worth following up, since §11 issue
+1 charges 4.8 GB of memory to it — a trade that looked obviously right at −25.5 ms and does
+not at −2.2.
+
+The other nine rungs cannot be re-measured this way. They are code commits from 8/3–8/5, all
+of which predate the routing fix, so `--lumen-linear` on any of them runs FP8 blockwise;
+re-pricing them would mean backporting the fix onto each commit.
+
 ---
 
 ## 11. Known issues
 
 | # | Issue | Severity | Affected | Status |
 |---|---|---|---|---|
-| 1 | Memory regresses rather than improves. FSDP2 8B: 15.30 → 20.90 GB peak, of which 4.8 GB is the cross-micro-batch weight cache. Megatron 8B at seq 8192: 144.0 → 150.4 GiB of 251.7, the delta being one extra FP4 copy per saved activation. BF16 master weights are retained either way, so there is no weight-storage saving to offset it | Medium | Memory footprint | Open. Caching only the pre-transposed form would recover roughly half. `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` trades the speed back |
+| 1 | Memory regresses rather than improves. FSDP2 8B: 15.30 → 20.90 GB peak, of which 4.8 GB is the cross-micro-batch weight cache. Megatron 8B at seq 8192: 144.0 → 150.4 GiB of 251.7, the delta being one extra FP4 copy per saved activation. BF16 master weights are retained either way, so there is no weight-storage saving to offset it | Medium | Memory footprint | Open, and the trade looks worse than it did: on the native linears the cache measures −2.2 ms, inside the 1.8 ms noise floor, against −25.5 on the old path (§10). Caching only the pre-transposed form would recover roughly half the memory; `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` gives all of it back for a cost no longer visible at 200 steps |
 | 2 | FP4 all-gather benefit unverified — the dequant path is pure PyTorch and may cost more than the bandwidth it saves on a single node | Medium | Communication | Open, see §9 |
 | 3 | Tuned GEMM table silently stops applying when M/N/K change | Medium | Performance reproducibility | Mitigated by §13; no automatic detection yet |
 | 4 | An untuned shape once returned garbage (0.6 dB at 64×64×128) through the default assembly config | High | Correctness | Resolved — the assembly path is gated on the tuned-shape table, and `scripts/mxfp4_tune_shapes.py` verifies bit-exactness before adding a row |
