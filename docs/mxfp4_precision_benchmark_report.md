@@ -16,16 +16,21 @@ faster than FP8 delayed, at 1.9%-2.5% less peak memory.** The surprise is not
 MXFP4 but FP8: on this stack FP8 delayed is worth 1.00x-1.03x over BF16, where
 the reference report measured 1.38x-1.43x on MI325X. §9 is about that.
 
+Both results were re-measured over 350 steps on real C4 text with a held-out
+validation set (§12) and came back to three digits, so neither is an artefact of
+short runs or mock data.
+
 ## 1. Scope — what was run
 
 | Group | Runs | Steps | Purpose |
 |---|---:|---:|---|
 | Core matrix | 9 | 50 | 3 models x {BF16, FP8 delayed, MXFP4} |
+| C4 matrix (§12) | 9 | 350 | The same nine cells on real data, with held-out validation |
 | Smoke pass | 9 | 3 | Prove each recipe starts before spending 50 steps on it |
 | Noise floor | 6 | 50 | BF16 and MXFP4 repeated per model, to size the error bar |
 | Tuned A4W4 table A/B | 3 | 50 | Price the tuned MXFP4 GEMM table per model |
 | FP8 integration probe | 2 | 50 | Test whether FP8's flat result is the recipe or the path |
-| **Total measured** | **29** | | ~6.2 h wall on the 8-GPU node |
+| **Total measured** | **38** | | ~13.5 h wall on the 8-GPU node |
 
 Plus two AITER tuning jobs (49 s together) that produced the A4W4 table rows
 Llama2-7B and Llama3.1-8B were missing, and one shape-collection pass per model.
@@ -103,7 +108,8 @@ cover what it does and does not explain.
 
 50 iterations, median after iteration 10, 8x MI350X. MXFP4 rows are the arm with
 a complete tuned A4W4 table (`asm 11/11`), which is what now ships for all three
-models; §7 prices the table.
+models; §7 prices the table. §12 repeats this table for 350 steps on real C4 data
+and reproduces the MXFP4 ratios to within 0.001x.
 
 | Model | Precision | ms/iter | vs BF16 | TFLOP/s/GPU | tok/s/GPU | peak mem | GEMM |
 |---|---|---:|---:|---:|---:|---:|---|
@@ -173,7 +179,8 @@ trajectories over the 50 steps:
 | Llama3.1-8B | 12.989 -> 5.095 | 13.000 -> 5.085 | 12.931 -> 5.242 |
 | Qwen3-8B | 13.244 -> 2.280 | 13.092 -> 2.275 | 13.141 -> 2.277 |
 
-**This is a crash test, not an accuracy result.** The corpus is uniformly random
+**This is a crash test, not an accuracy result** — §12 is where real loss curves
+live. The corpus is uniformly random
 token ids, so a loss falling from ~12 to ~2 in 50 steps is the model fitting the
 one-step statistics of noise, and it does that whatever the arithmetic. The
 useful signal is the absence of divergence, NaNs and loss-scale collapse, plus
@@ -377,7 +384,77 @@ scaling (`Enabled FP8 (scaling=delayed) on 128 Lumen parallel linear modules`),
 so the old defect where the native path silently downgraded the recipe to FP8
 blockwise is genuinely fixed.
 
-## 12. Reproducing
+## 12. 350 steps on real data (C4)
+
+Everything above is 50 steps on random tokens. That measures step time honestly
+but cannot say whether a precision *learns*, which is the limitation §6 flags.
+This section repeats the same nine cells for 350 steps on C4 with a held-out
+validation file, to ask two things: does the step-time result survive a 7x
+longer run on real data, and do the three precisions track each other's loss.
+
+Same harness, same seed, same recipes, same tuned A4W4 tables; the corpus and
+the step count are the only changes.
+
+| Model | Precision | ms/iter | vs BF16 | vs BF16 at 50 steps | tok/s/GPU | peak mem | train loss | held-out val |
+|---|---|---:|---:|---:|---:|---:|---|---:|
+| Llama2-7B | BF16 | 6558.9 | 1.000x | 1.000x | 19984 | 0.5349 | 11.197 -> 5.494 | 5.497 |
+| Llama2-7B | FP8 delayed | 6442.2 | 1.018x | 1.025x | 20346 | 0.5686 | 11.185 -> 5.501 | 5.502 |
+| Llama2-7B | **MXFP4** | **4301.4** | **1.525x** | 1.524x | 30472 | 0.5245 | 11.190 -> 5.560 | 5.561 |
+| Llama3.1-8B | BF16 | 8222.2 | 1.000x | 1.000x | 15941 | 0.6094 | 12.569 -> 6.282 | 6.245 |
+| Llama3.1-8B | FP8 delayed | 8030.8 | 1.024x | 1.026x | 16321 | 0.6327 | 12.579 -> 6.271 | 6.242 |
+| Llama3.1-8B | **MXFP4** | **5726.4** | **1.436x** | 1.435x | 22889 | 0.5939 | 12.587 -> 6.342 | 6.300 |
+| Qwen3-8B | BF16 | 8669.7 | 1.000x | 1.000x | 15118 | 0.6539 | 12.777 -> 6.170 | 6.217 |
+| Qwen3-8B | FP8 delayed | 8704.4 | 0.996x | 1.002x | 15058 | 0.6763 | 12.774 -> 6.181 | 6.230 |
+| Qwen3-8B | **MXFP4** | **6169.1** | **1.405x** | 1.406x | 21246 | 0.6388 | 12.785 -> 6.244 | 6.285 |
+
+**The step-time result reproduces, to three digits.** MXFP4 lands at 1.525x,
+1.436x and 1.405x against 1.524x, 1.435x and 1.406x from the 50-step mock
+matrix — an order of magnitude inside the 1.5% noise floor, on a different
+corpus at 7x the length. FP8 stays flat, and Qwen3-8B's arm is now 0.996x, i.e.
+marginally *slower* than BF16; with §10's error bar that is still
+"indistinguishable from BF16", but it removes any reading of §9 as an artefact
+of short runs or mock data.
+
+**The loss curves are now real, and MXFP4 tracks BF16.** Held-out validation
+loss, MXFP4 minus BF16: +0.064 (Llama2-7B), +0.055 (Llama3.1-8B), +0.068
+(Qwen3-8B). FP8 sits within ±0.013. The MXFP4 gaps are small, consistent across
+three models, and in the expected direction — it is the coarsest arithmetic
+here — and no run produced a NaN or a skipped iteration.
+
+Read that as corroboration, not as an accuracy verdict. 350 steps at 1.05 M
+tokens each is 367 M tokens, about a third of a percent of a real pretraining
+budget, and it is well short of the ~1300-step horizon where 8B diverged without
+the tail-BF16 setting ([`mxfp4_training_report.md`](mxfp4_training_report.md)
+§1.5). What it does establish is that the MXFP4 path learns on real text at a
+rate indistinguishable-in-shape from BF16, which no amount of random-token
+running could show.
+
+### Two data-sizing constraints, both learned the hard way
+
+The first attempt at this run died at iteration 210 of 350 with a bare
+`StopIteration` out of the dataloader. Both causes are worth recording, because
+neither announces itself until the run is hours in:
+
+1. **The training set has to cover the step count.** 350 steps x 256 sequences
+   asks for 89,600 samples; the C4 file holds 81,294. `PretrainTextDataset` now
+   takes `allow_repeat`, set only for the training set, so it wraps to the
+   requested count instead of ending the run — here that means the last 10% of
+   the run sees data it has seen once before, which is fine for a paired
+   comparison and is logged as `data repeats 1.10 times`.
+2. **The validation set is consumed, not re-read.** Each eval pass takes
+   `EVAL_ITERS x GBS` *fresh* sequences and the validation dataset deliberately
+   does not wrap, so a held-out loss is never averaged over duplicated samples.
+   The budget is `(TRAIN_STEPS / EVAL_INTERVAL + 1) x EVAL_ITERS x GBS`. That is
+   what actually killed the first attempt: iteration 210 was the sixth eval, and
+   the file only had five in it.
+
+The binding constraint is Llama3.1-8B, whose tokenizer turns the held-out file
+into 1,228 samples of 8193 tokens (against 2,890 for Llama2-7B at 4097). This
+run therefore uses `EVAL_INTERVAL=50` and `EVAL_ITERS=1`: eight eval points
+costing 1,024 samples, leaving about 1.6 evals of headroom. Raising either knob,
+or the step count, needs that arithmetic redone first.
+
+## 13. Reproducing
 
 ```bash
 # full 9-cell matrix
@@ -392,6 +469,14 @@ REPEAT_TAG=rep2 PRECISIONS=mxfp4 bash examples/scripts/run_precision_matrix.sh
 # FP8 on the native linear path (§11)
 FP8_FORMAT=fp8_e4m3 FP8_LUMEN_LINEAR=1 REPEAT_TAG=lumlin \
   PRECISIONS=fp8 bash examples/scripts/run_precision_matrix.sh
+
+# the 350-step C4 matrix of §12, with live wandb
+TRAIN_STEPS=350 LOG_TAG=c4_350 CACHE_TAG=c4_350 FP8_FORMAT=fp8_e4m3 \
+  EVAL_INTERVAL=50 EVAL_ITERS=1 \
+  WANDB_PROJECT=lumen-precision-matrix-mi350x-c4 \
+  TRAIN_JSONL=$PWD/examples/qwen3/results/c4_data/c4_train_1k.jsonl \
+  VALID_JSONL=$PWD/examples/qwen3/results/c4_data/c4_valid_heldout.jsonl \
+  bash examples/scripts/run_precision_matrix.sh
 
 # the table
 python examples/scripts/collect_precision_matrix.py --markdown
@@ -408,17 +493,25 @@ Logs: `examples/{llama2,llama31,qwen3}/results/lumen_*.log`.
 
 ### W&B
 
-The matrix ran without `--wandb-project`, so Megatron never built its wandb
-writer and these runs had no dashboard. All 20 were replayed out of their logs
-afterwards into
+The 50-step matrix ran without `--wandb-project`, so Megatron never built its
+wandb writer and those runs had no dashboard. All 20 were replayed out of their
+logs afterwards into
 [`lumen-precision-matrix-mi350x`](https://wandb.ai/daixindi-amd/lumen-precision-matrix-mi350x):
 
 ```bash
 bash examples/scripts/backfill_precision_matrix_wandb.sh      # DRY_RUN=1 to check first
 ```
 
-Each run carries `backfilled_from_log` in its config, and its wall-clock
-timestamps are the replay's rather than the training run's — step time comes from
+The §12 C4 runs did not need this: they set `WANDB_PROJECT` at launch and streamed
+live into
+[`lumen-precision-matrix-mi350x-c4`](https://wandb.ai/daixindi-amd/lumen-precision-matrix-mi350x-c4),
+so their timestamps and durations are real. Note that `--wandb-project` alone is
+not enough — Megatron gates every `wandb_writer.log()` behind the *TensorBoard*
+writer, so without `--tensorboard-dir` the run appears in the project, connects,
+and uploads nothing. `train_pretrain.sh` sets both together for that reason.
+
+Each backfilled run carries `backfilled_from_log` in its config, and its
+wall-clock timestamps are the replay's rather than the training run's — step time comes from
 Megatron's own per-iteration number, so the curves are the run's, but do not read
 the run duration or start time as real.
 
@@ -442,7 +535,7 @@ CSV existed, Qwen3-8B by removing the CSV it already had. Their coverage differs
 (2, 4 and 3 of 11) only because AITER's stock table happens to cover each model's
 shapes differently.
 
-## 13. Conclusions
+## 14. Conclusions
 
 1. **MXFP4 is the fastest training precision available here on all three models**:
    1.524x (Llama2-7B), 1.435x (Llama3.1-8B), 1.406x (Qwen3-8B) over BF16, and
@@ -462,13 +555,24 @@ shapes differently.
    from +3.5% to -0.7% on Qwen3-8B (§11).
 5. **The hybrid FP8 recipe the reference report used crashes on this stack** (§8.1)
    and needs fixing before any FP8 number here can be called a reproduction of it.
-6. **Nothing here is an accuracy result.** 0 NaN / 0 skipped across 29 runs on
-   random-token data is a crash test. MXFP4 accuracy rests on the operator tests
-   and the C4 runs in [`mxfp4_training_report.md`](mxfp4_training_report.md), and
-   on keeping the last 5 layers in BF16.
+6. **The step-time result holds on real data at 7x the length** (§12): 1.525x,
+   1.436x and 1.405x over 350 C4 steps against 1.524x, 1.435x and 1.406x over 50
+   mock steps, and Qwen3-8B's FP8 arm comes out at 0.996x, so §9 is not an
+   artefact of short runs or random tokens.
+7. **This is still not a full accuracy result.** 0 NaN / 0 skipped everywhere, and
+   §12's held-out validation loss puts MXFP4 within +0.068 of BF16 on real text —
+   but 367 M tokens is far short of the ~1300-step horizon where 8B diverged
+   without tail-BF16. MXFP4 accuracy rests on the operator tests and the longer C4
+   runs in [`mxfp4_training_report.md`](mxfp4_training_report.md), and on keeping
+   the last 5 layers in BF16.
 
 ## Changelog
 
+- **2026-08-12** — Added §12: the same nine cells re-run for 350 steps on C4 with
+  a held-out validation set. Step-time results reproduce within the noise floor;
+  the loss curves are real for the first time here. Records the two data-sizing
+  constraints that killed the first attempt at iteration 210, and the
+  `allow_repeat` fix for the first of them.
 - **2026-08-11** — First version. 29 runs on 8x MI350X: 9-cell core matrix, 6
   noise-floor repeats, 3 tuned-table A/Bs, 2 FP8 integration probes, 9 smoke
   passes. Added Llama2-7B and Llama3.1-8B A4W4 tuned tables (16 shapes, all
