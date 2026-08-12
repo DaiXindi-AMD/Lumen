@@ -1,0 +1,13 @@
+model	precision	tag	status	seconds	log
+llama2_7b	bf16	smoke	ok	130	/home/xdai/Lumen/examples/llama2/results/lumen_llama2_7b_smoke_bf16.log
+llama2_7b	fp8	smoke	FAILED(rc=1)	111	/home/xdai/Lumen/examples/llama2/results/lumen_llama2_7b_smoke_fp8.log
+llama2_7b	mxfp4	smoke	ok	150	/home/xdai/Lumen/examples/llama2/results/lumen_llama2_7b_smoke_mxfp4.log
+llama31_8b	bf16	smoke	ok	180	/home/xdai/Lumen/examples/llama31/results/lumen_llama31_8b_smoke_bf16.log
+llama31_8b	fp8	smoke	FAILED(rc=1)	144	/home/xdai/Lumen/examples/llama31/results/lumen_llama31_8b_smoke_fp8.log
+llama31_8b	mxfp4	smoke	ok	184	/home/xdai/Lumen/examples/llama31/results/lumen_llama31_8b_smoke_mxfp4.log
+qwen3_8b	bf16	smoke	ok	244	/home/xdai/Lumen/examples/qwen3/results/lumen_qwen3_8b_smoke_bf16.log
+qwen3_8b	fp8	smoke	FAILED(rc=1)	200	/home/xdai/Lumen/examples/qwen3/results/lumen_qwen3_8b_smoke_fp8.log
+qwen3_8b	mxfp4	smoke	ok	235	/home/xdai/Lumen/examples/qwen3/results/lumen_qwen3_8b_smoke_mxfp4.log
+llama2_7b	fp8	smoke	ok	131	/home/xdai/Lumen/examples/llama2/results/lumen_llama2_7b_smoke_fp8.log
+llama31_8b	fp8	smoke	ok	186	/home/xdai/Lumen/examples/llama31/results/lumen_llama31_8b_smoke_fp8.log
+qwen3_8b	fp8	smoke	ok	244	/home/xdai/Lumen/examples/qwen3/results/lumen_qwen3_8b_smoke_fp8.log
