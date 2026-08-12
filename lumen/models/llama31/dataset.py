@@ -49,6 +49,11 @@ class PretrainTextDataset(Dataset):
             ``tokenize()`` / ``eod``.
         is_hf_tokenizer: ``True`` for HuggingFace-style tokenizers.
         max_samples: If set, cap ``__len__`` at this value.
+        allow_repeat: Serve ``max_samples`` samples even when the corpus holds
+            fewer, wrapping back to chunk 0. Off by default so a dataset never
+            silently trains on repeated data; turn it on for a training set that
+            must reach a fixed step count on a corpus smaller than one epoch,
+            which otherwise ends in a ``StopIteration`` mid-run.
     """
 
     def __init__(
@@ -58,7 +63,9 @@ class PretrainTextDataset(Dataset):
         tokenizer,
         is_hf_tokenizer: bool = False,
         max_samples: Optional[int] = None,
+        allow_repeat: bool = False,
     ):
+        self._allow_repeat = allow_repeat
         self.seq_length = seq_length
         self.tokenizer = tokenizer
         self.is_hf_tokenizer = is_hf_tokenizer
@@ -85,15 +92,25 @@ class PretrainTextDataset(Dataset):
 
         self._max_samples = max_samples
 
+        if allow_repeat and max_samples is not None and n_chunks and max_samples > n_chunks:
+            logger.warning(
+                "Corpus holds %d samples but %d were requested: data repeats %.2f times",
+                n_chunks,
+                max_samples,
+                max_samples / n_chunks,
+            )
+
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
         n = len(self._chunks)
-        if self._max_samples is not None:
-            return min(n, self._max_samples)
-        return n
+        if self._max_samples is None:
+            return n
+        if self._allow_repeat and n:
+            return self._max_samples
+        return min(n, self._max_samples)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         idx = idx % len(self._chunks)

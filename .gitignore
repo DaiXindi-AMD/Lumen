@@ -16,12 +16,18 @@ runs/
 train_*.log
 .claude/worktrees/
 
-# Corpora staged by the Qwen3 Megatron launcher (hundreds of MB each)
-examples/qwen3/results/mock_data/
-examples/qwen3/results/c4_data/
+# Corpora staged by the Megatron launchers (hundreds of MB each)
+examples/*/results/mock_data/
+examples/*/results/c4_data/
 # Run output: training logs and the per-shape GEMM backend cache. Megabytes per
 # run, and the numbers worth keeping are quoted in docs/mxfp4_training_report.md.
+# The handful of reference logs committed before this pattern stay tracked.
+examples/*/results/lumen_*.log
 examples/qwen3/results/*.log
-examples/qwen3/results/mxfp4_autotune_*.json
+examples/*/results/mxfp4_autotune_*.json
+examples/*/results/*.shapes.csv
+examples/*/results/*.untuned.csv
 # Event files the --tensorboard-dir flag writes; wandb already has the curves.
-examples/qwen3/results/tensorboard/
+examples/*/results/tensorboard/
+# Index of benchmark runs, rebuilt by examples/scripts/run_precision_matrix.sh
+examples/precision_matrix_runs.tsv

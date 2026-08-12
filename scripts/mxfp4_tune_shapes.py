@@ -4,7 +4,7 @@
 
 """Get a model's MXFP4 GEMM shapes into AITER's tuned table, and prove they are correct.
 
-The prebuilt A4W4 ASM/CK kernels are only reachable for shapes present in
+The/tmp/qwen3-8b.untuned.csv prebuilt A4W4 ASM/CK kernels are only reachable for shapes present in
 ``a4w4_blockscale_tuned_gemm.csv``. Anything else falls back to Triton -- and must,
 because for an untuned shape AITER picks a default kernel that is not validated:
 at (64, 64, 128) it silently returns garbage. So widening the fast path for a new
@@ -18,7 +18,7 @@ Four stages, run in order:
 
     # 2. Keep only what AITER has no tuned entry for
     python scripts/mxfp4_tune_shapes.py untuned --shapes /tmp/qwen3-8b.shapes.csv \
-        --out /tmp/qwen3-8b.untuned.csv
+        --out 
 
     # 3. Tune them (long; needs a clang for the CK JIT build)
     python scripts/mxfp4_tune_shapes.py tune --untuned /tmp/qwen3-8b.untuned.csv \

@@ -7,8 +7,9 @@
 #   LAUNCH=native bash run_pretrain_qwen3_8b_mxfp4.sh      # on the host
 #   PRECISION=bf16 LAUNCH=native bash ...                  # reference run
 #
-# The training command itself lives in scripts/train_qwen3_8b.sh; this file only
-# sets up paths and environment for one of the two launch modes.
+# The training command itself lives in ../scripts/train_pretrain.sh, shared with
+# the other benchmark models; this file only sets up paths and environment for
+# one of the two launch modes.
 #
 # Native mode needs a Megatron-LM checkout (MEGATRON_ROOT) and works without
 # TransformerEngine or apex — Megatron falls back to torch norms and optimizers.
@@ -35,6 +36,7 @@ RESULTS_DIR="${RESULTS_DIR:-${SCRIPT_DIR}/results}"
 CONTAINER_NAME="${CONTAINER_NAME:-lumen_qwen3_8b_${PRECISION}}"
 
 CFG_ENV=(
+    MODEL=qwen3_8b
     PRECISION="${PRECISION}"
     NUM_LAYERS="${NUM_LAYERS:-36}"
     TAIL_BF16="${TAIL_BF16:-5}"
@@ -106,7 +108,7 @@ if [ "${LAUNCH}" = "native" ]; then
         MEGATRON_ROOT="${MEGATRON_ROOT}" \
         RESULTS_ROOT="${RESULTS_DIR}" \
         TOKENIZER_PATH="${TOKENIZER_DIR}" \
-        bash "${SCRIPT_DIR}/scripts/train_qwen3_8b.sh"
+        bash "${LUMEN_DIR}/examples/scripts/train_pretrain.sh"
 fi
 
 # ---- docker mode ------------------------------------------------------------
@@ -142,7 +144,7 @@ docker run --rm --init \
     -e RESULTS_ROOT=/results \
     -e TOKENIZER_PATH=/tokenizer \
     "${IMAGE}" \
-    bash /workspace/Lumen/examples/qwen3/scripts/train_qwen3_8b.sh
+    bash /workspace/Lumen/examples/scripts/train_pretrain.sh
 
 echo ""
 echo "[DONE] log: ${RESULTS_DIR}/lumen_qwen3_8b_${PRECISION}.log"

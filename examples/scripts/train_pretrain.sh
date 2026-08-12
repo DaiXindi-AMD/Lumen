@@ -1,18 +1,28 @@
 #!/bin/bash
 ###############################################################################
-# Qwen3-8B pretrain body, shared by the docker and native launchers.
+# Megatron pretrain body for the precision-comparison benchmark, shared by
+# every model and by the docker and native launchers.
 #
-# Everything is read from the environment so the two launchers differ only in
-# how they set up paths. Required:
+# One body on purpose. The point of the benchmark is to compare BF16, FP8
+# delayed and MXFP4 at ms/step, so the only thing allowed to differ between
+# arms is the quantization recipe — anything else that varies (a second mock
+# corpus, a different eval cadence, a launcher that forgets an env switch)
+# lands directly in the number being reported.
+#
+# Everything is read from the environment so the launchers differ only in how
+# they set up paths. Required:
 #
 #   LUMEN_ROOT      Lumen checkout
 #   MEGATRON_ROOT   Megatron-LM checkout (needed on PYTHONPATH and for patching)
 #   RESULTS_ROOT    writable dir for logs, mock data and the autotune cache
 #   TOKENIZER_PATH  HuggingFace tokenizer directory
 #
-# Optional: PRECISION NUM_LAYERS TAIL_BF16 MBS GBS SEQ_LEN TRAIN_STEPS SEED NPROC
-#           TRAIN_JSONL VALID_JSONL LOG_TAG EVAL_INTERVAL EVAL_ITERS SPLIT
-#           WANDB_PROJECT WANDB_NAME WANDB_ENTITY
+# Optional: MODEL PRECISION NUM_LAYERS TAIL_BF16 MBS GBS SEQ_LEN TRAIN_STEPS
+#           SEED NPROC TRAIN_JSONL VALID_JSONL LOG_TAG EVAL_INTERVAL EVAL_ITERS
+#           SPLIT DRY_RUN WANDB_PROJECT WANDB_NAME WANDB_ENTITY
+#
+# DRY_RUN=1 prints the torchrun command and exits without touching a GPU. Use it
+# to diff two arms' command lines before spending hours measuring them.
 ###############################################################################
 set -euo pipefail
 
@@ -21,12 +31,46 @@ set -euo pipefail
 : "${RESULTS_ROOT:?}"
 : "${TOKENIZER_PATH:?}"
 
-PRECISION="${PRECISION:-mxfp4}"
-NUM_LAYERS="${NUM_LAYERS:-36}"
+MODEL="${MODEL:-qwen3_8b}"
+PRECISION="${PRECISION:-mxfp4}"        # bf16 | fp8 | mxfp4
+
+# Per-model defaults, in one table so the whole benchmark matrix is readable at
+# a glance. MBS x SEQ_LEN is 16384 for all three: the tuned MXFP4 GEMM table
+# keys on exact M/N/K, so a model whose token count drifts silently loses the
+# ASM kernels (docs/mxfp4_feature_parity_plan.md §13).
+#
+# VOCAB_MAX only bounds the random token ids in the mock corpus; it tracks each
+# tokenizer's vocabulary so no id lands outside the embedding table.
+case "${MODEL}" in
+    llama2_7b)
+        MODEL_DIR="llama2"
+        ARGS_FILE="${LUMEN_ROOT}/examples/llama2/scripts/llama2_7b_common_args.sh"
+        : "${NUM_LAYERS:=32}" "${MBS:=4}" "${GBS:=256}" "${SEQ_LEN:=4096}"
+        : "${VOCAB_MAX:=31999}"
+        ;;
+    llama31_8b)
+        MODEL_DIR="llama31"
+        ARGS_FILE="${LUMEN_ROOT}/examples/llama31/scripts/llama31_8b_common_args.sh"
+        : "${NUM_LAYERS:=32}" "${MBS:=2}" "${GBS:=128}" "${SEQ_LEN:=8192}"
+        : "${VOCAB_MAX:=127999}"
+        ;;
+    qwen3_8b)
+        MODEL_DIR="qwen3"
+        ARGS_FILE="${LUMEN_ROOT}/examples/qwen3/scripts/qwen3_8b_common_args.sh"
+        : "${NUM_LAYERS:=36}" "${MBS:=2}" "${GBS:=128}" "${SEQ_LEN:=8192}"
+        : "${VOCAB_MAX:=151999}"
+        ;;
+    *)
+        echo "ERROR: unknown MODEL='${MODEL}' (llama2_7b | llama31_8b | qwen3_8b)"
+        exit 1
+        ;;
+esac
+
+# Last ~15% of layers stay BF16 under MXFP4: both FP4 papers find the tail
+# layers are the sensitive ones, and 8B diverged around step 1300 without this
+# (docs/mxfp4_training_report.md §1.5, §6.3). 5 of 32 and 5 of 36 are both that
+# fraction, so one default covers all three models.
 TAIL_BF16="${TAIL_BF16:-5}"
-MBS="${MBS:-2}"
-GBS="${GBS:-128}"
-SEQ_LEN="${SEQ_LEN:-8192}"
 TRAIN_STEPS="${TRAIN_STEPS:-50}"
 SEED="${SEED:-1234}"
 NPROC="${NPROC:-8}"
@@ -35,9 +79,13 @@ NPROC="${NPROC:-8}"
 # eval gives wandb one data point per val metric, which it can only render as a bar,
 # and one point cannot show where the curves separate.
 EVAL_INTERVAL="${EVAL_INTERVAL:-$(( TRAIN_STEPS / 10 > 0 ? TRAIN_STEPS / 10 : 1 ))}"
-# Each eval pass consumes EVAL_ITERS × GBS sequences from VALID_JSONL, capped by
-# however many that file holds. Keep it small: eval time is pure overhead, and the
-# eval batch must stay identical across runs for the comparison to be paired.
+# Each eval pass consumes EVAL_ITERS × GBS fresh sequences from VALID_JSONL, and
+# the validation dataset does not wrap, so the whole run dies with a StopIteration
+# mid-training once the evals have drained the file. The budget is
+# (TRAIN_STEPS / EVAL_INTERVAL + 1) × EVAL_ITERS × GBS sequences of SEQ_LEN + 1
+# tokens; size VALID_JSONL above that before raising either knob. Keep it small
+# anyway: eval time is pure overhead, and the eval batch must stay identical
+# across runs for the comparison to be paired.
 EVAL_ITERS="${EVAL_ITERS:-2}"
 # Kept only because Megatron requires it; PretrainTextDataset ignores it.
 SPLIT="${SPLIT:-98,1,1}"
@@ -51,7 +99,7 @@ TRAIN_JSONL="${TRAIN_JSONL:-${DATA_DIR}/mock_train_s${SEQ_LEN}_g${GBS}_t${TRAIN_
 # makes "validation loss" a measurement on data the model also trains on. Point it
 # at a disjoint file to get a real held-out number.
 VALID_JSONL="${VALID_JSONL:-${TRAIN_JSONL}}"
-LOG_FILE="${RESULTS_ROOT}/lumen_qwen3_8b${LOG_TAG:+_${LOG_TAG}}_${PRECISION}.log"
+LOG_FILE="${RESULTS_ROOT}/lumen_${MODEL}${LOG_TAG:+_${LOG_TAG}}_${PRECISION}.log"
 mkdir -p "${DATA_DIR}"
 
 # Megatron builds its wandb writer only when --wandb-project is non-empty, and it
@@ -69,7 +117,7 @@ WANDB_ARGS=()
 if [ -n "${WANDB_PROJECT:-}" ]; then
     WANDB_ARGS=(
         --wandb-project "${WANDB_PROJECT}"
-        --wandb-exp-name "${WANDB_NAME:-megatron-${PRECISION}-8b${LOG_TAG:+-${LOG_TAG}}-${TRAIN_STEPS}}"
+        --wandb-exp-name "${WANDB_NAME:-megatron-${PRECISION}-${MODEL}${LOG_TAG:+-${LOG_TAG}}-${TRAIN_STEPS}}"
         --wandb-save-dir "${RESULTS_ROOT}/wandb"
         --tensorboard-dir "${RESULTS_ROOT}/tensorboard/${WANDB_NAME:-${PRECISION}${LOG_TAG:+-${LOG_TAG}}}"
     )
@@ -164,7 +212,7 @@ ROPE_ARGS+=(--lumen-fused-rope)
 # stay comparable; it is skipped when the file is already there.
 if [ ! -s "${TRAIN_JSONL}" ]; then
     SEQ_LEN="${SEQ_LEN}" GBS="${GBS}" TRAIN_STEPS="${TRAIN_STEPS}" SEED="${SEED}" \
-    TRAIN_JSONL="${TRAIN_JSONL}" python - <<'PYEOF'
+    VOCAB_MAX="${VOCAB_MAX}" TRAIN_JSONL="${TRAIN_JSONL}" python - <<'PYEOF'
 import json
 import os
 import random
@@ -172,6 +220,7 @@ import random
 seq = int(os.environ["SEQ_LEN"])
 gbs = int(os.environ["GBS"])
 steps = int(os.environ["TRAIN_STEPS"])
+vocab_max = int(os.environ["VOCAB_MAX"])
 need_chunks = gbs * (steps + 5)
 need_tokens = int(need_chunks * (seq + 1) * 1.2)
 random.seed(int(os.environ["SEED"]))
@@ -180,7 +229,7 @@ words_per_doc = 4000
 docs = need_tokens // words_per_doc + 1
 with open(path, "w") as f:
     for _ in range(docs):
-        toks = [str(random.randint(1, 151999)) for _ in range(words_per_doc)]
+        toks = [str(random.randint(1, vocab_max)) for _ in range(words_per_doc)]
         f.write(json.dumps({"text": " ".join(toks)}) + "\n")
 print(f"[mock-data] wrote {docs} docs to {path}")
 PYEOF
@@ -188,7 +237,7 @@ else
     echo "[data] using existing ${TRAIN_JSONL}"
 fi
 
-# ---- MXFP4-only flags -------------------------------------------------------
+# ---- quantization flags -----------------------------------------------------
 # MXFP4 is selected with --linear-fp8-format because Megatron's own --fp8-format
 # has no MX formats among its choices. The last TAIL_BF16 layers stay BF16: both
 # FP4 papers find the tail layers are the sensitive ones, and 8B diverged around
@@ -203,19 +252,63 @@ fi
 # the loss curve inside the run-to-run noise floor (two identical baselines differ
 # by 0.25% mean, the native arm by 0.37%). Numbers from before this date were
 # measured on the patched-Megatron path and are 5.6% slower for that reason alone.
+#
+# The FP8 arm reproduces the recipe the BF16/FP8 reference report measured:
+# delayed scaling, amax history 1024, algo max. FP8_FORMAT is overridable because
+# `hybrid` is what that report used but it dies in the first backward on this
+# stack (mixed-dtype hipb_mm, .claude/tmp-training-bugs.md), so a run here has to
+# be able to fall back to fp8_e4m3 and say so.
 QUANT_ARGS=()
-if [ "${PRECISION}" = "mxfp4" ]; then
-    QUANT_ARGS=(
-        --linear-fp8
-        --linear-fp8-format mxfp4
-        --linear-fp8-scaling blockwise
-        --linear-fp8-block-size 32
-        --lumen-linear
-        --first-last-layers-bf16
-        --num-layers-at-start-in-bf16 0
-        --num-layers-at-end-in-bf16 "${TAIL_BF16}"
-    )
-fi
+case "${PRECISION}" in
+    mxfp4)
+        QUANT_ARGS=(
+            --linear-fp8
+            --linear-fp8-format mxfp4
+            --linear-fp8-scaling blockwise
+            --linear-fp8-block-size 32
+            --lumen-linear
+            --first-last-layers-bf16
+            --num-layers-at-start-in-bf16 0
+            --num-layers-at-end-in-bf16 "${TAIL_BF16}"
+        )
+        ;;
+    fp8)
+        QUANT_ARGS=(
+            --linear-fp8
+            --linear-fp8-format "${FP8_FORMAT:-hybrid}"
+            --linear-fp8-scaling delayed
+            --linear-fp8-amax-algo max
+            --linear-fp8-amax-history 1024
+        )
+        # Off by default so the FP8 arm stays the recipe the reference report
+        # measured, which predates the native path. FP8_LUMEN_LINEAR=1 exists to
+        # answer whether FP8's missing speedup on this machine is the recipe or the
+        # integration: MXFP4 gets the native linear and FP8 does not, so the two
+        # arms differ by more than their number format until this is set.
+        [ "${FP8_LUMEN_LINEAR:-0}" = "1" ] && QUANT_ARGS+=(--lumen-linear)
+        # The FP8 fusion switches the reference report's §7 credits for taking
+        # Llama2-7B from ~10.8s to 8.19s. They are FP8-only: the MXFP4 path has
+        # its own fused quantizer and the BF16 arm reaches none of this code.
+        export LUMEN_PREFER_HIPBLASLT=1
+        export LUMEN_FUSED_QUANT_TRANSPOSE_CPP=1
+        export LUMEN_FUSED_QUANT_AMAX=1
+        export LUMEN_FUSED_QUANT_SCALE=1
+        export LUMEN_FUSED_CAST_TRANSPOSE=1
+        export LUMEN_FUSED_CAST_TRANSPOSE_V2=1
+        export LUMEN_FUSED_SWIGLU_QUANT=1
+        export LUMEN_FUSED_NORM_QUANT=1
+        export LUMEN_FUSED_NORM_QUANT_V2=1
+        export LUMEN_TRANSPOSE_CACHE=1
+        export LUMEN_FAST_QUANT_DISPATCH=1
+        export LUMEN_WEIGHT_QUANT_ONCE=1
+        ;;
+    bf16)
+        ;;
+    *)
+        echo "ERROR: unknown PRECISION='${PRECISION}' (bf16 | fp8 | mxfp4)"
+        exit 1
+        ;;
+esac
 
 # AITER can only reach its prebuilt A4W4 asm kernels for shapes listed in the
 # tuned table, and Qwen3-8B's fused qkv/gate_up shapes at this token count are
@@ -225,10 +318,22 @@ fi
 # on the exact M/N/K, so they only fire at MBS x SEQ_LEN = 16384 with TP=1.
 # Setting the variable turns off AITER's own config discovery, hence relisting
 # the stock tables it would otherwise have merged.
+#
+# A model with no tuned table of its own still trains: every shape falls back to
+# Triton, which is correct but slower, so the log says which case it is rather
+# than leaving the step time unexplained.
 if [ "${PRECISION}" = "mxfp4" ] && [ -z "${AITER_CONFIG_GEMM_A4W4:-}" ]; then
     AITER_CFG_DIR="$(python -c 'import aiter, os; print(os.path.join(os.path.dirname(aiter.__file__), "configs"))')"
-    A4W4_PATHS="$(realpath "$(dirname "${BASH_SOURCE[0]}")/../configs/qwen3_8b_a4w4_blockscale_tuned_gemm.csv")"
-    A4W4_PATHS="${A4W4_PATHS}:${AITER_CFG_DIR}/a4w4_blockscale_tuned_gemm.csv"
+    MODEL_A4W4_CSV="${LUMEN_ROOT}/examples/${MODEL_DIR}/configs/${MODEL}_a4w4_blockscale_tuned_gemm.csv"
+    A4W4_PATHS="${AITER_CFG_DIR}/a4w4_blockscale_tuned_gemm.csv"
+    if [ -f "${MODEL_A4W4_CSV}" ]; then
+        A4W4_PATHS="${MODEL_A4W4_CSV}:${A4W4_PATHS}"
+    else
+        echo "[setup] WARNING: no tuned A4W4 table for ${MODEL} at ${MODEL_A4W4_CSV}"
+        echo "[setup] every MXFP4 GEMM shape this model issues falls back to Triton;"
+        echo "[setup] the step time is correct but not the best this path can do."
+        echo "[setup] Produce one with scripts/mxfp4_tune_shapes.py."
+    fi
     for f in "${AITER_CFG_DIR}"/model_configs/*a4w4_blockscale_tuned_gemm.csv; do
         if [ -e "$f" ]; then A4W4_PATHS="${A4W4_PATHS}:${f}"; fi
     done
@@ -236,19 +341,28 @@ if [ "${PRECISION}" = "mxfp4" ] && [ -z "${AITER_CONFIG_GEMM_A4W4:-}" ]; then
     echo "[setup] AITER_CONFIG_GEMM_A4W4=${AITER_CONFIG_GEMM_A4W4}"
 fi
 
-source "$(dirname "${BASH_SOURCE[0]}")/qwen3_8b_common_args.sh"
+source "${ARGS_FILE}"
 
 # Word-split on purpose: EXTRA_ARGS carries whole flags, e.g. profiler options.
 read -r -a EXTRA_ARGS_ARR <<< "${EXTRA_ARGS:-}"
 
 cd "${LUMEN_ROOT}/examples/llama31"
+
+TORCHRUN_ARGS=(
+    --nproc_per_node="${NPROC}" --nnodes=1 pretrain_llama31.py
+    --backend megatron
+    "${COMMON_ARGS[@]}"
+    --lumen-attn-backend csrc
+    "${ROPE_ARGS[@]}"
+    "${QUANT_ARGS[@]}"
+    "${WANDB_ARGS[@]}"
+    "${EXTRA_ARGS_ARR[@]}"
+)
+
+if [ "${DRY_RUN:-0}" = "1" ]; then
+    printf '%s\n' "torchrun ${TORCHRUN_ARGS[*]}"
+    exit 0
+fi
+
 set -x
-torchrun --nproc_per_node="${NPROC}" --nnodes=1 pretrain_llama31.py \
-    --backend megatron \
-    "${COMMON_ARGS[@]}" \
-    --lumen-attn-backend csrc \
-    "${ROPE_ARGS[@]}" \
-    "${QUANT_ARGS[@]}" \
-    "${WANDB_ARGS[@]}" \
-    "${EXTRA_ARGS_ARR[@]}" \
-    2>&1 | tee "${LOG_FILE}"
+torchrun "${TORCHRUN_ARGS[@]}" 2>&1 | tee "${LOG_FILE}"

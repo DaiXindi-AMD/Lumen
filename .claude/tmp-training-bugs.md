@@ -36,6 +36,8 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - Evidence so far: 4-layer 5-step smoke, 8×MI350X, `/tmp/smoke_fp8.log` (first failure at line 1260). Same smoke with `--linear-fp8-format fp8_e4m3` (single dtype, everything else identical) completes 5/5 iterations, loss 12.0→11.3, 0 NaN.
 - Next check: confirm whether the installed `hipb_mm` binding ever accepted mixed FP8 dtypes, then either route mixed pairs to `gemm_a8w8_mixed` regardless of hipBLASLt, or catch the dtype RuntimeError as a logged fallback. Benchmark before adopting: the Triton mixed kernel may be slow enough that hybrid should instead be rejected at config time rather than silently made slow.
 - Not blocking the MXFP4-vs-FP8 comparison, which uses `fp8_e4m3` delayed.
+- 2026-08-11: reproduces on **Llama2-7B** too (3-step smoke, 8×MI350X, `examples/llama2/results/lumen_llama2_7b_smoke_fp8.log:4871`, same `Float8_e5m2 != c10::Float8_e4m3fn` out of `aiter/jit/core.py` wrapper on all 8 ranks). So it is model-independent, not a Qwen3 shape thing, and it lands via Megatron's `--fp8-format hybrid` as well as `--linear-fp8-format hybrid` — `_FP8_FORMAT_MAP` sends both to the same resolved format.
+- Bearing on the BF16/FP8/MXFP4 precision matrix: the reference FP8 report (`ref/Lumen-fp8-test-report-for-reference-only.md` §8) ran hybrid delayed on MI325X, so the recipe cannot be reproduced on this stack at all. The matrix runs its FP8 arm at `FP8_FORMAT=fp8_e4m3` and the report has to say so — an E4M3 backward is a different numerical recipe, not just a different flag.
 - Status: open
 
 ## Ruled Out

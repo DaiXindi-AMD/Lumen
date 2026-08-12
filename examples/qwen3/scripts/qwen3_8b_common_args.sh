@@ -8,7 +8,9 @@
 # The two launchers exist to compare quantization stacks, so every
 # hyperparameter that is not the thing under test lives here — duplicating this
 # list per launcher is how the two arms silently drift apart and produce a
-# comparison that means nothing.
+# comparison that means nothing. For the same reason the model-independent half
+# now lives in examples/scripts/pretrain_common_args.sh, shared with the other
+# benchmark models; only the architecture below is Qwen3's own.
 ###############################################################################
 
 COMMON_ARGS=(
@@ -33,31 +35,6 @@ COMMON_ARGS=(
     --hidden-dropout 0.0
     --no-masked-softmax-fusion
     --attention-softmax-in-fp32
-    --tensor-model-parallel-size 1
-    --pipeline-model-parallel-size 1
-    --context-parallel-size 1
-    --micro-batch-size "${MBS}"
-    --global-batch-size "${GBS}"
-    --train-iters "${TRAIN_STEPS}"
-    --lr 1.0e-5 --min-lr 0.0
-    --lr-decay-style cosine
-    --lr-warmup-iters 2
-    --weight-decay 0.1
-    --clip-grad 1.0
-    --adam-beta1 0.9 --adam-beta2 0.95 --adam-eps 1e-8
-    --bf16
-    --no-gradient-accumulation-fusion
-    --use-distributed-optimizer
-    --overlap-grad-reduce
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "${TOKENIZER_PATH}"
-    --train-data-path "${TRAIN_JSONL}"
-    --valid-data-path "${VALID_JSONL}"
-    --test-data-path "${VALID_JSONL}"
-    --split "${SPLIT}"
-    --seed "${SEED}"
-    --eval-iters "${EVAL_ITERS}"
-    --eval-interval "${EVAL_INTERVAL}"
-    --save-interval 1000000
-    --log-interval 1
 )
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" && pwd)/pretrain_common_args.sh"

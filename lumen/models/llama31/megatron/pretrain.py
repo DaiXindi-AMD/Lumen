@@ -126,12 +126,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
     print_rank_0("> building train, validation, and test pretraining datasets ...")
 
+    # Only the training set wraps: --train-iters fixes how many samples training
+    # asks for, and a corpus shorter than that would otherwise end the run early
+    # with a StopIteration. Validation stays capped at one pass so a held-out loss
+    # is never averaged over duplicated samples.
     train_ds = PretrainTextDataset(
         train_path,
         args.seq_length,
         raw_tokenizer,
         is_hf,
         max_samples=train_val_test_num_samples[0],
+        allow_repeat=True,
     )
     valid_ds = PretrainTextDataset(
         valid_path,
