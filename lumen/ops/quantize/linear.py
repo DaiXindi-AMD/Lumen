@@ -54,6 +54,7 @@ from lumen.ops.dispatch import (
 from lumen.ops.quantize import mxfp4_autotune
 from lumen.quantize.config import _get_float8_e4m3
 from lumen.quantize.descriptor import FP8Descriptor
+from lumen.utils import ablation
 
 _logger = _logging.getLogger(__name__)
 
@@ -1091,7 +1092,8 @@ def _shuffle_mxfp4_weight(w_fp4, arch=None):
     if hasattr(torch, "float4_e2m1fn_x2") and dtype == torch.float4_e2m1fn_x2:
         w = w.view(torch.uint8)
     if (
-        arch == "gfx1250"
+        not ablation.enabled("VEC_SHUFFLE")
+        or arch == "gfx1250"
         or w.ndim != 2
         or not w.is_contiguous()
         or w.numel() < _MXFP4_WIDE_SHUFFLE_MIN_BYTES
@@ -1192,7 +1194,7 @@ def _mxfp4_can_fuse_scale_swizzle(*scale_shapes):
     """
     from lumen.ops.quantize.ops import mxfp4_scale_swizzle_supported, triton_arch
 
-    if triton_arch() != "gfx950":
+    if not ablation.enabled("SWIZZLE_CACHE") or triton_arch() != "gfx950":
         return False
     return all(
         rows % _MXFP4_ASM_SCALE_ROW_MULTIPLE == 0
@@ -1217,7 +1219,8 @@ def _mxfp4_can_fuse_b_shuffle(gemm_key, rows, packed_cols):
     from lumen.ops.quantize.ops import mxfp4_data_shuffle_supported
 
     return (
-        mxfp4_autotune.cached(gemm_key) in ("asm", "shuffled")
+        ablation.enabled("QUANT_EMIT_SHUFFLE")
+        and mxfp4_autotune.cached(gemm_key) in ("asm", "shuffled")
         and mxfp4_data_shuffle_supported(rows, packed_cols)
     )
 
@@ -1357,7 +1360,7 @@ def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
     rows, cols = scale.shape
     rows_pad = -(-rows // _MXFP4_ASM_SCALE_ROW_MULTIPLE) * _MXFP4_ASM_SCALE_ROW_MULTIPLE
     cols_pad = -(-cols // _MXFP4_ASM_SCALE_COL_MULTIPLE) * _MXFP4_ASM_SCALE_COL_MULTIPLE
-    if (rows, cols) == (rows_pad, cols_pad):
+    if (rows, cols) == (rows_pad, cols_pad) and ablation.enabled("SCALE_PAD_SKIP"):
         # Training shapes are almost always aligned already (rows is the token
         # count or a hidden dim, cols is K/32). Allocating and filling a copy
         # that is byte-identical to the input costs ~17us of launch overhead per
@@ -1391,7 +1394,7 @@ def _cached_weight_operands(w_fp4, scale_w, key, build):
     weight tensor outliving its scales would otherwise go silently stale.
     """
     stamp = (scale_w.data_ptr(), scale_w._version)
-    cached = getattr(w_fp4, key, None)
+    cached = getattr(w_fp4, key, None) if ablation.enabled("SWIZZLE_CACHE") else None
     if cached is not None and cached[0] == stamp:
         return cached[1]
     built = build()
@@ -1509,6 +1512,22 @@ def _mxfp4_probe_backends():
     return _fast_mxfp4_gemm_fn is not None
 
 
+# ``LUMEN_MXFP4_ASM`` / ``LUMEN_MXFP4_PRESHUFFLE`` only steer the static byte
+# thresholds, so they cannot take a backend out of play once autotune measures
+# the candidates. The staircase needs a switch that does, including against an
+# autotune cache recorded while the backend was still reachable.
+_MXFP4_BACKEND_SWITCH = {
+    "asm": "MXFP4_ASM_BACKEND",
+    "shuffled": "MXFP4_SHUF_BACKEND",
+}
+
+
+def _mxfp4_backend_allowed(name):
+    """False when this backend is ablated out of the dispatch for this run."""
+    switch = _MXFP4_BACKEND_SWITCH.get(name)
+    return switch is None or ablation.enabled(switch)
+
+
 def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
     """Name of the MXFP4 backend to run for these operands.
 
@@ -1519,11 +1538,19 @@ def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
     _mxfp4_probe_backends()
     key = (a_fp4.shape[0], w_fp4.shape[0], a_fp4.shape[1] * 2)
     name = mxfp4_autotune.cached(key)
-    if name is not None:
+    if name is not None and _mxfp4_backend_allowed(name):
         return name
 
-    asm_ok = _fast_mxfp4_asm_ok and _mxfp4_asm_supported(a_fp4, w_fp4)
-    shuf_ok = _fast_mxfp4_preshuffle_ok and _mxfp4_preshuffle_supported(a_fp4, w_fp4)
+    asm_ok = (
+        _fast_mxfp4_asm_ok
+        and _mxfp4_backend_allowed("asm")
+        and _mxfp4_asm_supported(a_fp4, w_fp4)
+    )
+    shuf_ok = (
+        _fast_mxfp4_preshuffle_ok
+        and _mxfp4_backend_allowed("shuffled")
+        and _mxfp4_preshuffle_supported(a_fp4, w_fp4)
+    )
 
     candidates = []
     if asm_ok:
@@ -1573,6 +1600,7 @@ def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
         # Same choice, but keep the other kernels behind it so a backend that
         # rejects these operands at runtime degrades instead of raising.
         legal = ("asm", "shuffled") if shuffled_b else ("asm", "shuffled", "plain")
+        legal = tuple(n for n in legal if _mxfp4_backend_allowed(n))
         order = [name] + [n for n in legal if n != name]
         backends = [
             (
@@ -1866,8 +1894,13 @@ class QuantizedLinearFunction(torch.autograd.Function):
             # transposed, so the quantizer can emit it from the read it already
             # does. Rebuilding it in backward off the stored FP4 instead costs a
             # second pass over the activation (measured 1.65x the fused form).
-            input_wgrad_operand = _mxfp4_wgrad_activation_operand(
-                input_2d, weight, scaling_type, _fuse_in_swizzle, ctx.needs_input_grad[1],
+            input_wgrad_operand = (
+                _mxfp4_wgrad_activation_operand(
+                    input_2d, weight, scaling_type, _fuse_in_swizzle,
+                    ctx.needs_input_grad[1],
+                )
+                if ablation.enabled("FWD_WGRAD_OPERAND")
+                else None
             )
             if input_wgrad_operand is not None:
                 input_desc, _wg_fp4, _wg_scale, _wg_shuffled = input_wgrad_operand
@@ -2397,6 +2430,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 dequant_hadamard_quant_mxfp4,
                 dequant_transpose_mxfp4,
                 dual_layout_quant_mxfp4,
+                hadamard_quant_mxfp4,
             )
 
             grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
@@ -2426,11 +2460,25 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         _fuse_swizzle = _mxfp4_can_fuse_scale_swizzle(
                             (M, N_out // mxfp4_block), (N_out, M // mxfp4_block),
                         )
-                        g_fp4, g_scale, grad_t_fp4, grad_t_scale = dual_layout_quant_mxfp4(
-                            grad_flat, sign_m, block_size=mxfp4_block, g=rht_g,
-                            use_sr_row=True, use_sr_transposed=True,
-                            swizzle_scale=_fuse_swizzle,
-                        )
+                        if ablation.enabled("DUAL_LAYOUT"):
+                            g_fp4, g_scale, grad_t_fp4, grad_t_scale = dual_layout_quant_mxfp4(
+                                grad_flat, sign_m, block_size=mxfp4_block, g=rht_g,
+                                use_sr_row=True, use_sr_transposed=True,
+                                swizzle_scale=_fuse_swizzle,
+                            )
+                        else:
+                            # The two-call form dual_layout_quant_mxfp4's docstring
+                            # names, which reads dY twice and takes dY^T strided.
+                            # It cannot emit swizzled scales, so the fusion below
+                            # has to be withdrawn with it.
+                            _fuse_swizzle = False
+                            g_fp4, g_scale = convert_to_mxfp4(
+                                grad_flat, block_size=mxfp4_block, axis=-1, use_sr=True,
+                            )
+                            grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
+                                grad_flat.t(), sign_m, block_size=mxfp4_block, g=rht_g,
+                                use_sr=True,
+                            )
                         if _fuse_swizzle:
                             _mark_mxfp4_scale_swizzled(g_scale)
                             _mark_mxfp4_scale_swizzled(grad_t_scale)

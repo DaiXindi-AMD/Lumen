@@ -203,8 +203,9 @@ fi
 # The Lumen backend ignores both branches above -- it sets apply_rope_fusion from
 # its own flag, which routes to AITER's fused kernel instead of apex's or TE's.
 # Without it the rotate-half runs as separate neg/cat/mul kernels: 137 ms/step at
-# this shape, measured (§5.7).
-ROPE_ARGS+=(--lumen-fused-rope)
+# this shape, measured (§5.7). FUSED_ROPE=0 is the ablation arm for that measurement
+# (docs/mxfp4_ablation_plan.md A13); it is on everywhere else.
+[ "${FUSED_ROPE:-1}" = "1" ] && ROPE_ARGS+=(--lumen-fused-rope)
 
 # Mock corpus of random token ids. Repetitive enough that the model memorises it
 # within ~50 steps, which is what makes the loss curve usable as a regression
@@ -254,10 +255,10 @@ fi
 # measured on the patched-Megatron path and are 5.6% slower for that reason alone.
 #
 # The FP8 arm reproduces the recipe the BF16/FP8 reference report measured:
-# delayed scaling, amax history 1024, algo max. FP8_FORMAT is overridable because
-# `hybrid` is what that report used but it dies in the first backward on this
-# stack (mixed-dtype hipb_mm, .claude/tmp-training-bugs.md), so a run here has to
-# be able to fall back to fp8_e4m3 and say so.
+# delayed scaling, amax history 1024, algo max, `hybrid`. Hybrid needs an AITER
+# whose hipb_mm accepts mixed E5M2 x E4M3 operands (.claude/tmp-training-bugs.md);
+# on a build without it the first backward dies, so FP8_FORMAT stays overridable
+# to fp8_e4m3 and every run records which one it used.
 QUANT_ARGS=()
 case "${PRECISION}" in
     mxfp4)
@@ -266,11 +267,15 @@ case "${PRECISION}" in
             --linear-fp8-format mxfp4
             --linear-fp8-scaling blockwise
             --linear-fp8-block-size 32
-            --lumen-linear
             --first-last-layers-bf16
             --num-layers-at-start-in-bf16 0
             --num-layers-at-end-in-bf16 "${TAIL_BF16}"
         )
+        # MXFP4_LUMEN_LINEAR=0 goes back to Megatron's own parallel linears under
+        # the quantize patch, which is what MXFP4 ran on before 8/10. It is the
+        # ablation arm for that switch (docs/mxfp4_ablation_plan.md A25) and is on
+        # everywhere else.
+        [ "${MXFP4_LUMEN_LINEAR:-1}" = "1" ] && QUANT_ARGS+=(--lumen-linear)
         ;;
     fp8)
         QUANT_ARGS=(
