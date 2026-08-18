@@ -250,6 +250,152 @@ def test_mfma_h16_switch_is_bit_exact():
                     )
 
 
+def _run_linear(**switches):
+    """One MXFP4 linear forward+backward under *switches*, seeds pinned.
+
+    The philox counters come from Python's RNG, so the seed has to be reset for
+    each run or two arms that draw the same number of times still see different
+    streams and nothing is comparable.
+    """
+    import random
+
+    from lumen.ops.quantize.linear import QuantizedLinearFunction
+
+    torch.manual_seed(5)
+    x = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
+
+    random.seed(0)
+    torch.manual_seed(0)
+    xi = x.detach().clone().requires_grad_(True)
+    wi = w.detach().clone().requires_grad_(True)
+    with ablation.overridden(**switches):
+        QuantizedLinearFunction.apply(
+            xi, wi, None, None, "mxfp4", None, 32, "weight",
+        ).backward(dy)
+    return xi.grad, wi.grad
+
+
+# A2, A5 and A16 sit on the activation's WGrad operand, which forward supplies
+# outright once A18 is on, and A2 also sits on the gradient operand, which the
+# dual-layout kernel supplies once A19 is on. Turning any of them off alone at
+# HEAD therefore changes nothing -- their code is only reached in the early rungs,
+# where A18 and A19 are still off. Tests have to use that base or they pass
+# vacuously.
+_EARLY_RUNG = {"FWD_WGRAD_OPERAND": False, "DUAL_LAYOUT": False}
+
+
+@_CUDA
+@_GFX950
+@pytest.mark.parametrize(
+    "switch,base",
+    [
+        ("DGRAD_WEIGHT_REUSE", {}),
+        ("WGRAD_VIEWS", {}),
+        ("FUSED_DHQ", _EARLY_RUNG),
+        ("DEQUANT_TRANSPOSE", _EARLY_RUNG),
+    ],
+)
+def test_backward_switch_is_bit_exact(switch, base):
+    """Reusing the weight, passing views, and both fusions keep dX and dW exact."""
+    ref_dx, ref_dw = _run_linear(**base)
+    got_dx, got_dw = _run_linear(**{**base, switch: False})
+    torch.testing.assert_close(got_dx, ref_dx, atol=0, rtol=0, msg=f"{switch} moved dX")
+    torch.testing.assert_close(got_dw, ref_dw, atol=0, rtol=0, msg=f"{switch} moved dW")
+
+
+@_CUDA
+@_GFX950
+def test_fused_hq_wgrad_is_not_bit_exact_but_is_equivalent():
+    """The unfused rotation narrows to BF16 in between, so dW moves a little.
+
+    ``hadamard_transform`` returns the input dtype, so the two-kernel form writes
+    a BF16 intermediate that the fused kernel keeps in FP32. That is a real
+    numerical difference rather than a re-draw, but it is far below the noise the
+    MXFP4 gradient already carries.
+    """
+    ref_dx, ref_dw = _run_linear(**_EARLY_RUNG)
+    got_dx, got_dw = _run_linear(**_EARLY_RUNG, FUSED_HQ_WGRAD=False)
+
+    torch.testing.assert_close(got_dx, ref_dx, atol=0, rtol=0, msg="dX should not move")
+    assert not torch.equal(got_dw, ref_dw), (
+        "expected the BF16 intermediate to change dW; if this now matches, the "
+        "unfused path stopped narrowing and the switch may be unwired"
+    )
+    assert _snr(ref_dw, got_dw) > 30.0, (
+        f"the unfused rotation should differ only marginally, got "
+        f"{_snr(ref_dw, got_dw):.2f} dB against the fused result"
+    )
+
+
+@_CUDA
+@_GFX950
+def test_fwd_wgrad_operand_improves_dw():
+    """A18's rung is expected to move the loss, and in the good direction.
+
+    Forward's operand skips one quantization round, so dW lands closer to the
+    BF16 reference. The plan reports that as a remark on the optimization, which
+    only holds if the gain is real and sizeable.
+    """
+    torch.manual_seed(5)
+    x = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
+    exact_dw = (dy.float().t() @ x.float()).bfloat16()
+
+    _, fused_dw = _run_linear()
+    _, rebuilt_dw = _run_linear(FWD_WGRAD_OPERAND=False, FUSED_DHQ=False)
+    assert _snr(exact_dw, fused_dw) > _snr(exact_dw, rebuilt_dw) + 0.5, (
+        f"expected forward's operand to be the better dW: "
+        f"{_snr(exact_dw, fused_dw):.2f} vs {_snr(exact_dw, rebuilt_dw):.2f} dB"
+    )
+
+
+@_CUDA
+@_GFX950
+def test_rtn_skip_philox_only_changes_the_random_stream():
+    """The RTN kernels never read the counter, so skipping the draw is free.
+
+    What the draw costs is the stream: every SR caller after it sees a different
+    one, which is why this arm moves the loss without changing any single RTN
+    result.
+    """
+    import random
+
+    from lumen.ops.quantize.ops import convert_to_mxfp4
+
+    torch.manual_seed(3)
+    x = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+
+    out, states = {}, {}
+    for on in (True, False):
+        random.seed(0)
+        with ablation.overridden(RTN_SKIP_PHILOX=on):
+            out[on] = convert_to_mxfp4(x, block_size=32, axis=-1, use_sr=False)
+        states[on] = random.random()
+
+    for a, b in zip(out[True], out[False]):
+        torch.testing.assert_close(a, b, atol=0, rtol=0)
+    assert states[True] != states[False], (
+        "the stream did not move, so the switch never reached the draw"
+    )
+
+
+@_CUDA
+@_GFX950
+def test_every_switch_off_still_runs():
+    """S0 is a combination that never existed; it has to at least execute.
+
+    Each switch was verified alone, but the stripped baseline turns all of them
+    off at once, and the legacy paths compose in ways no single-switch test
+    reaches.
+    """
+    dx, dw = _run_linear(**{name: False for name in ablation._REGISTRY})
+    for name, g in (("dX", dx), ("dW", dw)):
+        assert g is not None and torch.isfinite(g).all(), f"{name} is not finite at S0"
+
+
 def _snr(ref, got):
     err = (ref.float() - got.float()).pow(2).sum()
     if err == 0:

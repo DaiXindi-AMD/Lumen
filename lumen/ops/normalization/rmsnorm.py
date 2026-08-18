@@ -45,6 +45,7 @@ from lumen.ops.dispatch import (
     build_fallback_chain,
     try_backends,
 )
+from lumen.utils import ablation
 
 
 def _to_2d(x: torch.Tensor) -> torch.Tensor:
@@ -256,7 +257,7 @@ def rmsnorm(
 
     if _USE_APEX_RMSNORM:
         y = _rmsnorm_apex(x_2d, weight, eps)
-    elif needs_grad and _rows_are_short(x_2d, weight):
+    elif needs_grad and _rows_are_short(x_2d, weight) and ablation.enabled("NARROW_N_RMSNORM"):
         y = _NarrowRMSNorm.apply(_to_2d(x), weight, eps)
     elif needs_grad and _probe_aiter_triton_rmsnorm():
         y = _rmsnorm_triton(x_2d, weight, eps)

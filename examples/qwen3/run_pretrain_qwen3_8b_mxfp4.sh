@@ -74,6 +74,14 @@ RUNTIME_ENV=(
     LUMEN_SKIP_BACKEND_SYNC=1
 )
 
+# The ablation ladder sets these per arm (docs/mxfp4_ablation_plan.md). Native
+# mode inherits the environment anyway, but docker mode only forwards what it is
+# told, so an arm's switches would silently revert to HEAD defaults inside the
+# container and every rung would measure the same thing.
+while IFS= read -r _abl_kv; do
+    [ -n "${_abl_kv}" ] && RUNTIME_ENV+=("${_abl_kv}")
+done < <(env | grep -E '^(LUMEN_ABL_[A-Z0-9_]+|FUSED_ROPE|LUMEN_GC_FREEZE|LUMEN_MXFP4_AUTOTUNE|LUMEN_MXFP4_DISABLE_WEIGHT_CACHE)=' || true)
+
 mkdir -p "${RESULTS_DIR}"
 
 if [ "${LAUNCH}" = "native" ]; then
@@ -97,9 +105,11 @@ if [ "${LAUNCH}" = "native" ]; then
         # under whatever kernels were reachable at the time, so a run made with
         # the tuned table missing pins "use Triton" for every shape and later
         # runs inherit it. A/B work needs to be able to point somewhere fresh.
+        # Both stay overridable: the ladder prices the fast dispatch as one of its
+        # arms, and each arm needs its own cache file.
         RUNTIME_ENV+=(
             LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${RESULTS_DIR}/mxfp4_autotune_qwen3_8b.json}"
-            LUMEN_FAST_QUANT_DISPATCH=1
+            LUMEN_FAST_QUANT_DISPATCH="${LUMEN_FAST_QUANT_DISPATCH:-1}"
         )
     fi
 
@@ -116,9 +126,9 @@ docker rm -f "${CONTAINER_NAME}" 2>/dev/null || true
 
 if [ "${PRECISION}" = "mxfp4" ]; then
     RUNTIME_ENV+=(
-        AITER_CONFIG_GEMM_A4W4=/workspace/Lumen/examples/qwen3/configs/a4w4_blockscale_tuned_gemm.csv
-        LUMEN_MXFP4_AUTOTUNE_CACHE=/results/mxfp4_autotune_qwen3_8b.json
-        LUMEN_FAST_QUANT_DISPATCH=1
+        AITER_CONFIG_GEMM_A4W4="${AITER_CONFIG_GEMM_A4W4:-/workspace/Lumen/examples/qwen3/configs/a4w4_blockscale_tuned_gemm.csv}"
+        LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-/results/mxfp4_autotune_qwen3_8b.json}"
+        LUMEN_FAST_QUANT_DISPATCH="${LUMEN_FAST_QUANT_DISPATCH:-1}"
     )
 fi
 

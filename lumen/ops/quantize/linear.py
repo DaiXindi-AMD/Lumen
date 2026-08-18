@@ -2427,11 +2427,64 @@ class QuantizedLinearFunction(torch.autograd.Function):
             from lumen.ops.quantize.ops import (
                 convert_from_mxfp4,
                 convert_to_mxfp4,
+                convert_to_mxfp4_2d,
                 dequant_hadamard_quant_mxfp4,
                 dequant_transpose_mxfp4,
                 dual_layout_quant_mxfp4,
                 hadamard_quant_mxfp4,
+                hadamard_transform,
+                transpose_packed_fp4,
             )
+
+            def _as_wgrad_operand(t):
+                """A transposed view, or the copy the quantizers used to be handed.
+
+                The quantize kernels address their input through both strides, so
+                the copy bought nothing; on Qwen3-8B it was ~85 ms of every step
+                (``7ef406f``). Materialising again is the A11 arm.
+                """
+                return t if ablation.enabled("WGRAD_VIEWS") else t.contiguous()
+
+            def _rotate_and_quantize(t, sign, *, use_sr):
+                """Rotate and quantize in one kernel, or in the two it replaced.
+
+                ``23644ea`` fused these; before it the rotation wrote a whole BF16
+                intermediate that ``convert_to_mxfp4`` read straight back. Both
+                spell the same ``diag(sign) @ H16`` map, so this is the A2 arm.
+                """
+                if ablation.enabled("FUSED_HQ_WGRAD"):
+                    return hadamard_quant_mxfp4(
+                        t, sign, block_size=mxfp4_block, g=_MXFP4_RHT_G, use_sr=use_sr,
+                    )
+                return convert_to_mxfp4(
+                    hadamard_transform(t, sign, g=_MXFP4_RHT_G),
+                    block_size=mxfp4_block, axis=-1, use_sr=use_sr,
+                )
+
+            def _decode_and_transpose(data, scale):
+                """Decode and transpose in one pass, or decode then transpose.
+
+                ``827c941`` fused the two; the unfused form writes the whole BF16
+                (K, M) tensor and reads it back. This is the A5 arm.
+
+                Unswizzle before reshaping. The swizzle state is recorded on the
+                tensor, so a reshaped view drops it and the unswizzle silently
+                becomes a no-op -- which hands the kernel a swizzled scale it
+                reads as row-major, and reads off the end of it.
+                """
+                unswizzled = _unswizzle_mxfp4_scale(scale)
+                data_2d = data.reshape(-1, data.shape[-1])
+                scale_2d = unswizzled.reshape(-1, unswizzled.shape[-1])
+                if ablation.enabled("DEQUANT_TRANSPOSE"):
+                    return dequant_transpose_mxfp4(
+                        data_2d, scale_2d, block_size=mxfp4_block,
+                    )
+                return _as_wgrad_operand(
+                    convert_from_mxfp4(
+                        data_2d, scale_2d,
+                        output_dtype=torch.bfloat16, block_size=mxfp4_block,
+                    ).t()
+                )
 
             grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
             M, N_out = grad_flat.shape
@@ -2475,9 +2528,8 @@ class QuantizedLinearFunction(torch.autograd.Function):
                             g_fp4, g_scale = convert_to_mxfp4(
                                 grad_flat, block_size=mxfp4_block, axis=-1, use_sr=True,
                             )
-                            grad_t_fp4, grad_t_scale = hadamard_quant_mxfp4(
-                                grad_flat.t(), sign_m, block_size=mxfp4_block, g=rht_g,
-                                use_sr=True,
+                            grad_t_fp4, grad_t_scale = _rotate_and_quantize(
+                                _as_wgrad_operand(grad_flat.t()), sign_m, use_sr=True,
                             )
                         if _fuse_swizzle:
                             _mark_mxfp4_scale_swizzled(g_scale)
@@ -2497,7 +2549,19 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
                     # weight_data / weight_scale are already the pre-transposed
                     # forms saved in forward (W^T packed, scales^T).
-                    grad_input = gemm_mxfp4_dispatch(g_fp4, weight_data, g_scale, weight_scale)
+                    if ablation.enabled("DGRAD_WEIGHT_REUSE"):
+                        dgrad_w, dgrad_w_scale = weight_data, weight_scale
+                    else:
+                        # What backward did before 23644ea: quantize the BF16
+                        # master again and transpose it here, every micro-batch.
+                        # RTN makes this the same weight bit for bit, only later.
+                        _w_fp4, _w_scale = convert_to_mxfp4_2d(
+                            ctx.weight_ref.contiguous(),
+                            block_size=mxfp4_block, use_sr=False,
+                        )
+                        dgrad_w = transpose_packed_fp4(_w_fp4)
+                        dgrad_w_scale = _w_scale.t().contiguous()
+                    grad_input = gemm_mxfp4_dispatch(g_fp4, dgrad_w, g_scale, dgrad_w_scale)
 
                     # --- WGrad: dW = fused_HQ(dY^T) @ fused_HQ(X^T)^T ---
                     # NVFP4 §4.4 / E.3: stochastic rounding belongs on the
@@ -2507,6 +2571,14 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         # Forward already emitted this operand off its own read of
                         # the activation (_mxfp4_wgrad_activation_operand).
                         input_t_fp4, input_t_scale = wgrad_act
+                    elif _rht_ok and not ablation.enabled("FUSED_DHQ"):
+                        # The three passes 1be93f8 fused into one: decode and
+                        # transpose, then rotate and quantize. The BF16 (K, M)
+                        # activation is written and read back in between.
+                        input_t_fp4, input_t_scale = _rotate_and_quantize(
+                            _decode_and_transpose(input_data, input_scale),
+                            sign_m, use_sr=False,
+                        )
                     elif _rht_ok:
                         # Decode, transpose, rotate and requantize in one pass, so
                         # the BF16 (K, M) form of the activation — four times the
@@ -2536,12 +2608,9 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         # Without the rotation there is nothing to fuse into; the
                         # transposing dequant still lands dense, which the
                         # quantizer below needs.
-                        input_t = dequant_transpose_mxfp4(
-                            input_data, _unswizzle_mxfp4_scale(input_scale),
-                            block_size=mxfp4_block,
-                        )
+                        input_t = _decode_and_transpose(input_data, input_scale)
                         input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t, block_size=mxfp4_block, axis=-1, use_sr=False,
+                            input_t.contiguous(), block_size=mxfp4_block, axis=-1, use_sr=False,
                         )
 
                     def _compute_wgrad():

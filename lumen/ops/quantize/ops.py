@@ -509,6 +509,31 @@ def _dividing_block(dim: int, cap: int, floor: int = 1) -> int:
     return max(block, floor)
 
 
+def _philox_counter(
+    use_sr: bool,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+) -> Tuple[int, int]:
+    """The ``(seed, offset)`` pair to hand a quantize kernel.
+
+    Only the SR path reads the counter, and drawing two Python randoms per launch
+    is measurable on a step that issues hundreds of them. Drawing them on the RTN
+    paths anyway also advanced the stream that the gradient's SR quantizer reads
+    next, which showed up as 2.2x the run-to-run loss noise (``1be93f8``).
+
+    ``LUMEN_ABL_RTN_SKIP_PHILOX=0`` draws unconditionally again, which is the arm
+    that prices that change (docs/mxfp4_ablation_plan.md A14). It moves the loss
+    as well as the step time, because the stream every SR caller sees shifts.
+    """
+    if use_sr or not ablation.enabled("RTN_SKIP_PHILOX"):
+        if philox_seed is None:
+            philox_seed = random.randint(0, 2**31 - 2)
+        if philox_offset is None:
+            philox_offset = random.randint(0, 2**31 - 2)
+        return philox_seed, philox_offset
+    return philox_seed or 0, philox_offset or 0
+
+
 def convert_to_mxfp4(
     data_hp: torch.Tensor,
     block_size: int = 32,
@@ -565,16 +590,7 @@ def convert_to_mxfp4(
         # Lumen unified kernel: ASM (gfx950) or software fallback
         from lumen.kernels.mxfp4 import _convert_to_mxfp4_kernel
 
-        # Only the SR path reads the counter, and drawing two Python randoms per
-        # launch is measurable on a step that issues hundreds of them.
-        if use_sr:
-            if philox_seed is None:
-                philox_seed = random.randint(0, 2**31 - 2)
-            if philox_offset is None:
-                philox_offset = random.randint(0, 2**31 - 2)
-        else:
-            philox_seed = philox_seed or 0
-            philox_offset = philox_offset or 0
+        philox_seed, philox_offset = _philox_counter(use_sr, philox_seed, philox_offset)
 
         from lumen.kernels.mxfp4 import MXFP4_SCALE_STRIPE
 
@@ -664,15 +680,8 @@ def convert_to_mxfp4_2d(
     from lumen.kernels.mxfp4 import _convert_to_mxfp4_kernel
 
     # Weights take this path once per optimizer step with RTN, where the counter
-    # is unused; only draw randoms when the kernel will actually read them.
-    if use_sr:
-        if philox_seed is None:
-            philox_seed = random.randint(0, 2**31 - 2)
-        if philox_offset is None:
-            philox_offset = random.randint(0, 2**31 - 2)
-    else:
-        philox_seed = philox_seed or 0
-        philox_offset = philox_offset or 0
+    # is unused.
+    philox_seed, philox_offset = _philox_counter(use_sr, philox_seed, philox_offset)
 
     fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=data_2d.device)
     scales_2d = torch.empty((sm, sn), dtype=torch.uint8, device=data_2d.device)
@@ -989,15 +998,7 @@ def hadamard_quant_mxfp4(
 
     use_asm = is_cdna4()
 
-    # Only the SR path reads the counter (see convert_to_mxfp4).
-    if use_sr:
-        if philox_seed is None:
-            philox_seed = random.randint(0, 2**31 - 2)
-        if philox_offset is None:
-            philox_offset = random.randint(0, 2**31 - 2)
-    else:
-        philox_seed = philox_seed or 0
-        philox_offset = philox_offset or 0
+    philox_seed, philox_offset = _philox_counter(use_sr, philox_seed, philox_offset)
 
     fp4_packed = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     scales_e8m0 = torch.empty((M, N // block_size), dtype=torch.uint8, device=x.device)
@@ -1074,17 +1075,9 @@ def dual_layout_quant_mxfp4(
     assert M % block_size == 0 and N % block_size == 0, f"({M}, {N}) not a whole number of {block_size}-blocks"
     assert M % g == 0, f"M={M} not divisible by g={g}"
 
-    # The counter only reaches the kernel through the SR path; an all-RTN call
-    # that drew from Python's RNG anyway would also shift the stream every SR
-    # caller after it reads.
-    if use_sr_row or use_sr_transposed:
-        if philox_seed is None:
-            philox_seed = random.randint(0, 2**31 - 2)
-        if philox_offset is None:
-            philox_offset = random.randint(0, 2**31 - 2)
-    else:
-        philox_seed = philox_seed or 0
-        philox_offset = philox_offset or 0
+    philox_seed, philox_offset = _philox_counter(
+        use_sr_row or use_sr_transposed, philox_seed, philox_offset,
+    )
 
     from lumen.kernels.mxfp4 import MXFP4_SCALE_KCHUNK, MXFP4_SCALE_STRIPE
 
@@ -1195,17 +1188,8 @@ def dequant_hadamard_quant_mxfp4(
     assert M % g == 0, f"M={M} not divisible by g={g}"
     assert g == 16, f"kernel is hardcoded for g=16, got {g}"
 
-    # Activations take this path with RTN, where the kernel never reads the
-    # counter; drawing from Python's RNG then would only shift the stream that
-    # the gradient's SR reads next.
-    if use_sr:
-        if philox_seed is None:
-            philox_seed = random.randint(0, 2**31 - 2)
-        if philox_offset is None:
-            philox_offset = random.randint(0, 2**31 - 2)
-    else:
-        philox_seed = philox_seed or 0
-        philox_offset = philox_offset or 0
+    # Activations take this path with RTN, where the kernel never reads it.
+    philox_seed, philox_offset = _philox_counter(use_sr, philox_seed, philox_offset)
 
     from lumen.kernels.mxfp4 import _dequant_hadamard_quant_mxfp4_kernel
 

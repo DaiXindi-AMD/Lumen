@@ -30,7 +30,7 @@ git checkout -b bench/mxfp4-ablation-staircase
 git stash pop                      # 如需带上 wip
 ```
 
-**分支纪律：**本分支只做两件事——(1) 新增 `LUMEN_ABL_*` 消融开关，(2) 新增 launcher 层 env 开关。**所有新开关的默认值必须等于 HEAD 当前行为**，即不加任何 env 时，本分支与 HEAD 逐位一致、step time 无差异。这一条用第七节的 `S23 == HEAD` 对照验证。
+**分支纪律：**本分支只做两件事——(1) 新增 `LUMEN_ABL_*` 消融开关，(2) 新增 launcher 层 env 开关。**所有新开关的默认值必须等于 HEAD 当前行为**，即不加任何 env 时，本分支与 HEAD 逐位一致、step time 无差异。这一条用第七节的 `S24 == HEAD` 对照验证。
 
 ---
 
@@ -59,32 +59,34 @@ HEAD 上 `convert_to_mxfp4` / `convert_from_mxfp4` / `transpose_packed_fp4` / `h
 | # | 引入日期 | commit | 优化项 | off 机制 | 开关 | 代码位点 | 工作量 | 预期类型 |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | A1 | 07-26 21:24 | `23644ea` | DGrad 复用 forward 已转置的 FP4 权重 | N | `LUMEN_ABL_DGRAD_WEIGHT_REUSE` | `linear.py` mxfp4 backward | 中 | 无损 |
-| A2 | 07-26 21:24 | `23644ea` | WGrad 走融合 Hadamard+Quant | N | `LUMEN_ABL_FUSED_HQ_WGRAD` | `linear.py` + `hadamard_quant_mxfp4` | 低 | 需验证位等价 |
+| A2 | 07-26 21:24 | `23644ea` | WGrad 走融合 Hadamard+Quant | N | `LUMEN_ABL_FUSED_HQ_WGRAD` | `linear.py:2452` `_rotate_and_quantize` | 低 | **非位等价但等效**（7.1） |
 | A3 | 07-26 21:24 | `23644ea` | 快速 GEMM dispatch（跳过 fallback 链） | **E** | `LUMEN_FAST_QUANT_DISPATCH=0` | `linear.py:68/1571` | 0 | 无损 |
 | A4 | 07-27 21:50 | `d545804` | 跨 micro-batch 权重缓存 | **E** | `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` | `megatron.py:1290`, `quantize/__init__.py:473` | 0 | **换显存 +4.8 GB** |
-| A5 | 07-28 00:28 | `827c941` | 融合 dequant+transpose kernel | N | `LUMEN_ABL_DEQUANT_TRANSPOSE` | `dequant_transpose_mxfp4` 调用点 | 低 | 无损 |
+| A5 | 07-28 00:28 | `827c941` | 融合 dequant+transpose kernel | N | `LUMEN_ABL_DEQUANT_TRANSPOSE` | `linear.py:2468` `_decode_and_transpose` | 低 | 无损（**已实测位等价**） |
 | A6 | 07-29 23:21 | `95512ed` | **preshuffle（shuffled-layout Triton）backend 进入 dispatch** | L | `LUMEN_ABL_MXFP4_SHUF_BACKEND` | `_mxfp4_choose_backend:1526` 的 `shuf_ok` | 低 | 无损 |
 | A7 | 07-29 23:21 | `95512ed` | **ASM/CK backend 进入 dispatch** | L | `LUMEN_ABL_MXFP4_ASM_BACKEND` | `_mxfp4_choose_backend:1525` 的 `asm_ok` | 低 | 无损 |
 | A8 | 07-29 23:21 | `95512ed` | 实测 per-shape autotune 取代静态字节阈值 | **E** | `LUMEN_MXFP4_AUTOTUNE=0` | `mxfp4_autotune.py:41`, `linear.py:1544` | 0 | 无损 |
 | A9 | 07-29 23:24 | `0bb7f8f` | 跳过冗余 scale padding | N | `LUMEN_ABL_SCALE_PAD_SKIP` | `_pad_and_swizzle_mxfp4_scale:1340` | 极低 | 无损 |
 | A10 | 07-29 23:24 | `0bb7f8f` | 向量化（int64）wide 权重 shuffle | N | `LUMEN_ABL_VEC_SHUFFLE` | `_shuffle_mxfp4_weight:1093` | 极低 | 无损 |
-| A11 | 07-29 23:25 | `7ef406f` | WGrad 不再物化转置（改传 view） | L | `LUMEN_ABL_WGRAD_VIEWS` | `linear.py` wgrad 分支 | 低 | 无损 |
+| A11 | 07-29 23:25 | `7ef406f` | WGrad 不再物化转置（改传 view） | L | `LUMEN_ABL_WGRAD_VIEWS` | `linear.py:2444` `_as_wgrad_operand` | 低 | 无损（**已实测位等价**） |
 | A12 | 08-03 21:29 | `332a403` | Qwen3-8B 专用 A4W4 tuned 表 | **E** | `AITER_CONFIG_GEMM_A4W4` 指向不含本模型 shape 的表 | `train_pretrain.sh:325` | 0 | 无损 |
 | A13 | 08-03 21:29 | `332a403` | 融合 RoPE | launcher | `FUSED_ROPE=0` (新增) | `train_pretrain.sh:207` | 极低 | 无损 |
-| A14 | 08-06 00:01:22 | `1be93f8` | 跳过 RTN 下用不到的 philox 采样 | N | `LUMEN_ABL_RTN_SKIP_PHILOX` | `ops.py` 量化核调用 | 低 | 需验证位等价 |
+| A14 | 08-06 00:01:22 | `1be93f8` | 跳过 RTN 下用不到的 philox 采样 | N | `LUMEN_ABL_RTN_SKIP_PHILOX` | `ops.py:512` `_philox_counter` | 低 | 单次 RTN 位等价，**但移动 RNG 流**（7.1） |
 | A15 | 08-06 00:01:22 | `1be93f8` | H16 旋转搬到矩阵单元（MFMA） | N | `LUMEN_ABL_MFMA_H16` | `kernels/mxfp4.py:630/765` | 低 | 无损（**已实测位等价**，见 7.1） |
-| A16 | 08-06 00:01:22 | `1be93f8` | 融合 dequant+Hadamard+quant | N | `LUMEN_ABL_FUSED_DHQ` | `dequant_hadamard_quant_mxfp4:1152` | 低 | 无损 |
+| A16 | 08-06 00:01:22 | `1be93f8` | 融合 dequant+Hadamard+quant | N | `LUMEN_ABL_FUSED_DHQ` | `linear.py:2536` | 低 | 无损（**已实测位等价**） |
 | A17 | 08-06 00:01:22 | `1be93f8` | 缓存/融合 scale swizzle | N | `LUMEN_ABL_SWIZZLE_CACHE` | `_shuffle_mxfp4_scale`, `_cached_weight_operands:1381` | 低 | 无损 |
 | A18 | 08-06 00:01:22 | `1be93f8` | forward 直接产出 WGrad 激活算子 | **N（legacy 分支已 live）** | `LUMEN_ABL_FWD_WGRAD_OPERAND` | `linear.py:1869` 产出、`:2475` legacy | 极低 | 换显存 +6.4 GiB；**备注：dW 少一轮量化，数值更优**（7.1） |
 | A19 | 08-06 00:01:22 | `1be93f8` | dual-layout 梯度量化 | N | `LUMEN_ABL_DUAL_LAYOUT` | `linear.py:2461` | 低 | 无损；SR 重抽签（7.1） |
 | A20 | 08-06 00:01:22 | `1be93f8` | quantizer 直接产出 shuffled B | N | `LUMEN_ABL_QUANT_EMIT_SHUFFLE` | `linear.py:1158/1437` | 低 | 无损 |
-| A21 | 08-06 00:01:37 | `f01c39f` | narrow-N RMSNorm 反向特化 | L | `LUMEN_ABL_NARROW_N_RMSNORM` | `ops/normalization/rmsnorm.py` | 中 | 无损（非 MXFP4 专属） |
-| A22 | 08-06 00:01:37 | `f01c39f` | attention QKV strided view | L | `LUMEN_ABL_ATTN_QKV_VIEWS` | `ops/attention/` | 中 | 无损（非 MXFP4 专属） |
-| A23 | 08-06 00:01:37 | `f01c39f` | seq-major attention 输出 | L | `LUMEN_ABL_ATTN_SEQ_MAJOR` | `ops/attention/` | 中 | 无损（非 MXFP4 专属） |
+| A21 | 08-06 00:01:37 | `f01c39f` | narrow-N RMSNorm 反向特化 | N | `LUMEN_ABL_NARROW_N_RMSNORM` | `rmsnorm.py:260` | 低 | 无损（非 MXFP4；**只影响 QK-norm**，见 7.1） |
+| A22 | 08-06 00:01:37 | `f01c39f` | attention QKV strided view | N | `LUMEN_ABL_ATTN_QKV_VIEWS` | `modules/attention_megatron.py:180` | 低 | 无损（非 MXFP4 专属） |
+| A23 | 08-06 00:01:37 | `f01c39f` | seq-major attention 输出 | N | `LUMEN_ABL_ATTN_SEQ_MAJOR` | `modules/attention_megatron.py:243` | 低 | 无损（非 MXFP4 专属） |
 | A24 | 08-06 00:01:37 | `f01c39f` | `gc.freeze` | **E** | `LUMEN_GC_FREEZE=0` | `megatron.py:1347` | 0 | 无损 |
-| A25 | 08-10 01:14 | `b7459ef` | Lumen 原生 parallel linear 默认开 | launcher | `MXFP4_LUMEN_LINEAR=0` (新增) | `train_pretrain.sh:269` | 极低 | 无损 |
 
-**已判定不设 arm：**`38414e0`（08-07，"stop making backward guess how forward saved its operands"）为纯 refactor —— 统一 `saved_tensors` 的存放顺序、把 fused WGrad 算子 scale 的 swizzle 状态改成如实记录的一个 bool，单文件 9 增 5 删，`tests/ops` 失败集合前后不变。无性能含义，不入阶梯。
+**已判定不设 arm：**
+
+- `38414e0`（08-07，"stop making backward guess how forward saved its operands"）为纯 refactor —— 统一 `saved_tensors` 的存放顺序、把 fused WGrad 算子 scale 的 swizzle 状态改成如实记录的一个 bool，单文件 9 增 5 删，`tests/ops` 失败集合前后不变。无性能含义，不入阶梯。
+- **`b7459ef`（08-10，Lumen 原生 parallel linear，原 A25）—— `--lumen-linear` 所有 arm 一律启用。**理由不是它没有性能含义，而是关掉它会同时改掉**量化范围**：`dfa8618` 这条 correctness fix 让 `--first-last-layers-bf16` 只在 `--lumen-linear` 路径上生效，关掉后 tail-BF16 policy 的落点不同（124 module 会变成另一个数），recipe 就跟着变了，违反设计原则 2。它同时也是 patched-Megatron 与原生 linear 两条不同代码路径的分界，跨界比较本就不是同一实验。因此 launcher 不设 `MXFP4_LUMEN_LINEAR` 开关，`--lumen-linear` 无条件加上。若要单独定价这一项，属于另一份"两条 linear 路径对比"报告。
 
 ### 4.1 `95512ed` 必须拆成三项（A6 / A7 / A8）
 
@@ -139,11 +141,10 @@ dual-layout kernel 跟着 A15 一起切，是为了守住它 docstring 里那条
 - `745de8f` 的 H16 policy / tail-BF16 policy、`40e2691` 的 WGrad SR→RTN —— 这些是 **recipe**，改的是数学不是速度，pin 在当前状态，不设 arm。若要评估它们的性能代价，属于另一份 recipe-cost 报告。
 - `LUMEN_MXFP4_ASM` / `LUMEN_MXFP4_PRESHUFFLE` **这两个 env var 本身**不对应任何 commit，是诊断后门，不设 arm。但它们所控制的底层优化——ASM backend 与 preshuffle backend 首次进入 production dispatch——确实改变了正常执行路径，已作为 A7 / A6 列入阶梯（见 4.1–4.3）。**区分"runtime switch"与"它控制的优化"是这里的关键**：前者不是历史优化，后者是。
 
-**launcher 需新增的两个 env 开关**（照 `FP8_LUMEN_LINEAR` 的既有写法）：
+**launcher 需新增的 env 开关**（照 `FP8_LUMEN_LINEAR` 的既有写法）只剩一个：
 
 ```bash
 # train_pretrain.sh
-[ "${MXFP4_LUMEN_LINEAR:-1}" = "1" ] && QUANT_ARGS+=(--lumen-linear)
 [ "${FUSED_ROPE:-1}" = "1" ] && ROPE_ARGS+=(--lumen-fused-rope)
 ```
 
@@ -151,9 +152,9 @@ dual-layout kernel 跟着 A15 一起切，是为了守住它 docstring 里那条
 
 ## 五、实验矩阵（cumulative add-one-in）
 
-26 个 arm（`S0` + A1–A25）。`S0` 全关；`Sn` = `S(n-1)` + 打开 `An`。`S25` 应与不带任何 env 的 HEAD 一致。
+25 个 arm（`S0` + A1–A24）。`S0` 全关；`Sn` = `S(n-1)` + 打开 `An`。`S24` 应与不带任何 env 的 HEAD 一致。
 
-`S0` 的 stripped baseline = 全部 `LUMEN_ABL_*=0` + `LUMEN_FAST_QUANT_DISPATCH=0` + `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` + `LUMEN_MXFP4_AUTOTUNE=0` + `LUMEN_GC_FREEZE=0` + `AITER_CONFIG_GEMM_A4W4=<不含本模型 shape 的表>` + `FUSED_ROPE=0` + `MXFP4_LUMEN_LINEAR=0`。此时 MXFP4 GEMM 只有 plain Triton 一条路（A6/A7 关掉后候选表里只剩 `plain`）。
+`S0` 的 stripped baseline = 全部 `LUMEN_ABL_*=0` + `LUMEN_FAST_QUANT_DISPATCH=0` + `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` + `LUMEN_MXFP4_AUTOTUNE=0` + `LUMEN_GC_FREEZE=0` + `AITER_CONFIG_GEMM_A4W4=<不含本模型 shape 的表>` + `FUSED_ROPE=0`。`--lumen-linear` 在**所有 arm（含 S0）**上都开着（见第四节末）。此时 MXFP4 GEMM 只有 plain Triton 一条路（A6/A7 关掉后候选表里只剩 `plain`）。
 
 | arm | 新增打开的项 | 相对上一 arm 的 env 变化 |
 | --- | --- | --- |
@@ -181,8 +182,7 @@ dual-layout kernel 跟着 A15 一起切，是为了守住它 docstring 里那条
 | S21 | A21 narrow-N RMSNorm | `LUMEN_ABL_NARROW_N_RMSNORM=1` |
 | S22 | A22 QKV view | `LUMEN_ABL_ATTN_QKV_VIEWS=1` |
 | S23 | A23 seq-major attention | `LUMEN_ABL_ATTN_SEQ_MAJOR=1` |
-| S24 | A24 `gc.freeze` | `LUMEN_GC_FREEZE=1` |
-| S25 | A25 原生 parallel linear | `MXFP4_LUMEN_LINEAR=1` → 等于 HEAD 默认 |
+| S24 | A24 `gc.freeze` | `LUMEN_GC_FREEZE=1` → 等于 HEAD 默认 |
 
 **可选合并（若 arm 数需要压缩到参考报告的 ~14 行）：**A14–A20 合并为"operand-layout 组"（1 个 arm），A21–A23 合并为"shared kernel 组"（1 个 arm）。**A6/A7/A8 不可合并**——把它们并回单一 "autotune" arm 正是 4.1 要避免的错误归因。建议先全跑，报告里再决定合并展示。
 
@@ -190,20 +190,24 @@ dual-layout kernel 跟着 A15 一起切，是为了守住它 docstring 里那条
 
 ## 六、运行协议
 
-**入口唯一：**`examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh`（native 或 docker 二选一后固定不变），配置参数一律不改。
+**不要手写 arm 的 env。**arm 定义只有一份：`examples/qwen3/ablation/arms.sh`（24 项，按 commit 时间戳排序），由 `run_ladder.sh` 消费、由 `tests/ops/test_ablation_ladder_arms.py` 校验。跑法：
 
 ```bash
-ARM=S0
-RESULTS_DIR=~/Lumen/examples/qwen3/results/ablation/${ARM} \
-LUMEN_MXFP4_AUTOTUNE_CACHE=~/Lumen/examples/qwen3/results/ablation/${ARM}/autotune.json \
-TRAIN_STEPS=60 SEED=1234 \
-<该 arm 的 env 差异> \
-  bash examples/qwen3/run_pretrain_qwen3_8b_mxfp4.sh
+cd ~/Lumen
+bash examples/qwen3/ablation/run_ladder.sh --dry-run --all   # 先看 env，不跑
+bash examples/qwen3/ablation/run_ladder.sh S0                # 单个 arm
+bash examples/qwen3/ablation/run_ladder.sh S0 S6 S8 S12 S20 S24   # 关键点子集
+bash examples/qwen3/ablation/run_ladder.sh --all             # 全阶梯
 ```
 
-硬性要求：
+模型 / 数据 / 并行度一律来自 `run_pretrain_qwen3_8b_mxfp4.sh`，runner 故意不暴露这些参数：**arm 之间只允许差 ablation env**。结果落 `results/ablation/<ARM>/run<N>/`，每个目录里带一份 `ablation_env.txt`（该 arm 实际导出的全部开关）与 `arm.txt`。
 
-1. **每个 arm 独立的 autotune cache 路径。**launcher 里已有注释警告过这一点：用缺表的配置跑过一次，cache 会把每个 shape 都钉死成 "用 Triton"，后续 arm 全部继承。**共用 cache 会静默毁掉整条阶梯。**
+runner 替下面这两条硬性要求兜底，两条都是手跑时会静默出错的地方：
+
+1. **每个 arm 独立的 autotune cache 路径**（`<arm>/run<N>/autotune.json`）。launcher 里已有注释警告过这一点：用缺表的配置跑过一次，cache 会把每个 shape 都钉死成 "用 Triton"，后续 arm 全部继承。**共用 cache 会静默毁掉整条阶梯。**
+2. **每个 arm 显式设置全部 24 个开关**，包括它要关掉的那些——靠默认值会让 arm 依赖上一次跑剩下的环境。`test_arm_env_covers_every_knob` 钉住这条。
+
+docker 模式另有一个坑：它只转发 `RUNTIME_ENV` 里列出的变量，arm 的 `LUMEN_ABL_*` 会在进容器时**静默消失**，每一级都退回 HEAD 默认。已在 `run_pretrain_qwen3_8b_mxfp4.sh` 里加了 `LUMEN_ABL_*` 的透传。
 2. **60 步，丢弃前 15 步**（warmup + autotune 探测），对剩余 45 步的 per-iteration elapsed time 取**中位数**。
 3. **每 arm 重复 2 次**；两次中位数相差 >1.5% 则跑第 3 次并报告 spread。
 4. **每 arm 记录**：step time 中位数、`torch.cuda.max_memory_allocated` 峰值、`rocm-smi` 峰值占用、前 50 步 loss 序列、dispatch 实际选中的 backend（每个 GEMM shape）。
@@ -215,7 +219,7 @@ TRAIN_STEPS=60 SEED=1234 \
 
 **Phase 0 —— 开关忠实性。**按 `tests/ops/` 约定，为每个新增 `LUMEN_ABL_*` 加一条测试：同一输入下 legacy 路径 vs 优化路径，用 `compute_snr` 比对。
 
-- 声明"无损"的项（A1、A5–A13、A16–A24）要求 **位等价**（`torch.testing.assert_close` 零容差），不满足则该项必须重新归类。A6/A7/A8/A12 尤其要验：代码注释声称三个 MXFP4 backend 位位相同，这条断言是整条 GEMM 阶梯"纯速度"定性的全部依据。
+- 声明"无损"的项（A1、A5–A13、A15–A17、A19–A24）要求 **位等价**（`torch.testing.assert_close` 零容差），不满足则该项必须重新归类。A6/A7/A8/A12 尤其要验：代码注释声称三个 MXFP4 backend 位位相同，这条断言是整条 GEMM 阶梯"纯速度"定性的全部依据。
 - 标注"需验证位等价"的项（A2、A14）单独跑：A14 若跳过 philox 采样会改变全局 RNG 消耗序列，需确认在 dropout=0 的本配置下不影响任何下游采样。A15 已判定位等价（7.1）。
 - **A6/A7 的 gate 需额外一条集成断言**：关闭时 `mxfp4_autotune.record_shape` 记录的 backend 必须只有 `plain`（见 4.2）。
 - **`38414e0` 的代码判定已完成**：纯 refactor，不入阶梯（见第四节末）。
@@ -232,6 +236,14 @@ TRAIN_STEPS=60 SEED=1234 \
 | A10 向量化 wide shuffle | **位等价** | `test_vec_shuffle_switch_is_bit_exact`，同上 |
 | A17 swizzle 缓存层 | **位等价** | 关闭后每次重建，产出与缓存值逐位相同 |
 | A15 MFMA H16 | **位等价** | 见下 |
+| A1 DGrad 权重复用 | **位等价** | 端到端 dX/dW 逐位相同；RTN 重量化是确定的，只是更晚更慢 |
+| A5 融合 dequant+transpose | **位等价** | 同上（需在 A16/A18 关闭的 regime 下测，见下） |
+| A11 WGrad 传 view | **位等价** | 同上，印证 `7ef406f` "五个 shape 位等价"的说法 |
+| A16 融合 DHQ | **位等价** | 同上 |
+| A2 融合 H+Q | **非位等价**，dW 移动极小 | 见下 |
+| A14 philox 跳过 | 单次 RTN 位等价，**RNG 流移动** | 见下 |
+| A21 narrow-N RMSNorm | 有效，两实现 SNR > 40 dB | 只对 N ≤ 512 生效；Qwen3-8B 只有 QK-norm（N=128）命中 |
+| A22 / A23 attention 布局 | gate 有效 | 拦截 `materialize` 与 `seq_major_out` 实测；本机无 Megatron，测试 skip |
 | A19 dual-layout 梯度量化 | **位等价（RTN）/ SR 重抽签** | 见下 |
 | A18 forward 产出 WGrad 算子 | 非位等价，**dW 数值更优** | 见下 |
 
@@ -245,13 +257,35 @@ TRAIN_STEPS=60 SEED=1234 \
 
 **A18：备注为数值收益。**该算子比 backward 重建的少一轮量化，因此 dW 无法逐位相同，且**更接近 BF16 参考**（`tests/ops/test_mxfp4_fwd_wgrad_operand.py` 直接断言 fused 的 SNR 不低于重建路径）。这是一项附带的数值**改善**，作为该优化的备注写进报告即可，不需要当作问题处理。只需在第八节的 loss 断言里把这一级列为预期会动、且方向应当变好。
 
+**A2 / A5 / A16 在 HEAD 默认下根本不可达 —— 必须在早期 rung 的 regime 下测。**这三项都落在"激活的 WGrad 算子"这条链上，而 A18 打开后 forward 直接把这个算子交出来（`wgrad_act is not None`），整条链被短路；A2 还落在梯度算子上，A19 打开后由 dual-layout kernel 接管。所以在 HEAD 上单独关掉 A2 / A5 / A16 中的任何一个，输出**逐位不变**——不是因为它们位等价，而是因为那段代码没被执行。
+
+这一点有两个后果：
+
+1. **测试若不设 base 就是假通过。**`tests/ops/test_mxfp4_ablation_switches.py` 里的 `_EARLY_RUNG`（A18 off + A19 off）就是为此存在，三项的判定全部在这个 base 下取得。
+2. **累积阶梯没问题，leave-one-out 不成立。**按时间顺序 A2(S2) / A5(S5) / A16(S16) 都早于 A18(S18)，在自己的 rung 上是真的在跑；但在 HEAD 上单独 leave-one-out 会得到 0。与 A15 同一类注意事项。
+
+**A2 是这批里唯一非位等价的一项。**`hadamard_transform` 按输入 dtype 返回，所以两趟形式会在中间落一个 BF16 中间量，而融合核把旋转结果留在 FP32 里直接量化。实测（A18/A19 关闭的 base）：dX 逐位相同，dW 不同但对融合结果的 SNR > 30 dB，dW 对精确参考的 SNR 为 12.98 vs 12.97 dB —— 差异在噪声量级。归类为"非位等价但等效"，报告中不作为有损项。
+
+**A14 的足迹是 RNG 流，不是单次结果。**实测：同一输入下 RTN 量化结果在开关两侧**逐位相同**（核根本不读 counter），但 Python RNG 的后续取值不同。所以 A14 这一级 loss 会动，量级等同换随机种子，与 A19 同一措辞处理。
+
+**A18 的数值收益已定量。**dW 对精确参考的 SNR：A18 开 14.22 dB / 关 13.00 dB，即 **+1.22 dB**。`test_fwd_wgrad_operand_improves_dw` 把这条断言钉住（要求领先 > 0.5 dB），否则第八节里"这一级 loss 应当变好"的说法就没有依据。
+
 **A18 与 A19 共用一个 kernel。**`dual_layout_quant_mxfp4` 同时服务 forward 的 WGrad 激活算子（A18）和 backward 的梯度量化（A19），两项各自 gate 不同调用点。测试因此断言"融合调用次数恰好减一、两次调用形式恰好加一"，而不是断言归零——否则会误判开关无效。
 
-**Phase 1 —— `S25 == HEAD`。**S25 的 step time 与 loss 必须与不带任何 env 的 HEAD 在噪声内一致。不一致说明 gate 写错或有开关默认值不等于 HEAD 行为。
+### 7.2 组合本身是一类风险（已踩到一次）
+
+单开关逐个验证**不足以**保证阶梯能跑。S0–S17 这段同时关着 A16 和 A18，激活的 WGrad 算子走的是"解码转置 → 旋转量化"这条 legacy 链，而这条链在任何单开关测试里都不会被执行。第一次跑这个组合直接 **illegal memory access**：legacy 路径先 reshape 再 unswizzle scale，而 swizzle 状态记在 tensor 上，reshape 出来的 view 丢掉了这个标记，unswizzle 静默变成 no-op，kernel 于是把一个 swizzled scale 当行主序读，越界。
+
+修法是先 unswizzle 再 reshape。留下两条保护：
+
+- `_decode_and_transpose` 的注释写明这个顺序不是风格问题；
+- `test_every_switch_off_still_runs`：把 18 个开关**同时**关掉跑一遍 backward，断言 dX/dW 有限。S0 是历史上从未存在过的组合，这条测试是它唯一的自动保护。
+
+**Phase 1 —— `S24 == HEAD`。**S24 的 step time 与 loss 必须与不带任何 env 的 HEAD 在噪声内一致。不一致说明 gate 写错或有开关默认值不等于 HEAD 行为。
 
 **Phase 2 —— `S0` 冒烟。**确认 stripped baseline 能跑完 60 步不 OOM、不 NaN。S0 是历史上从未存在过的组合，这一步是纯粹的新配置风险。若 S0 慢到不可接受，把该 arm 的步数降到 30 并在报告中标注。
 
-**Phase 3 —— 全阶梯。**26 arm × 2 次。
+**Phase 3 —— 全阶梯。**25 arm × 2 次。
 
 **Phase 4 —— 出报告。**对齐参考文档结构：结论速览表 / 阶梯表（单步降幅 + 累计降幅 + 类型）/ 每步细节 / 瓶颈构成变化 / 试过但没采用。
 
@@ -270,13 +304,13 @@ TRAIN_STEPS=60 SEED=1234 \
 | 风险 | 缓解 |
 | --- | --- |
 | legacy 路径不忠实（gate 出来的旧行为并不等于当年的旧行为） | Phase 0 位等价测试；对 **[L]** 类逐个 diff 对应 commit 的旧代码，在测试注释里写明依据的 commit |
-| 累计归因不可交换：重叠收益全归时间上更早的那一项（如权重缓存在原生 linear 之前，会吃掉大部分收益） | 报告中明确写"按引入时间的累计归因，非 Shapley 贡献"；对怀疑重叠的对（A4/A25、A5/A16、A17/A20、A6/A7/A8/A12）补一组 leave-one-out 作为脚注 |
+| 累计归因不可交换：重叠收益全归时间上更早的那一项（如权重缓存在原生 linear 之前，会吃掉大部分收益） | 报告中明确写"按引入时间的累计归因，非 Shapley 贡献"；对怀疑重叠的对（A5/A16、A17/A20、A6/A7/A8/A12）补一组 leave-one-out 作为脚注 |
 | **用现有 `LUMEN_MXFP4_ASM` / `_PRESHUFFLE` 当开关**，autotune 仍从候选表里选中它们 → 得到"关掉也没变慢"的假结论 | A6/A7 的 gate 必须切在 `_mxfp4_choose_backend` 的 `asm_ok` / `shuf_ok` 上；Phase 0 增加一条断言：A6/A7 关闭时 `mxfp4_autotune.record_shape` 记录的 backend 只能是 `plain` |
 | A7 在自己 rung 上降幅 ≈0 被误读为"ASM 无用" | 报告中把 A7 / A12 / A8 三项作为一组解释（4.3），并给出"三者齐备后 ASM 的实际收益"作为组内小结 |
 | autotune cache 跨 arm 污染 | 每 arm 独立 cache 路径 + 每 arm 结束后校验 cache 里记录的 backend 与日志一致 |
 | A19 这一级 loss 会动（SR 重抽签），被误读成"该优化有损" | 报告中预先声明：A19 的 scale 逐位相同、SNR 无差异，扰动等价于换随机种子（7.1） |
 | S0 组合从未存在，可能 OOM 或触发未测过的路径 | Phase 2 冒烟；必要时把 A4 权重缓存提前到 S0（作为 baseline 的一部分）并在报告中标注基线定义 |
-| 26 arm × 2 次的机时超预算 | 先跑 S0 / S6 / S8 / S12 / S20 / S25 六个关键点确认阶梯形状，再补齐中间 arm |
+| 25 arm × 2 次的机时超预算 | 先跑 S0 / S6 / S8 / S12 / S20 / S24 六个关键点确认阶梯形状，再补齐中间 arm |
 | 时间顺序搞错导致某项在自己 rung 上恒为 0（初稿已犯过一次，见 4.4） | arm 顺序一律以 `git log -1 --date=iso` 的精确时间戳为准，不用日期；每个 arm 上线前确认它依赖的代码在前序 arm 已激活 |
 
 ---
@@ -284,8 +318,11 @@ TRAIN_STEPS=60 SEED=1234 \
 ## 十、执行顺序
 
 1. 切分支 `bench/mxfp4-ablation-staircase`（第二节）。
-2. 加 launcher 两个 env 开关（`MXFP4_LUMEN_LINEAR`、`FUSED_ROPE`）+ 18 个 `LUMEN_ABL_*` gate，默认值全部等于 HEAD 行为。其中 A6/A7 切在 `_mxfp4_choose_backend` 的候选表层（见 4.2），不要复用 `LUMEN_MXFP4_ASM` / `_PRESHUFFLE`。已落地 9 个：A6、A7、A9、A10、A15、A17、A18、A19、A20。
-3. 写 Phase 0 测试，跑通位等价判定，据结果冻结最终 arm 列表。
-4. Phase 1 / Phase 2 关卡。
-5. Phase 3 全阶梯，结果落 `examples/qwen3/results/ablation/`。
-6. Phase 4 出报告。
+2. ~~加 launcher 一个 env 开关（`FUSED_ROPE`）+ 18 个 `LUMEN_ABL_*` gate~~ —— **已完成**，18 个开关全部落地，默认值等于 HEAD 行为。其中 A6/A7 切在 `_mxfp4_choose_backend` 的候选表层（见 4.2），没有复用 `LUMEN_MXFP4_ASM` / `_PRESHUFFLE`。
+3. ~~写 Phase 0 测试~~ —— **已完成**，38 条测试（`test_mxfp4_ablation_switches.py` 26 + `test_ablation_ladder_arms.py` 10 + `test_ablation_shared_kernel_switches.py` 2 passed / 2 skipped）。判定见 7.1，arm 列表已冻结为 S0–S24。
+4. ~~写 runner~~ —— **已完成**：`examples/qwen3/ablation/arms.sh` + `run_ladder.sh`，env 解析已 dry-run 校验（S0 全关、S12 中段、S24 等于 HEAD 默认）。
+5. Phase 1 / Phase 2 关卡（需要 8 卡机时，尚未跑）。
+6. Phase 3 全阶梯，结果落 `examples/qwen3/results/ablation/`。
+7. Phase 4 出报告。
+
+**当前状态：**代码与 runner 侧的准备工作全部完成，下一步是占机跑 Phase 1（`S24 == HEAD`）与 Phase 2（`S0` 冒烟），两关通过后再开 Phase 3。

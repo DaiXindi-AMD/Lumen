@@ -44,6 +44,7 @@ from lumen.ops.attention.attention import (
     attention_fp8_quant,
 )
 from lumen.quantize import is_aiter_available
+from lumen.utils import ablation
 
 __all__ = [
     "LumenDotProductAttention",
@@ -177,7 +178,11 @@ class LumenDotProductAttention(MegatronModule):
         Returns:
             context: [sq, b, hp]   (hp = np * hn)
         """
-        materialize = self.backend != "aiter_csrc" or self.cp_size > 1
+        materialize = (
+            self.backend != "aiter_csrc"
+            or self.cp_size > 1
+            or not ablation.enabled("ATTN_QKV_VIEWS")
+        )
         q = _sbhd_to_bshd(query, materialize)
         k = _sbhd_to_bshd(key, materialize)
         v = _sbhd_to_bshd(value, materialize)
@@ -236,7 +241,9 @@ class LumenDotProductAttention(MegatronModule):
                 grad_quant_type=self.grad_quant_type,
                 # The result feeds Megatron's [s, b, ...] residual stream, so
                 # ask the kernel to write it that way and skip the transpose.
-                seq_major_out=cp_param_bundle is None,
+                seq_major_out=(
+                    cp_param_bundle is None and ablation.enabled("ATTN_SEQ_MAJOR")
+                ),
             )
 
         # out: [b, sq, np, hn] -> [sq, b, np*hn]

@@ -253,6 +253,9 @@ fi
 # the loss curve inside the run-to-run noise floor (two identical baselines differ
 # by 0.25% mean, the native arm by 0.37%). Numbers from before this date were
 # measured on the patched-Megatron path and are 5.6% slower for that reason alone.
+# The MXFP4 ablation ladder deliberately has no switch for it: turning it off also
+# moves where the tail-BF16 policy lands, so the two paths are different recipes
+# rather than two rungs (docs/mxfp4_ablation_plan.md §4).
 #
 # The FP8 arm reproduces the recipe the BF16/FP8 reference report measured:
 # delayed scaling, amax history 1024, algo max, `hybrid`. Hybrid needs an AITER
@@ -267,15 +270,11 @@ case "${PRECISION}" in
             --linear-fp8-format mxfp4
             --linear-fp8-scaling blockwise
             --linear-fp8-block-size 32
+            --lumen-linear
             --first-last-layers-bf16
             --num-layers-at-start-in-bf16 0
             --num-layers-at-end-in-bf16 "${TAIL_BF16}"
         )
-        # MXFP4_LUMEN_LINEAR=0 goes back to Megatron's own parallel linears under
-        # the quantize patch, which is what MXFP4 ran on before 8/10. It is the
-        # ablation arm for that switch (docs/mxfp4_ablation_plan.md A25) and is on
-        # everywhere else.
-        [ "${MXFP4_LUMEN_LINEAR:-1}" = "1" ] && QUANT_ARGS+=(--lumen-linear)
         ;;
     fp8)
         QUANT_ARGS=(
