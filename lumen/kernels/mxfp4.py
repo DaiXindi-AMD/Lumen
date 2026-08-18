@@ -600,6 +600,7 @@ def _fused_hadamard_quant_mxfp4_kernel(
     QUANT_BLOCK_SIZE: tl.constexpr,
     USE_SR: tl.constexpr,
     USE_ASM: tl.constexpr,
+    USE_MFMA: tl.constexpr = True,
 ):
     """BF16 → Hadamard-16 rotate (in-register) → packed MXFP4 + E8M0 scales.
 
@@ -609,6 +610,10 @@ def _fused_hadamard_quant_mxfp4_kernel(
     A BF16 input takes the matrix-unit rotation, matching what the dual-layout
     and WGrad-activation quantizers do so the three agree bit for bit; an FP32
     input keeps the butterfly, which does not have to narrow the operand.
+
+    USE_MFMA=False sends a BF16 input down the butterfly too, which is what this
+    kernel did before the rotation moved to the matrix unit. It exists to measure
+    that move (docs/mxfp4_ablation_plan.md A15) and is on otherwise.
     """
     pid_m = tl.program_id(axis=0)
     pid_n = tl.program_id(axis=1)
@@ -626,7 +631,7 @@ def _fused_hadamard_quant_mxfp4_kernel(
     x_in = tl.load(x_ptr + offs_x)
 
     # --- Hadamard-16 in registers (zero memory traffic) ---
-    if x_in.type.element_ty == tl.bfloat16:
+    if USE_MFMA and x_in.type.element_ty == tl.bfloat16:
         x = _hadamard16_mfma(x_in, hmat_ptr, ROWS=ROWS).reshape(BLOCK_M, BLOCK_N)
     else:
         sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)
@@ -691,6 +696,7 @@ def _dual_layout_quant_mxfp4_kernel(
     NUM_SCALE_COLS_B: tl.constexpr,
     SHUFFLE_B: tl.constexpr = False,
     NUM_PACKED_COLS_B: tl.constexpr = 0,
+    USE_MFMA: tl.constexpr = True,
 ):
     """One tile read of x → MXFP4 along n *and* Hadamard-rotated MXFP4 along m.
 
@@ -755,7 +761,7 @@ def _dual_layout_quant_mxfp4_kernel(
 
     # --- B: transposed, Hadamard-16 along m, quant blocks along m ---
     ROWS_B: tl.constexpr = BLOCK_N * (BLOCK_M // G)
-    if x_in.type.element_ty == tl.bfloat16:
+    if USE_MFMA and x_in.type.element_ty == tl.bfloat16:
         xt = _hadamard16_mfma(tl.trans(x_in), hmat_ptr, ROWS=ROWS_B).reshape(BLOCK_N, BLOCK_M)
     else:
         sign = tl.load(sign_ptr + tl.arange(0, G)).to(tl.float32)

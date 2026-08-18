@@ -179,6 +179,77 @@ def test_scale_pad_skip_switch_is_bit_exact():
     torch.testing.assert_close(skipped, copied, atol=0, rtol=0)
 
 
+@_CUDA
+@_GFX950
+def test_mfma_h16_switch_routes_the_rotation_off_the_matrix_unit():
+    """Only the MFMA path reads the folded matrix; the butterfly reads the signs.
+
+    A zeroed matrix therefore has to blank the output with the switch on and be
+    inert with it off. Without this the bit-exactness test below would also pass
+    on a switch that was never wired to anything.
+    """
+    import lumen.ops.quantize.linear as lin
+    from lumen.ops.quantize.ops import (
+        _RHT_MATRIX_ATTR, _rht_matrix_bf16, hadamard_quant_mxfp4,
+    )
+
+    torch.manual_seed(3)
+    x = torch.randn(512, 512, device="cuda", dtype=torch.bfloat16)
+    sign = lin._get_mxfp4_rht_sign(x.device)
+    g = lin._MXFP4_RHT_G
+
+    def _quant():
+        return hadamard_quant_mxfp4(x, sign, block_size=32, g=g, use_sr=False)[0]
+
+    base = {}
+    for on in (True, False):
+        with ablation.overridden(MFMA_H16=on):
+            base[on] = _quant()
+
+    good = _rht_matrix_bf16(sign, g).clone()
+    setattr(sign, _RHT_MATRIX_ATTR, torch.zeros_like(good))
+    try:
+        with ablation.overridden(MFMA_H16=True):
+            assert bool((_quant() == 0).all()), "the matrix unit did not read hmat"
+        with ablation.overridden(MFMA_H16=False):
+            torch.testing.assert_close(_quant(), base[False], atol=0, rtol=0)
+    finally:
+        setattr(sign, _RHT_MATRIX_ATTR, good)
+
+
+@_CUDA
+@_GFX950
+def test_mfma_h16_switch_is_bit_exact():
+    """Both forms sum the same 16 exact products, and E2M1 is coarse enough.
+
+    The orders differ, so the FP32 sums may differ in their last bits, but the
+    two-mantissa-bit output grid does not resolve that -- measured bit-equal over
+    shapes, seeds and a 1e4 row-magnitude spread.
+    """
+    import lumen.ops.quantize.linear as lin
+    from lumen.ops.quantize.ops import hadamard_quant_mxfp4
+
+    sign = lin._get_mxfp4_rht_sign(torch.device("cuda"))
+    g = lin._MXFP4_RHT_G
+    for seed in (0, 42):
+        for shape in ((256, 256), (512, 1024)):
+            for spread in (1.0, 1e4):
+                torch.manual_seed(seed)
+                x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+                x = x * (spread ** torch.rand(shape[0], 1, device="cuda")).bfloat16()
+                got = {}
+                for on in (True, False):
+                    with ablation.overridden(MFMA_H16=on):
+                        got[on] = hadamard_quant_mxfp4(
+                            x, sign, block_size=32, g=g, use_sr=False,
+                        )
+                for a, b in zip(got[True], got[False]):
+                    torch.testing.assert_close(
+                        a, b, atol=0, rtol=0,
+                        msg=f"seed={seed} shape={shape} spread={spread:g}",
+                    )
+
+
 def _snr(ref, got):
     err = (ref.float() - got.float()).pow(2).sum()
     if err == 0:

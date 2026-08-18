@@ -62,9 +62,10 @@ _REGISTRY = {
         "1be93f8",
         "the quantizer draws philox values RTN rounding never reads",
     ),
-    # The H16 butterfly's MFMA form is deliberately absent: the Hadamard is part
-    # of the recipe, so it is pinned to one setting across every arm rather than
-    # ablated (docs/mxfp4_ablation_plan.md section 4.5).
+    "MFMA_H16": (
+        "1be93f8",
+        "the H16 rotation runs as the in-register butterfly, not on the matrix unit",
+    ),
     "FUSED_DHQ": (
         "1be93f8",
         "dequant, Hadamard and quantize run as separate kernels",

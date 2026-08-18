@@ -72,7 +72,7 @@ HEAD 上 `convert_to_mxfp4` / `convert_from_mxfp4` / `transpose_packed_fp4` / `h
 | A12 | 08-03 21:29 | `332a403` | Qwen3-8B 专用 A4W4 tuned 表 | **E** | `AITER_CONFIG_GEMM_A4W4` 指向不含本模型 shape 的表 | `train_pretrain.sh:325` | 0 | 无损 |
 | A13 | 08-03 21:29 | `332a403` | 融合 RoPE | launcher | `FUSED_ROPE=0` (新增) | `train_pretrain.sh:207` | 极低 | 无损 |
 | A14 | 08-06 00:01:22 | `1be93f8` | 跳过 RTN 下用不到的 philox 采样 | N | `LUMEN_ABL_RTN_SKIP_PHILOX` | `ops.py` 量化核调用 | 低 | 需验证位等价 |
-| ~~A15~~ | 08-06 00:01:22 | `1be93f8` | MFMA 实现的 H16 butterfly | **不设 arm，统一设置** | —— | `hadamard_transform:898` | 0 | 见 4.4 |
+| A15 | 08-06 00:01:22 | `1be93f8` | H16 旋转搬到矩阵单元（MFMA） | N | `LUMEN_ABL_MFMA_H16` | `kernels/mxfp4.py:630/765` | 低 | 无损（**已实测位等价**，见 7.1） |
 | A16 | 08-06 00:01:22 | `1be93f8` | 融合 dequant+Hadamard+quant | N | `LUMEN_ABL_FUSED_DHQ` | `dequant_hadamard_quant_mxfp4:1152` | 低 | 无损 |
 | A17 | 08-06 00:01:22 | `1be93f8` | 缓存/融合 scale swizzle | N | `LUMEN_ABL_SWIZZLE_CACHE` | `_shuffle_mxfp4_scale`, `_cached_weight_operands:1381` | 低 | 无损 |
 | A18 | 08-06 00:01:22 | `1be93f8` | forward 直接产出 WGrad 激活算子 | **N（legacy 分支已 live）** | `LUMEN_ABL_FWD_WGRAD_OPERAND` | `linear.py:1869` 产出、`:2475` legacy | 极低 | 换显存 +6.4 GiB；**备注：dW 少一轮量化，数值更优**（7.1） |
@@ -115,11 +115,19 @@ ASM 能否真正被用到，取决于三件事同时成立：
 
 结论：按时间顺序，**A7 在自己的 rung 上的降幅预计接近 0**，真正的跳变会出现在 A12（tuned 表）和 A8（autotune）。报告里必须写明这一点，否则一个 ≈0 的 rung 会被误读成"ASM 没用"。同理，A9（scale padding 跳过）和 A10（wide shuffle）优化的都是 A6/A7 两个 backend 的 prologue，它们在时间上正好落在 A6/A7 之后，依赖自动满足——这也是 4.5 那个顺序错误必须修正的原因。
 
-### 4.4 A15（MFMA H16 butterfly）统一设置，不设 arm
+### 4.4 A15（MFMA H16）是 arm，但它的作用范围只有一个 kernel
 
-Hadamard 本身属于 **recipe**（`745de8f` 定的 H16 + 确定性），A15 只是它的 MFMA 实现。按"recipe 一律 pin 在当前状态"的规则，H16 butterfly 在**所有 arm 上统一用 HEAD 的 MFMA 实现**，不做消融。相应地不注册 `LUMEN_ABL_MFMA_H16` 开关，`lumen/utils/ablation.py` 里以注释记下这个决定，避免后来者以为漏了一项。
+要分清 **recipe 与实现**：`745de8f` 定下的"用 H16 旋转"属于 recipe，一律 pin；而 `1be93f8` 把这个旋转从**寄存器内 butterfly 搬到矩阵单元**，是同一个线性映射的两种实现，是纯性能改动，**应当作为 rung**。两者算的是同一个 `diag(sign) @ H16 / sqrt(16)`：MFMA 路径把符号折进矩阵一次 `tl.dot` 做完，butterfly 路径先乘符号再走 4 级蝶形。
 
-这样也顺带消掉了原先最大的一处不确定性：A15 是否位等价不再影响 arm 列表——它不在阶梯上，其成本计入 `S0` 基线。若日后要单独评估 Hadamard 实现的性能，属于 recipe-cost 报告，不是本消融。
+作用范围有一处容易记错。`_hadamard16_butterfly` 并没有被 `1be93f8` 删掉，它至今是 FP32 输入的分支，选择方式是 `if x_in.type.element_ty == tl.bfloat16`——**不是** env 开关。所以 gate 的做法是给 kernel 加 `USE_MFMA: tl.constexpr`，关掉时让 BF16 输入也走 butterfly，这正是该 kernel 在 `1be93f8` 之前的行为。三个调用点的归属不同：
+
+| kernel | `1be93f8` 之前 | 归属 |
+| --- | --- | --- |
+| `_fused_hadamard_quant_mxfp4_kernel` | 已存在，用 butterfly | **A15 本体**，gate 于此 |
+| `_dual_layout_quant_mxfp4_kernel` | 同一 commit 新建 | 随 A15 一起 gate（见下） |
+| `_dequant_hadamard_quant_mxfp4_kernel` | 同一 commit 新建，**从无 butterfly** | 属 A16，其 legacy 是两趟 dequant+quant，不是 butterfly |
+
+dual-layout kernel 跟着 A15 一起切，是为了守住它 docstring 里那条不变量——三个 quantizer 都走矩阵单元所以"逐位一致"；只切一个会让它们在 A15 关闭时互相不一致。第三个 kernel 生来就只有 MFMA，给它造一个 butterfly 分支等于伪造历史，因此不做；按累积顺序 A15 早于 A16，`S15` 上该 kernel 还没被启用，不影响阶梯。**这也意味着该开关只对累积阶梯成立，不适用于在 HEAD 上单独 leave-one-out A15。**
 
 ### 4.5 07-29 的时间顺序（已修正）
 
@@ -143,7 +151,7 @@ Hadamard 本身属于 **recipe**（`745de8f` 定的 H16 + 确定性），A15 只
 
 ## 五、实验矩阵（cumulative add-one-in）
 
-25 个 arm（`S0` + A1–A25 去掉不设 arm 的 A15）。`S0` 全关；每个 `Sn` 比上一 arm 多打开一项。`S24` 应与不带任何 env 的 HEAD 一致。
+26 个 arm（`S0` + A1–A25）。`S0` 全关；`Sn` = `S(n-1)` + 打开 `An`。`S25` 应与不带任何 env 的 HEAD 一致。
 
 `S0` 的 stripped baseline = 全部 `LUMEN_ABL_*=0` + `LUMEN_FAST_QUANT_DISPATCH=0` + `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` + `LUMEN_MXFP4_AUTOTUNE=0` + `LUMEN_GC_FREEZE=0` + `AITER_CONFIG_GEMM_A4W4=<不含本模型 shape 的表>` + `FUSED_ROPE=0` + `MXFP4_LUMEN_LINEAR=0`。此时 MXFP4 GEMM 只有 plain Triton 一条路（A6/A7 关掉后候选表里只剩 `plain`）。
 
@@ -164,20 +172,19 @@ Hadamard 本身属于 **recipe**（`745de8f` 定的 H16 + 确定性），A15 只
 | S12 | A12 tuned A4W4 表 | `AITER_CONFIG_GEMM_A4W4=<qwen3_8b tuned>` |
 | S13 | A13 融合 RoPE | `FUSED_ROPE=1` |
 | S14 | A14 philox 跳过 | `LUMEN_ABL_RTN_SKIP_PHILOX=1` |
-| S15 | A16 融合 DHQ | `LUMEN_ABL_FUSED_DHQ=1` |
-| S16 | A17 swizzle 缓存 | `LUMEN_ABL_SWIZZLE_CACHE=1` |
-| S17 | A18 forward 产出 WGrad 算子 | `LUMEN_ABL_FWD_WGRAD_OPERAND=1` |
-| S18 | A19 dual-layout 量化 | `LUMEN_ABL_DUAL_LAYOUT=1` |
-| S19 | A20 quantizer 产出 shuffle | `LUMEN_ABL_QUANT_EMIT_SHUFFLE=1` |
-| S20 | A21 narrow-N RMSNorm | `LUMEN_ABL_NARROW_N_RMSNORM=1` |
-| S21 | A22 QKV view | `LUMEN_ABL_ATTN_QKV_VIEWS=1` |
-| S22 | A23 seq-major attention | `LUMEN_ABL_ATTN_SEQ_MAJOR=1` |
-| S23 | A24 `gc.freeze` | `LUMEN_GC_FREEZE=1` |
-| S24 | A25 原生 parallel linear | `MXFP4_LUMEN_LINEAR=1` → 等于 HEAD 默认 |
+| S15 | A15 MFMA H16 | `LUMEN_ABL_MFMA_H16=1` |
+| S16 | A16 融合 DHQ | `LUMEN_ABL_FUSED_DHQ=1` |
+| S17 | A17 swizzle 缓存 | `LUMEN_ABL_SWIZZLE_CACHE=1` |
+| S18 | A18 forward 产出 WGrad 算子 | `LUMEN_ABL_FWD_WGRAD_OPERAND=1` |
+| S19 | A19 dual-layout 量化 | `LUMEN_ABL_DUAL_LAYOUT=1` |
+| S20 | A20 quantizer 产出 shuffle | `LUMEN_ABL_QUANT_EMIT_SHUFFLE=1` |
+| S21 | A21 narrow-N RMSNorm | `LUMEN_ABL_NARROW_N_RMSNORM=1` |
+| S22 | A22 QKV view | `LUMEN_ABL_ATTN_QKV_VIEWS=1` |
+| S23 | A23 seq-major attention | `LUMEN_ABL_ATTN_SEQ_MAJOR=1` |
+| S24 | A24 `gc.freeze` | `LUMEN_GC_FREEZE=1` |
+| S25 | A25 原生 parallel linear | `MXFP4_LUMEN_LINEAR=1` → 等于 HEAD 默认 |
 
-A15 不占 arm（4.4），所以 S15 起与 A 编号错开一位；A 编号绑定 commit，不重排。
-
-**可选合并（若 arm 数需要压缩到参考报告的 ~14 行）：**A14/A16–A20 合并为"operand-layout 组"（1 个 arm），A21–A23 合并为"shared kernel 组"（1 个 arm）。**A6/A7/A8 不可合并**——把它们并回单一 "autotune" arm 正是 4.1 要避免的错误归因。建议先全跑，报告里再决定合并展示。
+**可选合并（若 arm 数需要压缩到参考报告的 ~14 行）：**A14–A20 合并为"operand-layout 组"（1 个 arm），A21–A23 合并为"shared kernel 组"（1 个 arm）。**A6/A7/A8 不可合并**——把它们并回单一 "autotune" arm 正是 4.1 要避免的错误归因。建议先全跑，报告里再决定合并展示。
 
 ---
 
@@ -209,14 +216,14 @@ TRAIN_STEPS=60 SEED=1234 \
 **Phase 0 —— 开关忠实性。**按 `tests/ops/` 约定，为每个新增 `LUMEN_ABL_*` 加一条测试：同一输入下 legacy 路径 vs 优化路径，用 `compute_snr` 比对。
 
 - 声明"无损"的项（A1、A5–A13、A16–A24）要求 **位等价**（`torch.testing.assert_close` 零容差），不满足则该项必须重新归类。A6/A7/A8/A12 尤其要验：代码注释声称三个 MXFP4 backend 位位相同，这条断言是整条 GEMM 阶梯"纯速度"定性的全部依据。
-- 标注"需验证位等价"的项（A2、A14）单独跑：A14 若跳过 philox 采样会改变全局 RNG 消耗序列，需确认在 dropout=0 的本配置下不影响任何下游采样。A15 已按 4.4 统一设置，不再需要这项判定。
+- 标注"需验证位等价"的项（A2、A14）单独跑：A14 若跳过 philox 采样会改变全局 RNG 消耗序列，需确认在 dropout=0 的本配置下不影响任何下游采样。A15 已判定位等价（7.1）。
 - **A6/A7 的 gate 需额外一条集成断言**：关闭时 `mxfp4_autotune.record_shape` 记录的 backend 必须只有 `plain`（见 4.2）。
 - **`38414e0` 的代码判定已完成**：纯 refactor，不入阶梯（见第四节末）。
 - 命名照 `test_<op>_<variant>` / `test_matches_reference`。
 
 ### 7.1 Phase 0 已得结论
 
-分支 `bench/mxfp4-ablation-staircase`，开关模块 `lumen/utils/ablation.py`（17 个开关，默认全开，未注册名字直接抛 `KeyError` —— 打错的开关静默什么都不做，会产出一个测错东西的 arm），测试 `tests/ops/test_mxfp4_ablation_switches.py`（16 passed，含 gfx950 实机）。
+分支 `bench/mxfp4-ablation-staircase`，开关模块 `lumen/utils/ablation.py`（18 个开关，默认全开，未注册名字直接抛 `KeyError` —— 打错的开关静默什么都不做，会产出一个测错东西的 arm），测试 `tests/ops/test_mxfp4_ablation_switches.py`（18 passed，含 gfx950 实机）。
 
 | 项 | 判定 | 依据 |
 | --- | --- | --- |
@@ -224,8 +231,13 @@ TRAIN_STEPS=60 SEED=1234 \
 | A9 scale padding 跳过 | **位等价** | `test_scale_pad_skip_switch_is_bit_exact`，gfx950 实跑，`atol=0 rtol=0` |
 | A10 向量化 wide shuffle | **位等价** | `test_vec_shuffle_switch_is_bit_exact`，同上 |
 | A17 swizzle 缓存层 | **位等价** | 关闭后每次重建，产出与缓存值逐位相同 |
+| A15 MFMA H16 | **位等价** | 见下 |
 | A19 dual-layout 梯度量化 | **位等价（RTN）/ SR 重抽签** | 见下 |
 | A18 forward 产出 WGrad 算子 | 非位等价，**dW 数值更优** | 见下 |
+
+**A15：实测位等价，且开关确实切换了实现。**MFMA 与 butterfly 在 4 组 shape × 2 组种子 × 两种动态范围（含 1e4 的行幅度差）下，data 与 scale **全部逐位相同**。两者把同样 16 个精确乘积按不同顺序求和，FP32 末位可能不同，但 E2M1 只有 2 位尾数，这点差异分辨不出来——所以这是**实测**结论，不是可证明的恒等式；换 g 或换量化格式需重测。
+
+位等价本身有个陷阱：**一个根本没接上的开关也会"位等价"**。因此另有一条测试反过来验证开关生效——MFMA 路径读折叠矩阵 `hmat`，butterfly 路径读 `sign`，所以把 `hmat` 置零必须在开关打开时把输出清零、在关闭时毫无影响。两条测试要一起看才有意义。
 
 **A19：数学一致，只有 SR 抽签不同。**实测（gfx950，同一 philox seed/offset）：`use_sr=False` 时 fused 与两次调用的 data 与 scale **全部逐位相同**；`use_sr=True` 时 **scale 仍逐位相同**，只有约 54% 的已舍入尾数不同——融合核按自己的 tiling 把 philox counter 映射到元素，两个独立核的映射不同。对精确旋转结果取 SNR，三个随机种子下两种形式相差均在 ±0.05 dB 内（约 16.0 dB），**没有哪一种舍得更好**。
 
@@ -235,11 +247,11 @@ TRAIN_STEPS=60 SEED=1234 \
 
 **A18 与 A19 共用一个 kernel。**`dual_layout_quant_mxfp4` 同时服务 forward 的 WGrad 激活算子（A18）和 backward 的梯度量化（A19），两项各自 gate 不同调用点。测试因此断言"融合调用次数恰好减一、两次调用形式恰好加一"，而不是断言归零——否则会误判开关无效。
 
-**Phase 1 —— `S24 == HEAD`。**S24 的 step time 与 loss 必须与不带任何 env 的 HEAD 在噪声内一致。不一致说明 gate 写错或有开关默认值不等于 HEAD 行为。
+**Phase 1 —— `S25 == HEAD`。**S25 的 step time 与 loss 必须与不带任何 env 的 HEAD 在噪声内一致。不一致说明 gate 写错或有开关默认值不等于 HEAD 行为。
 
 **Phase 2 —— `S0` 冒烟。**确认 stripped baseline 能跑完 60 步不 OOM、不 NaN。S0 是历史上从未存在过的组合，这一步是纯粹的新配置风险。若 S0 慢到不可接受，把该 arm 的步数降到 30 并在报告中标注。
 
-**Phase 3 —— 全阶梯。**25 arm × 2 次。
+**Phase 3 —— 全阶梯。**26 arm × 2 次。
 
 **Phase 4 —— 出报告。**对齐参考文档结构：结论速览表 / 阶梯表（单步降幅 + 累计降幅 + 类型）/ 每步细节 / 瓶颈构成变化 / 试过但没采用。
 
@@ -264,7 +276,7 @@ TRAIN_STEPS=60 SEED=1234 \
 | autotune cache 跨 arm 污染 | 每 arm 独立 cache 路径 + 每 arm 结束后校验 cache 里记录的 backend 与日志一致 |
 | A19 这一级 loss 会动（SR 重抽签），被误读成"该优化有损" | 报告中预先声明：A19 的 scale 逐位相同、SNR 无差异，扰动等价于换随机种子（7.1） |
 | S0 组合从未存在，可能 OOM 或触发未测过的路径 | Phase 2 冒烟；必要时把 A4 权重缓存提前到 S0（作为 baseline 的一部分）并在报告中标注基线定义 |
-| 25 arm × 2 次的机时超预算 | 先跑 S0 / S6 / S8 / S12 / S19 / S24 六个关键点确认阶梯形状，再补齐中间 arm |
+| 26 arm × 2 次的机时超预算 | 先跑 S0 / S6 / S8 / S12 / S20 / S25 六个关键点确认阶梯形状，再补齐中间 arm |
 | 时间顺序搞错导致某项在自己 rung 上恒为 0（初稿已犯过一次，见 4.4） | arm 顺序一律以 `git log -1 --date=iso` 的精确时间戳为准，不用日期；每个 arm 上线前确认它依赖的代码在前序 arm 已激活 |
 
 ---
@@ -272,7 +284,7 @@ TRAIN_STEPS=60 SEED=1234 \
 ## 十、执行顺序
 
 1. 切分支 `bench/mxfp4-ablation-staircase`（第二节）。
-2. 加 launcher 两个 env 开关（`MXFP4_LUMEN_LINEAR`、`FUSED_ROPE`）+ 17 个 `LUMEN_ABL_*` gate，默认值全部等于 HEAD 行为。其中 A6/A7 切在 `_mxfp4_choose_backend` 的候选表层（见 4.2），不要复用 `LUMEN_MXFP4_ASM` / `_PRESHUFFLE`。已落地 8 个：A6、A7、A9、A10、A17、A18、A19、A20。
+2. 加 launcher 两个 env 开关（`MXFP4_LUMEN_LINEAR`、`FUSED_ROPE`）+ 18 个 `LUMEN_ABL_*` gate，默认值全部等于 HEAD 行为。其中 A6/A7 切在 `_mxfp4_choose_backend` 的候选表层（见 4.2），不要复用 `LUMEN_MXFP4_ASM` / `_PRESHUFFLE`。已落地 9 个：A6、A7、A9、A10、A15、A17、A18、A19、A20。
 3. 写 Phase 0 测试，跑通位等价判定，据结果冻结最终 arm 列表。
 4. Phase 1 / Phase 2 关卡。
 5. Phase 3 全阶梯，结果落 `examples/qwen3/results/ablation/`。

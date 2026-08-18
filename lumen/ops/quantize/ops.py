@@ -47,6 +47,8 @@ except (ImportError, ModuleNotFoundError):
     _convert_to_mxfp8_kernel = None  # type: ignore[assignment]
 from torch.library import triton_op, wrap_triton
 
+from lumen.utils import ablation
+
 logger = logging.getLogger(__name__)
 
 
@@ -1016,6 +1018,7 @@ def hadamard_quant_mxfp4(
         QUANT_BLOCK_SIZE=block_size,
         USE_SR=use_sr,
         USE_ASM=use_asm,
+        USE_MFMA=ablation.enabled("MFMA_H16"),
     )
 
     out_shape = (*orig_shape[:-1], N // 2)
@@ -1144,6 +1147,7 @@ def dual_layout_quant_mxfp4(
         NUM_SCALE_COLS_B=n_scale_b,
         SHUFFLE_B=shuffle_col,
         NUM_PACKED_COLS_B=M // 2,
+        USE_MFMA=ablation.enabled("MFMA_H16"),
     )
 
     return row_fp4, row_scales, col_fp4, col_scales
