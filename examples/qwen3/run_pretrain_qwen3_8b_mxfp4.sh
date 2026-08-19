@@ -80,7 +80,7 @@ RUNTIME_ENV=(
 # container and every rung would measure the same thing.
 while IFS= read -r _abl_kv; do
     [ -n "${_abl_kv}" ] && RUNTIME_ENV+=("${_abl_kv}")
-done < <(env | grep -E '^(LUMEN_ABL_[A-Z0-9_]+|FUSED_ROPE|LUMEN_GC_FREEZE|LUMEN_MXFP4_AUTOTUNE|LUMEN_MXFP4_DISABLE_WEIGHT_CACHE)=' || true)
+done < <(env | grep -E '^(LUMEN_ABL_[A-Z0-9_]+|FUSED_ROPE|LUMEN_GC_FREEZE|LUMEN_MXFP4_AUTOTUNE|LUMEN_MXFP4_DISABLE_WEIGHT_CACHE|LOG_TAG)=' || true)
 
 mkdir -p "${RESULTS_DIR}"
 

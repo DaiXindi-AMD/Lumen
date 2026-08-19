@@ -42,7 +42,15 @@ DRY_RUN=0
 REPEATS="${REPEATS:-2}"
 TRAIN_STEPS="${TRAIN_STEPS:-60}"
 SEED="${SEED:-1234}"
+LAUNCH="${LAUNCH:-native}"
 OUT_ROOT="${OUT_ROOT:-${QWEN3_DIR}/results/ablation}"
+
+# Shared on purpose, and not the per-arm directory. train_pretrain.sh keeps the
+# mock corpus under RESULTS_ROOT/mock_data, so giving each arm its own results
+# root would regenerate a ~520 MB dataset per run and hand every arm its own
+# corpus -- the comparison has to be paired on identical data. Arms are kept apart
+# by LOG_TAG, which is what it is there for.
+SHARED_RESULTS="${SHARED_RESULTS:-${QWEN3_DIR}/results}"
 
 ARMS=()
 for arg in "$@"; do
@@ -101,13 +109,33 @@ run_one_arm() {  # <n> <repeat>
     printf '%s\n' "${env_pairs[@]}" > "${out}/ablation_env.txt"
     abl_arm_summary "${n}" > "${out}/arm.txt"
 
+    local log_tag="abl_${arm}_r${rep}"
+    local train_log="${SHARED_RESULTS}/lumen_qwen3_8b_${log_tag}_mxfp4.log"
+    rm -f "${train_log}"
+
+    # The autotune cache stays per arm: it records which backend won under
+    # whatever kernels were reachable then, so sharing it lets an early arm pin
+    # "use Triton" for every shape and the whole ladder inherits it.
+    set +e
     env "${env_pairs[@]}" \
-        RESULTS_DIR="${out}" \
+        LAUNCH="${LAUNCH}" \
+        RESULTS_DIR="${SHARED_RESULTS}" \
+        LOG_TAG="${log_tag}" \
         LUMEN_MXFP4_AUTOTUNE_CACHE="${out}/autotune.json" \
         TRAIN_STEPS="${TRAIN_STEPS}" \
         SEED="${SEED}" \
         bash "${QWEN3_DIR}/run_pretrain_qwen3_8b_mxfp4.sh" \
-        2>&1 | tee "${out}/console.log"
+        > "${out}/console.log" 2>&1
+    local rc=$?
+    set -e
+
+    [ -f "${train_log}" ] && cp "${train_log}" "${out}/train.log"
+    if [ "${rc}" != "0" ]; then
+        echo "  FAILED rc=${rc}, see ${out}/console.log"
+        echo "${rc}" > "${out}/FAILED"
+        return 0        # keep going: one bad arm should not end the ladder
+    fi
+    python "${SCRIPT_DIR}/summarize.py" --arm-dir "${out}"
 }
 
 for arm in "${ARMS[@]}"; do
