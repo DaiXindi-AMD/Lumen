@@ -1,0 +1,1 @@
++ A2 WGrad rotates and quantizes in one kernel

@@ -1,0 +1,14 @@
+{
+  "iterations": 60,
+  "measured": 45,
+  "median_ms": 8915.0,
+  "p25_ms": 8887.9,
+  "p75_ms": 8981.9,
+  "max_ms": 13957.4,
+  "spread_pct": 1.1,
+  "mean_ms": 9266.9,
+  "mean_over_median": 1.039,
+  "slow_steps": 4,
+  "peak_mem_frac": 0.618,
+  "final_loss": 2.270607
+}

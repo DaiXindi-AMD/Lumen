@@ -1,0 +1,1 @@
++ A22 attention reads strided QKV views

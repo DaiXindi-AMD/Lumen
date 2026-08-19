@@ -1,0 +1,1 @@
++ A16 fused dequant+Hadamard+quant
