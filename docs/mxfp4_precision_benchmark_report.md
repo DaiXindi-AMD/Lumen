@@ -19,7 +19,9 @@ pins rather than the stock ROCm one this machine had installed, which is what
 made the reference report's `hybrid` recipe runnable here at all. With that
 recipe FP8 delayed is worth **1.09x-1.14x** over BF16 — against 1.00x-1.04x for
 the `fp8_e4m3` recipe the first version of this report was forced to use, and
-1.38x-1.43x on MI325X. §8.1 is what was wrong and §9 is the gap that remains.
+1.38x-1.43x on MI325X. Re-running everything inside the coworker's own Docker
+image (next section) reaches 1.15x-1.20x, which is the best seen on gfx950 and
+still 15%-19% short. §8.1 is what was wrong and §9 is the gap that remains.
 
 Both results were re-measured over 350 steps on real C4 text with a held-out
 validation set (§12) and came back to three digits, so neither is an artefact of
@@ -267,6 +269,57 @@ property of hybrid: an E4M3 recipe routed through the transposed operand should
 recover the same 1.098x, and that is worth testing before anyone concludes hybrid
 is the faster arithmetic.
 
+### Why the three MXFP4 ratios differ, and why that is not a kernel result
+
+MXFP4 spans 1.406x to 1.524x across the three models, and the ordering is stable
+across the 50-step and 350-step matrices. It is worth saying what that spread is,
+because the natural reading — that the kernels suit Llama2-7B better than
+Qwen3-8B — is not what the numbers say.
+
+MXFP4 accelerates the transformer linears outside the BF16 tail and nothing else.
+Attention, the norms and the LM head stay BF16 in every arm, so each model has an
+Amdahl ceiling fixed by its architecture. Computing that composition from the
+launcher configs (`scripts/mxfp4_speedup_composition.py`) and solving
+`1/((1-p) + p/s) = measured` for the effective speedup `s` of the quantized part:
+
+| Model | quantizable `p` | attention | LM head | BF16 tail | measured | implied `s` |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama2-7B | 75.5% | 8.7% | 1.8% | 14.0% | 1.524x | **1.84x** |
+| Llama3.1-8B | 67.2% | 14.3% | 6.0% | 12.5% | 1.435x | **1.82x** |
+| Qwen3-8B | 66.6% | 15.7% | 6.9% | 10.7% | 1.406x | **1.77x** |
+
+**The kernels deliver about the same 1.8x everywhere.** The end-to-end ordering
+follows `p` exactly, and `p` is architecture. Llama2-7B leads because it runs at
+sequence 4096 where the other two run at 8192, which holds its unquantized
+attention to 8.7% against their 14%-16%, and because its 32000-token vocabulary
+makes the BF16 LM head almost free at 1.8%.
+
+Qwen3-8B trails Llama3.1-8B on two counts at identical sequence length, token
+count and near-identical linear FLOPs: its 36 layers carry 12.5% more attention
+than Llama3.1-8B's 32 (+1.4 points), and its 151936-token vocabulary makes the
+BF16 LM head 18.5% larger (+0.9 points). Working the other way, and worth noting
+because it is counter-intuitive, Qwen3-8B has the *smallest* BF16-tail penalty of
+the three — five fixed layers is a smaller share of 36 than of 32 — which offsets
+part of the loss but not all of it.
+
+That leaves roughly 3% of genuinely kernel-side difference in `s`. Tuned-table
+coverage is not the cause: §7 shows all three at `asm 11/11`. The likely residue
+is Qwen3-8B's FFN 12288 shape being slightly less efficient on the assembly
+kernels than 14336 or 11008, plus QK-LayerNorm (§8.2), which costs about 0.6% of
+the step in HBM traffic and does not appear in a FLOP model at all because it is
+bandwidth-bound rather than compute-bound.
+
+The FP8 column orders the same way — 1.140x, 1.121x, 1.093x — for the same
+reason, which is a useful cross-check: two independent quantization paths ranking
+the three models identically is what an architectural explanation predicts and a
+kernel-quality explanation does not.
+
+Treat `s` as an effective figure, not a measured GEMM speedup: the model assumes
+time proportional to FLOPs with fixed forward/backward multipliers and does not
+separately account for bandwidth-bound operators, communication or the optimizer.
+The robust finding is not any single `s` but that all three land within 4% of
+each other.
+
 The reference report's MI325X rows, for context. Read the two blocks as separate
 experiments — different silicon and an older Lumen — not as a delta:
 
@@ -454,7 +507,7 @@ layers, so this asymmetry does not flatter it — it makes the MXFP4 numbers
 conservative. It does mean the two arms carry different accuracy risk, and the
 tail-BF16 setting is load-bearing for MXFP4 at longer horizons (§6).
 
-## 9. FP8 delayed is worth 1.09x-1.14x here, and still short of MI325X
+## 9. FP8 delayed is worth 1.09x-1.14x here, at most 1.20x anywhere, and still short of MI325X
 
 **Corrected on 2026-08-14.** The first version of this section reported FP8 at
 1.00x-1.03x and called it indistinguishable from BF16. That was measured with the
@@ -471,6 +524,13 @@ So the headline finding changes and the open question narrows but survives. FP8
 delayed *is* faster than BF16 on gfx950 — 9.3% to 14.0%, six to nine times the
 1.53% error bar — and it is still 23%-29% short of what the same recipe bought on
 MI325X.
+
+**Updated 2026-08-19, and this is now the tighter bound.** Re-running all 16 FP8
+cells inside the coworker's own Docker image (see the section above §1) lifts
+hybrid to 1.148x-1.179x on the 50-step core and 1.147x-1.199x on C4 — better than
+this report's stack, but still **15%-19% short** of MI325X. The rest of this
+section was written against the 23%-29% figure; read it as the mechanism
+discussion, and 15%-19% as the gap that actually has to be explained.
 
 What moved is still mostly the baseline. Between the reference report's stack on
 MI325X and this one on MI350X, with FP8 read as `hybrid` on both sides:
@@ -503,8 +563,18 @@ Ruled out, or bounded:
 - **Not the integration path.** §11 re-runs both FP8 recipes on `--lumen-linear`,
   the path MXFP4 uses. Hybrid lands at 1.122x (Llama2-7B) and 1.099x (Qwen3-8B),
   within 1.6% of its `nn.Linear` numbers — the wiring is not it.
+- **Not the fusion switches.** All twelve FP8 switches the reference report's §7
+  credits are exported for every FP8 cell here, and all 26 FP8 logs confirm the
+  hipBLASLt forward path was taken (§3). Audited 2026-08-17 precisely because a
+  switch left at its default would have been the cheap explanation. It is not.
+- **Not the software environment as a whole, which is the strongest of these.**
+  The 2026-08-19 re-run took the coworker's entire stack — their Lumen commit,
+  their AITER, their Docker image — and still reached only 1.148x-1.179x on
+  gfx950. That closes the last "our build is wrong" hypothesis, since the build
+  was theirs. Note *how* it improved: their BF16 is also slower, so the ratio rose
+  because the baseline lost more, not because FP8 got faster in absolute terms.
 
-What is left, now with a concrete lead rather than a category:
+What is left, after the environment hypothesis fell:
 
 1. A roofline ceiling. **Still cannot be the whole story:** MXFP4, on the same
    model, batch shape and linears, finds 1.41x-1.52x through the same integration.
@@ -530,7 +600,11 @@ the 23%-29% here until they are re-taken under the harness environment.
 
 Confirming the rest needs exactly that: the per-op profile re-run with the
 benchmark's switches on, comparing FP8 and MXFP4 kernel time at the same GEMM
-shapes, which is still out of scope here.
+shapes, which is still out of scope here. With recipe, AITER, integration path,
+fusion switches and the entire software environment now eliminated, that profile
+is the only remaining way to turn "the kernels were tuned for gfx942" from the
+surviving hypothesis into a measured one.
+
 **Until that is done, the FP8 column should be read as "FP8 delayed as currently
 implemented, on gfx950" and not as a statement about what FP8 can do on this
 hardware.** The MXFP4-vs-BF16 comparison does not depend on it.
@@ -846,11 +920,13 @@ shapes differently.
    — and only with the `hybrid` recipe; `fp8_e4m3` gives 1.00x-1.04x, inside the
    noise floor. The recipe alone is 1.098x of that, 8.9% off the step time and
    about a third of the gap to MI325X; §4 shows the mechanism is which wgrad
-   routine the dtype test selects rather than the arithmetic itself. The remaining
-   23%-29% is not a silent fallback and not the integration path (§9, §11); the
-   leading candidate is that FP8's quantization and GEMM kernels never got gfx950
-   tuning. This is still the highest-value follow-up in this report, and it is not
-   an MXFP4 issue — MXFP4 reaches 1.41x-1.52x through the same linears.
+   routine the dtype test selects rather than the arithmetic itself. Re-running
+   the whole matrix in the coworker's own Docker image reaches 1.15x-1.20x, so
+   **15%-19% is the real gap** and it is not the recipe, the AITER, the fusion
+   switches, the integration path, or the software environment (§9). The surviving
+   candidate is that FP8's quantization and GEMM kernels never got gfx950 tuning.
+   This is still the highest-value follow-up in this report, and it is not an
+   MXFP4 issue — MXFP4 reaches 1.41x-1.52x through the same linears.
 4. **Use `hybrid`, and put the arm on `--lumen-linear`.** Hybrid takes 8.9% less
    step time than e4m3 at equal memory and no measurable accuracy cost over 350
    C4 steps (§12). The native path costs nothing in step time and drops memory from
@@ -872,6 +948,24 @@ shapes differently.
 
 ## Changelog
 
+- **2026-08-24** — Explained the MXFP4 spread in §4. Decomposing each model's step
+  into quantizable and non-quantizable work shows the 1.406x-1.524x range is an
+  Amdahl effect of architecture, not kernel quality: the implied speedup of the
+  quantized part is 1.84x / 1.82x / 1.77x, within 4% across the three. Qwen3-8B
+  ranks last because 36 layers at sequence 8192 and a 151936-token vocabulary
+  leave it the least to quantize. Adds
+  `scripts/mxfp4_speedup_composition.py`. No measured number changes.
+- **2026-08-19** — Re-ran all 16 FP8 cells plus 6 BF16 controls inside the
+  coworker's own environment (their Lumen commit, their AITER `e42f5791a`, their
+  Docker image), reported in the section above §1. Hybrid reaches 1.148x-1.179x
+  on the 50-step core and 1.147x-1.199x on C4 — better than this report's stack,
+  still 15%-19% short of MI325X, and the ratio improves because BF16 slows down
+  rather than because FP8 speeds up. This eliminates the software environment as
+  the explanation for the gap: the build was theirs. §9 now carries 15%-19% as the
+  bound to explain and lists the environment among the ruled-out causes. Required
+  gfx950 OCP E4M3/E5M2 support in the fused cast+transpose extension (verified
+  bit-exact against PyTorch) and `LUMEN_FUSED_RES_BWD=0` on native-linear cells;
+  both are documented there as deliberate compatibility deltas.
 - **2026-08-17** — Audited the FP8 optimization switches against the reference
   report's §6/§7 after a question about whether they were all on. They are: §3
   now enumerates the twelve `train_pretrain.sh` exports and the four harness-wide
