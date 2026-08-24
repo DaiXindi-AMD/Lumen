@@ -134,6 +134,57 @@ Pairwise, on this stack:
 MXFP4 wins on all three models by 40%-52% against BF16, and its margin over FP8 is nearly the
 same as over BF16 because FP8 barely moves off BF16 here.
 
+### Why the three MXFP4 ratios differ, and why that is not a kernel result
+
+MXFP4 spans 1.406x to 1.524x across the three models, and the ordering is stable
+across the 50-step and 350-step matrices. It is worth saying what that spread is,
+because the natural reading — that the kernels suit Llama2-7B better than
+Qwen3-8B — is not what the numbers say.
+
+MXFP4 accelerates the transformer linears outside the BF16 tail and nothing else.
+Attention, the norms and the LM head stay BF16 in every arm, so each model has an
+Amdahl ceiling fixed by its architecture. Computing that composition from the
+launcher configs (`scripts/mxfp4_speedup_composition.py`) and solving
+`1/((1-p) + p/s) = measured` for the effective speedup `s` of the quantized part:
+
+| Model | quantizable `p` | attention | LM head | BF16 tail | measured | implied `s` |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama2-7B | 75.5% | 8.7% | 1.8% | 14.0% | 1.524x | **1.84x** |
+| Llama3.1-8B | 67.2% | 14.3% | 6.0% | 12.5% | 1.435x | **1.82x** |
+| Qwen3-8B | 66.6% | 15.7% | 6.9% | 10.7% | 1.406x | **1.77x** |
+
+**The kernels deliver about the same 1.8x everywhere.** The end-to-end ordering
+follows `p` exactly, and `p` is architecture. Llama2-7B leads because it runs at
+sequence 4096 where the other two run at 8192, which holds its unquantized
+attention to 8.7% against their 14%-16%, and because its 32000-token vocabulary
+makes the BF16 LM head almost free at 1.8%.
+
+Qwen3-8B trails Llama3.1-8B on two counts at identical sequence length, token
+count and near-identical linear FLOPs: its 36 layers carry 12.5% more attention
+than Llama3.1-8B's 32 (+1.4 points), and its 151936-token vocabulary makes the
+BF16 LM head 18.5% larger (+0.9 points). Working the other way, and worth noting
+because it is counter-intuitive, Qwen3-8B has the *smallest* BF16-tail penalty of
+the three — five fixed layers is a smaller share of 36 than of 32 — which offsets
+part of the loss but not all of it.
+
+That leaves roughly 3% of genuinely kernel-side difference in `s`. Tuned-table
+coverage is not the cause: §7 shows all three at `asm 11/11`. The likely residue
+is Qwen3-8B's FFN 12288 shape being slightly less efficient on the assembly
+kernels than 14336 or 11008, plus QK-LayerNorm (§8.2), which costs about 0.6% of
+the step in HBM traffic and does not appear in a FLOP model at all because it is
+bandwidth-bound rather than compute-bound.
+
+The FP8 column orders the same way — 1.140x, 1.121x, 1.093x — for the same
+reason, which is a useful cross-check: two independent quantization paths ranking
+the three models identically is what an architectural explanation predicts and a
+kernel-quality explanation does not.
+
+Treat `s` as an effective figure, not a measured GEMM speedup: the model assumes
+time proportional to FLOPs with fixed forward/backward multipliers and does not
+separately account for bandwidth-bound operators, communication or the optimizer.
+The robust finding is not any single `s` but that all three land within 4% of
+each other.
+
 The reference report's MI325X rows, for context. Read the two blocks as separate
 experiments — different silicon and an older Lumen — not as a delta:
 
@@ -326,6 +377,7 @@ One hypothesis is now bounded and one remains:
 
 Confirming it needs a per-op profile of the FP8 arm on gfx950 — comparing FP8 and
 MXFP4 kernel time for the same GEMM shapes — which is out of scope here.
+
 **Until that is done, the FP8 column should be read as "FP8 delayed as currently
 implemented, on gfx950" and not as a statement about what FP8 can do on this
 hardware.** The MXFP4-vs-BF16 comparison does not depend on it.
@@ -568,6 +620,13 @@ shapes differently.
 
 ## Changelog
 
+- **2026-08-24** — Explained the MXFP4 spread in §4. Decomposing each model's step
+  into quantizable and non-quantizable work shows the 1.406x-1.524x range is an
+  Amdahl effect of architecture, not kernel quality: the implied speedup of the
+  quantized part is 1.84x / 1.82x / 1.77x, within 4% across the three. Qwen3-8B
+  ranks last because 36 layers at sequence 8192 and a 151936-token vocabulary
+  leave it the least to quantize. Adds
+  `scripts/mxfp4_speedup_composition.py`. No measured number changes.
 - **2026-08-12** — Added §12: the same nine cells re-run for 350 steps on C4 with
   a held-out validation set. Step-time results reproduce within the noise floor;
   the loss curves are real for the first time here. Records the two data-sizing
