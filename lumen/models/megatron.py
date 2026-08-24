@@ -832,6 +832,8 @@ def enable_fp8_for_parallel_linear(
     # own linear types, and --lumen-linear has already swapped those out by the
     # time it runs -- so on this path the flag used to select nothing at all and
     # every layer went to MXFP4 regardless.
+    from lumen.quantize import is_under_bf16_prefix
+
     bf16_prefixes: Set[str] = set()
     if quant_config is not None and quant_config.first_last_layers_bf16:
         from lumen.quantize import _build_bf16_skip_prefixes
@@ -855,7 +857,7 @@ def enable_fp8_for_parallel_linear(
         if isinstance(
             module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
         ):
-            if any(name.startswith(p) for p in bf16_prefixes):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
                 continue
             _mgr = scaling_manager
@@ -1206,12 +1208,24 @@ def make_lumen_model_provider(
             # formats carry scaling in the format, so an MXFP4 run passes
             # "blockwise" here and would silently run FP8 blockwise instead.
             scaling_type = cfg.quant_config.recipe
+            gaf = getattr(args, "lumen_gradient_accumulation_fusion", False)
+            delay_wgrad = getattr(args, "lumen_delay_wgrad", False)
+            # A deferred wgrad lands in main_grad after the backward graph, hence
+            # after DDP's post-hook has already declared the bucket ready, so the
+            # overlapped reduce would send gradients that are one wgrad short.
+            if gaf and delay_wgrad and getattr(args, "overlap_grad_reduce", False):
+                raise ValueError(
+                    "--lumen-gradient-accumulation-fusion with --lumen-delay-wgrad "
+                    "cannot be combined with --overlap-grad-reduce: the deferred "
+                    "weight gradient is not in main_grad yet when the gradient "
+                    "reduction is scheduled. Drop one of the three."
+                )
             enable_fp8_for_parallel_linear(
                 model,
                 scaling_type=scaling_type,
                 fp8_mha=getattr(args, "lumen_fp8_attn", "none") == "mha",
-                gradient_accumulation_fusion=getattr(args, "lumen_gradient_accumulation_fusion", False),
-                delay_wgrad=getattr(args, "lumen_delay_wgrad", False),
+                gradient_accumulation_fusion=gaf,
+                delay_wgrad=delay_wgrad,
                 quant_config=cfg.quant_config,
             )
 

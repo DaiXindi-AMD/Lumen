@@ -1108,11 +1108,10 @@ def dual_layout_quant_mxfp4(
 
     # BLOCK_M sets how long a contiguous run the transposed output writes
     # (BLOCK_M/2 bytes), so it wants to be the larger of the two. (256, 32)
-    # measured fastest across Qwen3-8B's wgrad shapes once the rotation moved
-    # to the matrix unit; before that the wider tile's register pressure cost
-    # more occupancy than the longer runs bought.
+    # is fastest for hidden=4096; gate_up/down at N=12288 prefer (256, 64).
     BLOCK_M = _dividing_block(M, 256, floor=max(block_size, g))
-    BLOCK_N = _dividing_block(N, 32, floor=block_size)
+    bn_cap = 64 if N >= 8192 else 32
+    BLOCK_N = _dividing_block(N, bn_cap, floor=block_size)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
 
     from lumen.kernels.mxfp4 import _dual_layout_quant_mxfp4_kernel

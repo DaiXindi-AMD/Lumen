@@ -56,6 +56,12 @@ ITER_RE = re.compile(
     r"iteration\s+(\d+)/\s*\d+.*?elapsed time per iteration \(ms\):\s*([\d.]+)"
 )
 
+# BF16 at this exact recipe (seq 8192, mbs 2, gbs 128, 8x MI350X), from
+# mxfp4_precision_benchmark_report.md section 4. Its own log is
+# results/lumen_qwen3_8b_bf16.log; see the report's section 3 for why the ladder
+# reproduces its MXFP4 arm to 0.01%.
+BF16_MS = 8573.6
+
 
 def use_cjk_font() -> None:
     """Pick a font that covers both the Chinese labels and the ASCII numbers.
@@ -162,6 +168,18 @@ def fig_staircase(L: Ladder, out: pathlib.Path) -> None:
     base, head = ys[0], ys[-1]
     ax.axhline(base, color=COLORS["base"], ls=":", lw=1.1, zorder=2)
     ax.axhline(head, color="#2f7d5c", ls=":", lw=1.1, zorder=2)
+
+    cross = next(n for n in xs if L.median(n) < BF16_MS)
+    ax.axhline(BF16_MS, color="#7a4fa3", ls="--", lw=1.4, zorder=5)
+    # Both labels go in the gap between the BF16 line and the shorter bars on
+    # the right; anything further left sits behind S0-S4.
+    ax.text(24.4, BF16_MS + 210, f"BF16 同配置 {BF16_MS:.0f} ms", ha="right",
+            fontsize=9.5, fontweight="bold", color="#7a4fa3")
+    ax.annotate(f"要到 S{cross} 才追上 BF16", (cross, L.median(cross)),
+                xytext=(16.4, 7750), textcoords="data", ha="center",
+                fontsize=9, fontweight="bold", color="#7a4fa3",
+                arrowprops=dict(arrowstyle="->", color="#7a4fa3", lw=1.0,
+                                shrinkA=2, shrinkB=4))
     ax.text(0, base + 190, f"{base:.0f} ms", ha="center", fontsize=9,
             fontweight="bold", color="#3a3f44")
     ax.text(24, head + 190, f"{head:.0f} ms", ha="center", fontsize=9,

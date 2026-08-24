@@ -1225,6 +1225,43 @@ def _mxfp4_can_fuse_b_shuffle(gemm_key, rows, packed_cols):
     )
 
 
+_GAF_PLACEHOLDER_WGRAD = {}
+
+
+def _gaf_placeholder_wgrad(weight, dtype):
+    """The grad to return for a weight whose wgrad already went into ``main_grad``.
+
+    ``None`` is the honest answer, but DDP's backward post-hook asserts the grad is
+    not None under ``--overlap-grad-reduce``: it needs a hook to fire on the main
+    backprop thread to schedule the bucket's reduce, and a None grad means no hook.
+    So hand back a buffer nobody reads and set ``grad_added_to_main_grad`` so the
+    hook skips its own accumulate, which is the contract
+    ``megatron.core.tensor_parallel.layers`` follows in the same situation.
+
+    Only DDP defines ``grad_added_to_main_grad``; without it there is no hook to
+    keep alive and None is returned as before.
+    """
+    if not hasattr(weight, "grad_added_to_main_grad"):
+        return None
+
+    main_grad = weight.main_grad
+    # One buffer per shape serves every layer and micro-batch: the contents are
+    # never read, so sharing it costs nothing and saves a wgrad-sized allocation
+    # on every backward call.
+    key = (tuple(main_grad.shape), dtype, main_grad.device)
+    placeholder = _GAF_PLACEHOLDER_WGRAD.get(key)
+    if placeholder is None:
+        placeholder = torch.zeros(
+            main_grad.shape, dtype=dtype, device=main_grad.device, requires_grad=False
+        )
+        _GAF_PLACEHOLDER_WGRAD[key] = placeholder
+
+    # zero_out_wgrad params are the exception: the hook does add this grad in, which
+    # the zero-filled buffer makes a no-op.
+    weight.grad_added_to_main_grad = True
+    return placeholder
+
+
 def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_swizzled, needs_wgrad):
     """Quantize the activation into the forward operand *and* WGrad's, in one pass.
 
@@ -2114,7 +2151,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 )
                 if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
                     ctx.weight_ref.main_grad.add_(grad_weight)
-                    grad_weight = None
+                    grad_weight = _gaf_placeholder_wgrad(ctx.weight_ref, grad_weight.dtype)
 
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
             return (
@@ -2179,7 +2216,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     grad_weight = ctx.scaling_manager.quantize_grad(grad_weight)
                 if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
                     ctx.weight_ref.main_grad.add_(grad_weight)
-                    grad_weight = None
+                    grad_weight = _gaf_placeholder_wgrad(ctx.weight_ref, grad_weight.dtype)
 
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
             return (
@@ -2402,7 +2439,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     grad_weight = mgr.quantize_grad(grad_weight)
                 if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
                     ctx.weight_ref.main_grad.add_(grad_weight)
-                    grad_weight = None
+                    grad_weight = _gaf_placeholder_wgrad(ctx.weight_ref, grad_weight.dtype)
 
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
             return (
@@ -2666,7 +2703,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
                     grad_weight = mgr.quantize_grad(grad_weight)
                 if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
                     ctx.weight_ref.main_grad.add_(grad_weight)
-                    grad_weight = None
+                    grad_weight = _gaf_placeholder_wgrad(ctx.weight_ref, grad_weight.dtype)
 
             grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
             return (
@@ -2837,7 +2874,7 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
             if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
                 ctx.weight_ref.main_grad.add_(grad_weight)
-                grad_weight = None
+                grad_weight = _gaf_placeholder_wgrad(ctx.weight_ref, grad_weight.dtype)
 
         grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
 

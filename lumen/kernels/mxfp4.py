@@ -703,7 +703,7 @@ def _dual_layout_quant_mxfp4_kernel(
     Backward quantizes the gradient twice: row-major for DGrad, then rotated and
     transposed for WGrad. Run separately the second pass has to read x^T as a
     view, which measures 1.70x slower than the same shape dense because of the
-    register layout the strided load forces (report §5.10). Here the tile is read
+    register layout the strided load forces. Here the tile is read
     once, densely, and transposed in registers.
 
     Both outputs' scale blocks live entirely inside the tile, so BLOCK_M and
