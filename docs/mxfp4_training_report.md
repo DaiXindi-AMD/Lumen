@@ -1543,6 +1543,138 @@ What is left is the kernel's own arithmetic — the two amax reductions, the
 E2M1 conversions and the in-register transpose — not how it is tiled or how wide
 its operands are.
 
+### 5.18 The fastest recipe measured, and why the step is 573 ms longer than its kernels
+
+§5.16 ends on a projection — "the reachable number today is the `TAIL_BF16=0`
+recipe at roughly 1.52×". This section measures it, then profiles it, because a
+recipe that removes 644 ms of BF16 GEMM changes which bottleneck is next.
+
+All arms are 60 steps at the §5.16 shape (Qwen3-8B 36L, GBS 128, seq 8192, MBS 2,
+TP=1, 8×MI350X), median of iterations 21–60, eval outside the run:
+
+| arm | median | mean | IQR | vs BF16 | loss@60 |
+|---|---:|---:|---:|---:|---:|
+| BF16 | 8520.7 ms | 8539.5 | 52.2 | 1.000× | 2.272813 |
+| MXFP4 `TAIL_BF16=5` | 5984.6 ms | 5999.1 | 31.0 | 1.424× | 2.271212 |
+| MXFP4 `TAIL_BF16=0` | 5591.0 ms | 5614.7 | 25.6 | **1.524×** | 2.270299 |
+| … + `--no-check-for-nan-in-loss-and-grad` | 5575.2 ms | 5593.0 | 56.6 | 1.528× | 2.272596 |
+| … + `--overlap-param-gather` | **5572.1 ms** | 5585.9 | 37.7 | **1.529×** | 2.269602 |
+
+The projection was right: `TAIL_BF16=0` lands at 1.524×, against 1.52× predicted
+from the kernel table. The two DDP flags below it are negative results — 18.9 ms
+across both, against IQRs of 25.6 and 37.7 — and are reported here only because
+the profile made them look like the obvious next move.
+
+#### The `TAIL_BF16=0` profile
+
+Clean two-iteration trace, eval disabled, at
+`examples/qwen3/results/prof_clean_tail0/`. Every count is closed form: FP4 GEMM
+3456 = 36 × 4 × 3 × 8, `_dual_layout_quant_mxfp4_kernel` 2304 = 36 × 4 × 2 × 8,
+Tensile GEMM 24 = 3 × 8 for the vocab projection and nothing else, `fmha_fwd`
+288 = 36 × 8.
+
+| ms/iter | `TAIL_BF16=5` | `TAIL_BF16=0` |
+|---|---:|---:|
+| attention | 1734.5 | 1551.1 |
+| FP4 GEMM | 1107.2 | 1283.2 |
+| BF16 Tensile GEMM | 1089.4 | 448.0 (vocab only) |
+| grad accumulate | 660.5 | 670.3 |
+| quantize / layout | 359.1 | 423.8 |
+| collectives | 260.3 | 406.3 |
+| optimizer | 341.0 | 354.0 |
+| everything else | 840.9 | 843.0 |
+| **total kernel time** | **6392.9** | **5979.7** |
+
+Two rows move for reasons that are not the recipe. **Attention drops 183 ms for
+identical work** — `fmha_bwd` is the same kernel at the same 288 calls, 1336.5 ms
+against 1157.8. Replacing BF16 GEMMs with FP4 ones lowers the power the GEMMs
+draw and the rest of the model clocks higher, which is a real effect on the step
+but means cross-trace comparisons of a "shared" category carry roughly 10%
+uncertainty. **Collectives rise 146 ms** for the same bytes; that one is the
+subject of the rest of this section.
+
+#### The step is 573 ms longer than the compute stream is busy
+
+`scripts/trace_compute_stream_gaps.py` splits the busiest kernel stream into busy
+and idle and asks what is on the other streams during each idle interval.
+
+| | BF16 | MXFP4 `TAIL_BF16=5` | MXFP4 `TAIL_BF16=0` |
+|---|---:|---:|---:|
+| step | 8520.7 ms | 5984.6 | 5591.0 |
+| compute stream busy | 8196.3 | 5623.0 | 5044.8 |
+| compute stream idle | 388.3 | 388.2 | **573.3** |
+| — of which a collective is in flight | 128.0 | 150.9 | **302.6** |
+
+The idle is not spread out. At `TAIL_BF16=0` two intervals per iteration, 293.2
+and 245.6 ms, are 100% covered by a collective and account for over half of it.
+They sit at 85% of the way through the step, where the last gradient buckets
+become ready.
+
+**Exposed communication grows as MXFP4 gets faster.** The bytes are fixed by the
+parameter count, not the recipe: gradients reduce-scatter in FP32
+(`accumulate_allreduce_grads_in_fp32`, so 8B × 4 B = 32 GB) and parameters
+all-gather in BF16 (16 GB), identically in all three arms. What shrinks is the
+backward pass available to hide them behind, so the same collective goes from 128
+to 303 ms of exposure. This is the structural cost of making the compute faster
+without touching the communication, and it is why the `TAIL_BF16=0` step improved
+by 394 ms when its kernel time fell by 413.
+
+#### Two Megatron knobs that do not close it, and why
+
+The host trace names the stall precisely. Inside
+`distributed_data_parallel.py:448 hook` → `register_grad_ready` →
+`start_grad_sync` → `param_and_grad_buffer.py:175 check_grads` →
+`rerun_state_machine.py:436 validate_result` there is an `aten::item`, and it
+blocks for the full 293 ms. `check_grads` takes an L2 norm of each bucket's
+gradient buffer and hands it to two `validate_result` calls — one `torch.isnan`,
+one `torch.isinf` — each of which is a device sync in the backward hook.
+`check_for_nan_in_grad` defaults False in `DistributedDataParallelConfig`, but
+`training.py:975` overwrites it from `args.check_for_nan_in_loss_and_grad`, which
+defaults True. It costs 578.8 ms/iter of host block time in the MXFP4 arm and
+927.9 in BF16, across 268 syncs per iteration.
+
+That made it look like the cause. It is not: `--no-check-for-nan-in-loss-and-grad`
+turns the syncs off (verified as `check_for_nan_in_grad=False` in the config the
+run logs) and buys **15.8 ms**, inside the IQR. The sync was waiting on the same
+collective the compute stream was waiting on, so removing it lets the host run
+ahead into work that has nowhere to go. `--overlap-param-gather` adds a further
+**3.1 ms**, also noise — the exposure is on the gradient reduce-scatter, and
+overlapping the parameter all-gather does not touch it.
+
+What would: the 32 GB FP32 gradient reduce-scatter itself. At 8 ranks its bus
+volume is 28 GB, and 292 ms for it is roughly 100 GB/s, well under what a single
+node's fabric should give. Whether that is RCCL configuration (the run logs
+`NCCL WARN NUMA auto balancing enabled which can lead to variability in the RCCL
+performance`, which needs root to change), bucket-group granularity, or the FP32
+reduce dtype is not yet separated, and it is shared-infrastructure work rather
+than MXFP4 work.
+
+#### The 1.6× arithmetic, with the profile behind it
+
+1.6× is a 5325.4 ms step, 246.7 ms below the best arm measured. Three routes,
+all closed:
+
+- **Shared work, including all the idle above.** Taking a constant *c* off both
+  arms needs (8520.7 − c)/(5572.1 − c) = 1.6, i.e. *c* = 658 ms. The MXFP4 arm
+  only has 573.3 ms of idle in total and BF16 has 388.3, so perfect scheduling in
+  both arms does not get there — it would have to come out of kernels both arms
+  run, such as a 40% cut to attention, which makes the ratio look better without
+  making MXFP4 faster.
+- **Quantization.** It is the only MXFP4-owned line item left at `TAIL_BF16=0`:
+  423.8 ms/iter. Reaching 1.6× means removing 246.7 of it, 58%. §5.17's tile
+  sweep and FP32-widening attempt both came back empty, and §5.11 already ruled
+  out memory traffic as the limiter.
+- **The vocab projection**, the last 448.0 ms of BF16 GEMM. Quantizing it needs
+  FP4 kernels at N = 151936, and the tuned A4W4 table covers N ∈ {4096, 6144,
+  16384, 24576} only, so all three of its GEMMs would fall back to Triton — which
+  the 2026-08-19 wgrad-accumulation measurement prices well above the ASM path at
+  these sizes. It is also the layer every FP4 paper keeps in high precision, and
+  §5.14's C4 sweep could not resolve tail accuracy to better than ~0.12 nats.
+
+**The answer stands: 1.6× is not available at Qwen3-8B / GBS 128 / seq 8192. The
+best measured recipe is 5572.1 ms against BF16's 8520.7 ms, or 1.53×**, and the
+next real lever is the data-parallel collective, which belongs to both arms.
+
 ---
 
 ## 6. Debugging History
