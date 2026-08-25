@@ -99,6 +99,25 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - Tests: `PYTHONPATH=/home/xdai/Lumen pytest -q tests/quantize/test_mxfp4_weight_cache_hook.py` -> 6 passed; added native Parameter-cache invalidation coverage. The recurring torch weakref shutdown traceback appears after pytest exits but does not change its zero exit code.
 - Next target from the post-fix trace: `_dual_layout_quant_mxfp4_kernel`, 412.5 ms/step and 2976 calls over two iterations. It is now the largest MXFP4-owned non-GEMM kernel. §5.11 already ruled out memory traffic as the limiter; use the CUDA-event harness to sweep register pressure / tile occupancy. Do not revisit GAF: the 8/19 entry bounds its recoverable headroom and rules out the available ASM epilogue path.
 - Status: fixed and measured; report §5.15.
+- Correction (2026-08-25): the 412.5 ms / 2976-call figure for `_dual_layout_quant_mxfp4_kernel` in this entry counts a validation pass that fell inside the profiling window. Training-step figures are 322.7 ms / 1984 calls. See the entry below.
+
+### [2026-08-25 profiling-window-includes-a-validation-pass]
+- Symptom: in every Qwen3-8B trace taken so far, forward-side kernels run at exactly twice their closed-form training count while backward-side kernels are correct. `fmha_fwd` 576 vs `fmha_bwd` 288 (= 36 layers x 8 micro-batches); FP4 GEMM 3968 where fwd+dgrad+wgrad is 3 x 992; `_dual_layout_quant_mxfp4_kernel` 2976 where fwd+bwd is 2 x 992; forward RMSNorm and rope likewise doubled, their backward counterparts not.
+- Cause: the standing profile recipe is `TRAIN_STEPS=22` with no `EVAL_INTERVAL` override, and `train_pretrain.sh` derives `EVAL_INTERVAL=TRAIN_STEPS/10 = 2`. Megatron therefore evaluates every 2 steps and one validation pass lands inside `--profile-step-start 18 --profile-step-end 20`, adding a forward's worth of work per profiled iteration.
+- This is also what the "profiler stretches a 6.1 s step to 7.3 s of compute-stream busy time" note in report §5.15 was seeing: summed kernel time was 132.7% of the step because the trace contained work the step does not do.
+- Fix: re-profiled both arms with `EVAL_INTERVAL=100000 EVAL_ITERS=1`. Every count now matches closed form (`fmha_fwd` 288, FP4 GEMM 2976 = 31 x 4 x 3 x 8, BF16 Tensile 504 = 5 x 4 x 3 x 8 + 24 for the vocab projection) and summed kernel time is 106.8% of the step. Summaries: `examples/qwen3/results/prof_clean_{mxfp4,bf16}/kernel_summary.txt`.
+- Blast radius: forward-side absolute values in report §5.5, §5.14 and §5.15 are ~2x too high. Backward-side rows and every ranking drawn from them are unaffected, and no step-time A/B is affected -- those come from Megatron's `elapsed time per iteration`, which excludes eval.
+- Status: corrected in report §5.16. Any future profiling run must push eval outside the window.
+
+### [2026-08-25 mxfp4-vs-bf16-paired-and-what-1.6x-would-take]
+- Ask: reach 1.6x BF16 per-step at the production shape, and report both step times.
+- Paired 60-step measurement, Qwen3-8B 36L, GBS 128, seq 8192, MBS 2, TP=1, 8xMI350X, same launcher and mock corpus, eval outside the run, median of iterations 21-60: BF16 **8520.7 ms** (mean 8539.5), MXFP4 `TAIL_BF16=5` **5984.6 ms** (mean 5999.1). **1.424x.**
+- Clean paired traces decompose it exactly: linear GEMM 5084.5 -> 2196.6 ms/iter (-2887.9), quantize/layout 0 -> 359.1, everything else within +-52 ms. Total kernel delta -2503.3 vs a measured step delta of -2536.1, i.e. nothing material outside the kernels.
+- Per layer per step: BF16 128.9 ms of GEMM; MXFP4 35.7 ms of FP4 GEMM (3.61x) + 11.6 ms of quantization = 47.3 ms (2.73x). Vocab projection is 445.0 ms of BF16 GEMM in both arms.
+- The FP4 GEMM is not the remaining lever: 4.25 PFLOPS against BF16's 1.18 PFLOPS on the same shapes, a 3.6x ratio where the hardware's FP4:BF16 arithmetic ratio is 4:1.
+- 1.6x needs a 5325.4 ms step, i.e. -659.2 ms. The only MXFP4-owned line items are the BF16 tail (-408 ms of kernel time if all 36 layers quantize) and all of quantization (-359.1 ms). Both together barely clear the bar and the second cannot go to zero. Shared work -- attention 1734.5, grad accumulate 660.5, optimizer 341.0, norm 275.8, collectives 260.3, activation 237.2, rope 157.0 -- is 3665 ms/iter that no recipe touches; taking x off both arms needs x = 1853 ms to reach 1.6x.
+- Conclusion: **1.6x is not reachable from MXFP4-side work at this shape.** Ceiling with every transformer linear and its quantization free is 2.20x; the best measured recipe available today is `TAIL_BF16=0`.
+- Status: measured and written up; report §5.16 / §5.17.
 
 ## Open
 
