@@ -1386,12 +1386,162 @@ or skipped iterations and loss@60 differs by 0.0018. The price is ~2.8 GiB/GPU
 for both packed weight layouts and expanded scales.
 
 After this fix the largest MXFP4-owned non-GEMM kernel is unambiguous:
-`_dual_layout_quant_mxfp4_kernel` remains 412.5 ms/step in the trace (2976
-launches over two iterations), about 6.8% of the unprofiled step. §5.11 already
-showed it is compute/register-bound rather than bandwidth-bound; register
-pressure and tile occupancy, measured with the six-second CUDA-event harness,
-are the next MXFP4-specific target. Attention is larger but is BF16 work, and
-grad accumulation's available headroom is ruled out in the 2026-08-19 findings.
+`_dual_layout_quant_mxfp4_kernel`. The trace put it at 412.5 ms/step; §5.16 shows
+that figure counts a validation pass and the training-step cost is 322.7 ms.
+§5.11 already showed it is compute/register-bound rather than bandwidth-bound;
+register pressure and tile occupancy, measured with the six-second CUDA-event
+harness, were the next MXFP4-specific target. Attention is larger but is BF16
+work, and grad accumulation's available headroom is ruled out in the 2026-08-19
+findings.
+
+### 5.16 The whole speedup against BF16, kernel by kernel
+
+Everything before this section prices MXFP4 against TransformerEngine or against
+its own previous commit. This one asks the other question — how far ahead of BF16
+the stack actually is at the production shape, and what the remaining distance to
+1.6× is made of.
+
+Both arms ran back to back on the same machine, same launcher, same mock corpus,
+differing only in the quantization recipe: Qwen3-8B, 36 layers, GBS 128, seq 8192,
+MBS 2 (8 gradient-accumulation micro-batches per rank), TP=1, 8×MI350X, 60 steps,
+median of iterations 21–60. Validation was pushed outside the run so no eval work
+lands in the step time.
+
+| | median | mean | spread (min–max) |
+|---|---:|---:|---|
+| BF16 | 8520.7 ms | 8539.5 ms | 8482.4 – 8635.5 |
+| **MXFP4, `TAIL_BF16=5`** | **5984.6 ms** | 5999.1 ms | 5961.2 – 6090.3 |
+
+**MXFP4 is 1.424× BF16** — 2536.1 ms/step faster, 29.8% less time.
+
+#### Where those 2536 ms come from
+
+Two-iteration PyTorch traces of each arm, categorised with
+`scripts/summarize_torch_trace.py`. Every call count below matches its closed
+form exactly, so the split between quantized and BF16 work is a measurement
+rather than an attribution: BF16 issues 3480 Tensile GEMM calls
+(36 layers × 4 linears × 3 GEMMs × 8 micro-batches + 24 for the vocab
+projection), MXFP4 issues 2976 FP4 GEMM calls (31 × 4 × 3 × 8) plus 504 Tensile
+calls (5 × 4 × 3 × 8 + 24).
+
+| ms/iter | BF16 | MXFP4 | delta |
+|---|---:|---:|---:|
+| linear GEMM | 5084.5 | 2196.6 | **−2887.9** |
+| — of which FP4 | — | 1107.2 | |
+| — of which BF16 (tail + vocab) | — | 1089.4 | |
+| quantize / layout | — | 359.1 | **+359.1** |
+| attention | 1731.7 | 1734.5 | +2.8 |
+| grad accumulate | 608.0 | 660.5 | +52.5 |
+| optimizer | 320.4 | 341.0 | +20.6 |
+| norm | 313.8 | 275.8 | −38.0 |
+| collectives | 246.0 | 260.3 | +14.3 |
+| activation | 244.9 | 237.2 | −7.7 |
+| rope / embedding | 170.2 | 157.0 | −13.2 |
+| everything else | 176.7 | 171.0 | −5.7 |
+| **total kernel time** | **8896.2** | **6392.9** | **−2503.3** |
+
+The kernel-time delta lands within 33 ms (1.3%) of the measured step delta, so
+nothing material is hiding outside the kernels. The speedup is one line: the
+linear GEMMs get 2888 ms cheaper and quantization hands 359 of it back.
+
+Solving the two GEMM rows for the per-layer cost (36L + vocab = 5084.5,
+5L + vocab = 1089.4) gives **128.9 ms per BF16 layer per step** and 445.0 ms for
+the vocab projection, which is BF16 in both arms. A quantized layer costs
+1107.2/31 = 35.7 ms of FP4 GEMM plus 359.1/31 = 11.6 ms of quantization:
+
+| per layer per step | BF16 | MXFP4 |
+|---|---:|---:|
+| linear GEMM | 128.9 ms | 35.7 ms (**3.61×**) |
+| quantization | — | 11.6 ms |
+| **total** | **128.9 ms** | **47.3 ms** (**2.73×**) |
+
+The FP4 GEMM is not the thing left to fix. At 4703 TFLOP of linear work per step
+across 31 layers it sustains 4.25 PFLOPS against BF16's 1.18 PFLOPS on the same
+GEMMs — a 3.6× ratio where the hardware's FP4:BF16 arithmetic ratio is 4:1, i.e.
+the FP4 path is running at about the same fraction of its peak as the BF16 path
+is of its own.
+
+#### What 1.6× would take
+
+1.6× means a 5325.4 ms step, 659.2 ms below where MXFP4 is. Only two line items
+in the table are MXFP4's to spend:
+
+- **The BF16 tail.** Quantizing the last 5 layers replaces 5 × 128.9 ms with
+  5 × 47.3 ms: −408 ms of kernel time. This is a recipe change, not an
+  optimization — §6.3 is why the tail exists.
+- **Quantization itself.** 359.1 ms, of which `_dual_layout_quant_mxfp4_kernel`
+  is 322.7. Removing all of it is the absolute bound, and §5.17 finds no way to
+  remove any of it.
+
+Together they are 767 ms of kernel time, roughly 720 ms of step — just past the
+bar, and only if quantization becomes free. Everything else in the table is work
+both arms do identically: attention (1734.5), gradient accumulation (660.5), the
+optimizer (341.0), norms, collectives, activation and rope sum to 3665 ms/iter
+that no quantization recipe touches, and the vocab projection adds 445 ms of BF16
+GEMM on top. Cutting shared work does raise the ratio, but slowly — it would take
+1853 ms off *both* arms to reach 1.6× that way.
+
+So the honest ceiling at this shape, if every transformer linear and its
+quantization were free, is 8520.7 / 3873.9 = **2.20×**, and the reachable number
+today is the `TAIL_BF16=0` recipe at roughly **1.52×**. 1.6× is not available
+from MXFP4-side work on Qwen3-8B at GBS 128 / seq 8192.
+
+#### A profiling-recipe correction
+
+The traces behind §5.5, §5.14 and §5.15 were taken with `TRAIN_STEPS=22` and no
+`EVAL_INTERVAL` override, which makes Megatron evaluate every 2 steps — and one
+of those validation passes falls inside the `--profile-step-start 18
+--profile-step-end 20` window. Every forward-side count in those tables is
+therefore exactly double what a training step issues: `fmha_fwd` 576 against 288,
+FP4 GEMM 3968 against 2976, `_dual_layout_quant_mxfp4_kernel` 2976 against 1984.
+It also explains the "profiler stretches the step ~20%" note in §5.15 — summed
+kernel time was 132.7% of the step because it included work the step does not do.
+
+Re-profiling with `EVAL_INTERVAL=100000` reproduces every count in closed form
+and lands at 106.8% of the step. Backward-side rows were never affected, so the
+rankings those sections drew still hold; the forward-side absolute values do not.
+The corrected summaries are at `examples/qwen3/results/prof_clean_{mxfp4,bf16}/`.
+**Any future profiling run has to disable eval in the window.**
+
+### 5.17 Two things that did not make the dual-layout quantizer faster
+
+§5.11 left the kernel at "compute- and register-bound, and the next thing to look
+at is its register pressure". Both attempts at that are negative results.
+
+**Relaunching it differently: no configuration beats the current rule.**
+`benchmarks/bench_dual_layout_tiles.py` sweeps BLOCK_M ∈ {64, 128, 256},
+BLOCK_N ∈ {32, 64, 128} and `num_warps` ∈ {4, 8, 16} — 27 configurations — on
+each of the five shapes a step issues, under both call recipes. The launcher's
+existing rule picks the fastest of the 27 on every shape, and `num_warps` 8 and
+16 are slower than Triton's default 4 everywhere. Summed over one call of each
+shape: 1.032 ms for the default against 1.032 ms for the per-shape best.
+
+| shape | recipe | tile | ms | GB/s |
+|---|---|---|---:|---:|
+| (16384, 24576) | gradient, SR | (256, 64) | 0.493 | 2093 |
+| (16384, 12288) | activation, RTN | (256, 64) | 0.210 | 2454 |
+| (16384, 6144) | gradient, SR | (256, 32) | 0.149 | 1730 |
+| (16384, 4096) | gradient, SR | (256, 32) | 0.105 | 1645 |
+| (16384, 4096) | activation, RTN | (256, 32) | 0.075 | 2284 |
+
+Note these are 1.6–2.5 TB/s, not the 850–990 GB/s §5.11 recorded — the matrix-unit
+rotation and the shortened Philox have moved the kernel a long way since. Against
+~8 TB/s of HBM it is still not bandwidth-bound, but the remaining headroom is not
+addressable by launching the same kernel differently.
+
+**Dropping the redundant FP32 widening: 0.7%, inside noise.** The kernel loads a
+BF16 tile and immediately widens it to FP32 for the row-major operand, even
+though both consumers have a BF16 form that produces the same bytes — the scale's
+round-even tests the same mantissa bit at either width, and `_pack_fp4` has a
+`v_cvt_scalef32_pk_fp4_bf16` path. That is a whole second copy of the tile live
+across the A path, so it looked like the register pressure §5.11 pointed at.
+Passing the loaded tile straight through moved the summed five-shape time from
+1.032 to 1.025 ms. Reverted: that is below the harness's run-to-run spread, and it
+is not worth moving a numerics path for.
+
+What is left is the kernel's own arithmetic — the two amax reductions, the
+E2M1 conversions and the in-register transpose — not how it is tiled or how wide
+its operands are.
 
 ---
 
