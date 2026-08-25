@@ -329,6 +329,27 @@ def _do_gemm(
         return F.linear(input_, weight_bf16, bias)
 
     if scaling_type != "none" or delay_wgrad:
+        fp8_weight_cache = None
+        fp8_weight_scale = None
+        if scaling_type == "mxfp4":
+            # Native Lumen linears bypass quantize._replace_forward, where the
+            # per-optimizer-step MXFP4 cache is normally populated. Reuse the
+            # same cache on the Parameter itself so eight gradient-accumulation
+            # micro-batches do not re-quantize and transpose an unchanged weight.
+            # register_mxfp4_weight_optimizer_hooks clears it after step().
+            from lumen.quantize import _mxfp4_cached_weight
+
+            gemm_rows = input_.numel() // input_.shape[-1]
+            fp8_weight_cache, fp8_weight_scale = _mxfp4_cached_weight(
+                weight,
+                weight,
+                None,
+                None,
+                scaling_type,
+                fp8_dtype,
+                block_size,
+                gemm_rows=gemm_rows,
+            )
         _pqi = _resolve_pre_quantized_input_with_swiglu_cache(
             pre_quantized_input,
             consume_fp8_activation=(scaling_type != "none"),
@@ -346,6 +367,8 @@ def _do_gemm(
             deferred_wgrad=deferred_wgrad,
             activation_tensor_id=activation_tensor_id,
             pre_quantized_input=_pqi,
+            fp8_weight_cache=fp8_weight_cache,
+            fp8_weight_scale=fp8_weight_scale,
         )
     _discard_swiglu_fp8_cache_safe()
     return F.linear(input_, weight, bias)

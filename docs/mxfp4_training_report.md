@@ -117,6 +117,7 @@ The NVFP4 paper (§4, Appendix E.2) finds that the **final linear layers are the
 - Controlled by `QuantConfig.first_last_layers_bf16` + `num_layers_at_end_in_bf16` (`lumen/quantize/config.py:219-221`). Matching layers are skipped during patching (stay BF16 / unpatched), and `lm_head` is also skipped.
 - MXFP4 default: `num_layers_at_start_in_bf16=0`, `num_layers_at_end_in_bf16=round(0.15·num_layers)` (≥1).
 - **Note**: the 8B run in §4.3 (loss spike) predates this mechanism (all layers were MXFP4); it needs re-validation with the current default (see §8).
+- **Cost**: 78.8 ms/step per layer held in BF16, flat across the sweep, so the default tail of 5 is 6.4% of step time on Qwen3-8B (§5.14). The same section shows why the matching accuracy question cannot be answered by a short run.
 
 ---
 
@@ -1282,20 +1283,115 @@ on the old path.
 | Rung | Toggle | Old path | New default |
 |---|---|---|---|
 | 1 | `--lumen-fused-rope` | −95.2 | **−88.4** |
-| 5 | Cross-micro-batch weight cache | −25.5 | −2.2 (noise) |
+| 5 | Cross-micro-batch weight cache | −25.5 | not wired to native linears (§5.15) |
 | 8 | Cached scale swizzle | −15.6 | −1.5 (noise) |
 | 13 | `gc.freeze()` after warmup | −5.1 | −1.1 (noise) |
 
-Read the last three as *unresolvable*, not as zero. Two identical runs of the new
-default differ by 1.8 ms in the median — three times the 0.6 ms spread the old
-path showed — and all three deltas sit inside that. What can be said is that
-their effect fell from tens of milliseconds to below what a 200-step median can
-see, which is consistent with the native modules not doing the redundant work
-those caches existed to absorb. Separating them now needs a profiler or many
-seeds, not another A/B. `gc.freeze()` is additionally the wrong thing to judge by
-median, since its documented effect is tail latency; its mean is 14 ms above the
-new default's, against an 8 ms mean spread between identical runs, so even that
-is only suggestive.
+Read the last two cache/GC rows as *unresolvable*, not as zero. Two identical
+runs of the new default differ by 1.8 ms in the median — three times the 0.6 ms
+spread the old path showed — and both deltas sit inside that. Separating them
+needs a profiler or many seeds, not another A/B. `gc.freeze()` is additionally
+the wrong thing to judge by median, since its documented effect is tail latency;
+its mean is 14 ms above the new default's, against an 8 ms mean spread between
+identical runs, so even that is only suggestive. The weight-cache result had a
+different cause: the switch only reached `quantize._replace_forward`, while the
+new default uses native Lumen linears. §5.15 wires the existing cache to that
+path and re-measures it.
+
+### 5.14 What the BF16 tail costs, per layer
+
+§4.7 priced the tail as a single 7.3% block on TE. On Lumen the same knob was swept
+one setting at a time to get its marginal cost, since that is what decides whether
+a partial tail is worth anything. Six arms, `TAIL_BF16` = 5 through 0, which on 36
+layers leaves 31 through 36 layers in MXFP4. Protocol: Megatron
+backend, 300 steps, GBS 128, seq 8192, c4 with a disjoint held-out valid file,
+lr 1e-4 with warmup 50 and cosine decay, median over iterations 21–300. Each arm's
+precision assignment was read back from `enable_fp8_for_parallel_linear`'s count
+(124/20 through 144/0 quantized-vs-BF16 modules in increments of 4, against 144 =
+36 layers × 4 linears), not assumed from the flag.
+
+| Arm | MXFP4 layers | median | IQR | vs default | speedup |
+|---|---|---|---|---|---|
+| `TAIL_BF16=5` (default) | 31 | 6168.6 ms | 24.2 | — | — |
+| `TAIL_BF16=4` | 32 | 6087.2 ms | 20.9 | −81.4 | 1.32% |
+| `TAIL_BF16=3` | 33 | 6012.1 ms | 18.1 | −156.6 | 2.54% |
+| `TAIL_BF16=2` | 34 | 5924.8 ms | 19.0 | −243.9 | 3.95% |
+| `TAIL_BF16=1` | 35 | 5851.4 ms | 18.5 | −317.2 | 5.14% |
+| `TAIL_BF16=0` | 36 | 5774.7 ms | 15.5 | **−393.9** | **6.39%** |
+
+The marginal cost is flat: 81.4, 75.1, 87.3, 73.4 and 76.7 ms for the five
+successive layers, 78.8 ms/layer overall. This is the one rung in this section that a
+median can resolve cleanly — the interquartile range is 15–24 ms against a
+smallest arm-to-arm gap of 81 ms. It is also why the earlier 30-step attempt at
+the same question failed: there the run-to-run spread of the median was 54 ms,
+the same size as one layer's effect, so only the 5-layer endpoint was
+separable. The endpoint agrees with that earlier measurement (6.39% here, 6.58%
+on the mock corpus at a 6099.7 ms baseline).
+
+**On the loss side these runs settle nothing, and show why.** Held-out loss at
+step 300 was 5.7172 / 5.5935 / 5.7043 / 5.7434 / 5.7824 / 5.7537 for tails
+5 / 4 / 3 / 2 / 1 / 0.
+Tail 4 quantizes *one* more layer than the default and comes out 0.124 nats
+*better*, while tail 0 quantizes five more and is only 0.037 nats worse. The
+ordering remains non-monotonic after filling both missing arms, so the run-level
+spread is at least ~0.12 nats and the smaller differences sit well inside it. A likely
+mechanism is that the arms are not actually paired: WGrad applies stochastic
+rounding to the gradient (§1.3), so changing which layers are quantized changes
+the random stream, not just the precision. §4.7's independent TE measurement —
+the tail buying 0.006 nats at 1000 steps — is 20× below this noise floor, so a
+short run was never going to see the effect either way. Separating it needs
+several seeds per arm.
+
+What the arms do agree on is the absence of any instability signal at this
+horizon: zero NaN and zero skipped iterations in all six, gradient-norm medians
+within 0.88–0.96, p95 near 3.0, and no iteration above 10 anywhere. That is not
+evidence that the tail is removable. The failure it exists to prevent is a
+late-horizon divergence, and per §6.3 every run that diverged used H32; H16
+*without* a tail is a combination that has never been run to the horizon where
+rows 2–4 broke. 314M tokens at lr 1e-4 without a spike lowers the prior on a
+problem; it does not test the tail risk.
+
+### 5.15 Native linears were re-quantizing every weight per micro-batch
+
+A fresh two-iteration PyTorch trace of the current default reproduced §5.5 to
+within 1% kernel by kernel. It also made one supposedly closed rung impossible:
+`_convert_to_mxfp4_kernel` and `_transpose_packed_fp4_kernel` each ran **992
+times/step**, exactly 124 quantized linears × 8 gradient-accumulation
+micro-batches. Their CPU correlation points to `QuantizedLinearFunction` forward
+with its BF16 weight input, not an activation layout operation.
+
+The cache in `_mxfp4_cached_weight` was correct but only called from
+`quantize._replace_forward`, the patched-Megatron path. Since §5.13 made native
+`Lumen*ParallelLinear` the default, `_do_gemm` had bypassed it and re-derived
+byte-identical RTN weights and DGrad transposes on every micro-batch. The native
+path now caches the two weight operands on the Parameter and passes them through
+`fp8_weight_cache` / `fp8_weight_scale`; the existing optimizer-step hook clears
+both the patched-module and native-Parameter cache locations.
+
+The second trace confirms the structural result:
+
+| current default, per step | before | native cache | delta |
+|---|---:|---:|---:|
+| weight convert calls / time | 992 / 62.5 ms | 124 / 4.3 ms | −58.2 ms |
+| packed transpose calls / time | 992 / 71.3 ms | 124 / 4.8 ms | −66.5 ms |
+| quantize/layout total | 575.2 ms | 454.3 ms | −120.9 ms |
+| main-compute-stream busy | 7338.9 ms | 7246.6 ms | −92.3 ms |
+
+The profiler stretches a normal ~6.1 s iteration to ~7.3 s of compute-stream
+busy time, so the last two rows are attribution, not a step-time claim. A
+profiler-free 60-step A/B on the same code, median over iterations 21–60, gives
+6093.3 ms with `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1` and **6019.9 ms** with the
+cache: **−73.5 ms / 1.21%** (means 6104.2 / 6040.8). Both complete with zero NaN
+or skipped iterations and loss@60 differs by 0.0018. The price is ~2.8 GiB/GPU
+for both packed weight layouts and expanded scales.
+
+After this fix the largest MXFP4-owned non-GEMM kernel is unambiguous:
+`_dual_layout_quant_mxfp4_kernel` remains 412.5 ms/step in the trace (2976
+launches over two iterations), about 6.8% of the unprofiled step. §5.11 already
+showed it is compute/register-bound rather than bandwidth-bound; register
+pressure and tile occupancy, measured with the six-second CUDA-event harness,
+are the next MXFP4-specific target. Attention is larger but is BF16 work, and
+grad accumulation's available headroom is ruled out in the 2026-08-19 findings.
 
 ---
 
@@ -1328,6 +1424,7 @@ Key insights:
 - Hadamard sign (random vs deterministic) alone did not fix the crash
 - The combination of **H16 + last 5/36 layers BF16** eliminated the late loss spike
 - Per the NVFP4 paper, end-of-network layers are most sensitive to FP4, and ~15% in BF16 is the primary stabilization lever (the AMD/PSU paper makes no such claim; its lever is the deterministic Hadamard)
+- Row 5 moved **two** knobs at once (G 32→16 and the tail), so the table does not attribute the fix to either alone. Every diverging row is H32; **H16 without a tail is untested**. That is the arm to run before treating the tail as optional, and it has to reach the horizon where rows 2–4 broke — a 300-step Megatron sweep at GBS 128 stays clean in all four tail settings (§5.14), which is far too early to count.
 
 ---
 
@@ -1437,3 +1534,11 @@ Key insights:
    in the shared launcher config. Not a Lumen-vs-TE gap; it would pay in both.
 10. **Do not widen Lumen's Hadamard scope** — §4.7 shows TE's all-operand rotation
    does not beat Lumen's WGrad-only rotation.
+11. **Decide the BF16 tail on evidence** — it costs 78.8 ms/step per layer, 6.4% for
+   the default 5 (§5.14), which makes it the largest recipe-level speedup still on
+   the table. Two things are needed and neither is another short A/B. Several seeds
+   per arm, because one sweep put `TAIL_BF16=4` 0.124 nats *ahead* of the default
+   while `TAIL_BF16=0` was 0.037 behind, so the run-level spread swamps the effect.
+   And an H16-no-tail run carried to the horizon where §6.3's rows 2–4 diverged,
+   since that combination has never been tested and divergence is a tail risk that
+   no mean over 300 steps can rule out.
