@@ -62,6 +62,18 @@ class TestMXFP4WeightCacheHook:
         assert not any(_cached(model))
         assert optimizer.steps == 1, "wrapping must still run the original step()"
 
+    def test_native_parameter_cache_is_cleared(self):
+        """Native parallel linears keep the cache on weight, not the module."""
+        model = nn.Sequential(nn.Linear(8, 8), nn.Linear(8, 8))
+        for layer in model:
+            layer.weight._mxfp4_w_cache = ("fp4", "scale")
+        optimizer = _MegatronStyleOptimizer()
+        register_mxfp4_weight_optimizer_hooks(model, optimizer)
+
+        optimizer.step()
+
+        assert not any(hasattr(layer.weight, "_mxfp4_w_cache") for layer in model)
+
     def test_wrapped_step_returns_original_result(self):
         optimizer = _MegatronStyleOptimizer()
         register_mxfp4_weight_optimizer_hooks(_model_with_cache(), optimizer)

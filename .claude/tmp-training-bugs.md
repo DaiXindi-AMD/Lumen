@@ -13,6 +13,42 @@ Treat any fresh return to the same debugging problem as a new debug session:
 
 Write back only meaningful tests or experiments that change confidence in a hypothesis, such as a new repro, written diff, backend toggle, layerwise compare, kernel test, or targeted integration check. Do not log every identical rerun. Do log negative results that rule a suspicion out.
 
+### [2026-08-24 tail-bf16-sweep-on-c4-300-steps]
+- Why: the 30-step mock sweep above could not speak to accuracy and its 54 ms noise floor swamped the per-layer marginals. Re-ran every `TAIL_BF16` value from 5 through 0 on real data, long enough for both questions.
+- Setup: Megatron backend, 300 steps, GBS 128, seq 8192, `TRAIN_JSONL=/home/xdai/fp8-coworker-repro/data/c4_train_1k_repeat2.jsonl` with the disjoint `c4_valid_heldout.jsonl`, `EVAL_INTERVAL=50 EVAL_ITERS=1`, `EXTRA_ARGS="--lr 1.0e-4 --lr-warmup-iters 50"`. wandb project `qwen3-8b-mxfp4-tail-bf16`, runs `tail{5,4,3,2,1,0}`. Compare with `scripts/compare_tail_bf16_arms.py`.
+- Two setup constraints worth keeping: the default `--lr 1.0e-5 --lr-warmup-iters 2` decays to zero within the run and cannot produce a divergence signal at any precision, which is why the earlier arms all looked clean; and the held-out budget is `(steps/EVAL_INTERVAL + 1) x EVAL_ITERS x GBS` sequences against ~1315 available in that file (10.8M tokens), so `EVAL_INTERVAL=30` would have hit `StopIteration` mid-run. 896 used here.
+- Step time, median of iterations 21-300 with the interquartile range:
+
+  | `TAIL_BF16` | MXFP4 layers | ms/step | IQR | vs base | speedup | marginal ms/layer |
+  |---|---|---|---|---|---|---|
+  | 5 | 31 | 6168.6 | 24.2 | — | 1.000x | — |
+  | 4 | 32 | 6087.2 | 20.9 | −81.4 | 1.013x | 81.4 |
+  | 3 | 33 | 6012.1 | 18.1 | −156.6 | 1.026x | 75.1 |
+  | 2 | 34 | 5924.8 | 19.0 | −243.9 | 1.041x | 87.3 |
+  | 1 | 35 | 5851.4 | 18.5 | −317.2 | 1.054x | 73.4 |
+  | 0 | 36 | 5774.7 | 15.5 | −393.9 | **1.064x** | 76.7 |
+
+- **This resolves the per-layer question the 30-step arms could not.** A 280-iteration median has an IQR of 15-24 ms against a smallest gap of 81 ms, so every arm separates. The marginal cost is flat at 78.8 ms/layer — no knee, and none of the structure the mock table showed (the 47.9-to-130.8 spread there was noise, as that entry already concluded). Endpoint agrees with the mock measurement: 6.39% here, 6.58% there.
+- **The loss comparison settles nothing, and shows why.** Held-out loss at step 300 for tails 5/4/3/2/1/0: 5.7172 / 5.5935 / 5.7043 / 5.7434 / 5.7824 / 5.7537. Filling the missing arms leaves the ordering non-monotonic. Tail 4 quantizes one more layer than the default and lands 0.124 nats *better*; tail 0 quantizes five more and is 0.037 nats worse. Run-level spread is therefore >= ~0.12 nats and the smaller differences are inside it. Tail 4 is consistently ahead from iteration 25 on, which does not argue against noise — an early perturbation putting a run on a lasting trajectory is how run-level variance shows up.
+- Plausible mechanism for the arms not being paired despite identical seed and data: WGrad applies stochastic rounding to the gradient, so changing *which* layers are quantized changes the random stream too, not only the precision.
+- Independent anchor: report §4.7 measured the tail buying 0.006 nats at 1000 steps on TE, i.e. 20x below this noise floor. A short run was never going to see it. Needs several seeds per arm.
+- No instability signal anywhere at this horizon: zero NaN and zero skipped in all six arms, grad-norm medians 0.88-0.96, p95 ~3.0, no iteration above 10.
+- **Not a green light to drop the tail.** Every §6.3 run that diverged used H32, and row 5 changed G 32->16 *and* added the tail together, so H16-without-tail has never been run to the horizon where rows 2-4 broke (step ~1275-1550 there). 314M tokens at lr 1e-4 with no spike lowers the prior; it does not test a tail risk.
+- Layer assignment verified rather than assumed, given the prefix bug above. `enable_fp8_for_parallel_linear`'s own count confirms 124/20 through 144/0 quantized-vs-BF16 modules in increments of four, against 144 = 36 layers x 4 linears, i.e. exactly 5 through 0 layers held back. Re-running the tail rule through `is_under_bf16_prefix` agrees, as does the flat 78.8 ms/layer.
+- When checking this, note the `lumen.quantize` logger line in these runs reads "Quantization enabled on 0 nn.Linear layers ... bf16_layers_skipped=1". That is the generic `nn.Linear` patcher finding nothing because `--lumen-linear` already swapped the modules out; it is not a sign that quantization was off. The real count is the `> Enabled FP8 (scaling=mxfp4) on N Lumen parallel linear modules` line, which `print_rank_0` emits without a logger prefix — grep for it by name, not by a `lumen.*:` pattern.
+- Status: step-time side closed and written into report §5.14. Accuracy side open and deliberately not pursued further; the two experiments it needs are report §8 next-step 11.
+
+### [2026-08-24 native-mxfp4-weight-cache-gap]
+- Symptom: a fresh two-iteration Qwen3-8B MXFP4 trace on the native-linear default shows `_convert_to_mxfp4_kernel` and `_transpose_packed_fp4_kernel` each at **992 calls / 62.5 and 71.3 ms per step**. 992 is exactly 124 MXFP4 linears x 8 micro-batches. Trace correlation binds both kernels to `QuantizedLinearFunction` forward with a BF16 weight input.
+- Repro/profile: `TRAIN_STEPS=22 TAIL_BF16=5 LAUNCH=native EXTRA_ARGS="--profile --use-pytorch-profiler --profile-step-start 18 --profile-step-end 20 --profile-ranks 0 --tensorboard-dir .../prof_current_tail5"`. Summary: `examples/qwen3/results/prof_current_tail5/kernel_summary.txt`. It reproduces the 8/19 profile to within 1% (dual-layout 408.7 vs 406.8 ms, FP4 GEMM 1483.2 vs 1484.8), so this is not a one-off trace artifact.
+- Cause: `_mxfp4_cached_weight` was only wired from `quantize._replace_forward`, the patched-Megatron linear path. `--lumen-linear` became the default later; native `parallel_linear._do_gemm` called `quantized_linear` with the BF16 weight and never supplied `fp8_weight_cache`, so the existing cache and its optimizer-step invalidation hook had nothing to cache. This also explains why report §5.13 measured the old cache toggle as −2.2 ms noise: that toggle did not reach the path being measured.
+- Fix under test: native `_do_gemm` calls the existing `_mxfp4_cached_weight`, storing the cache on the Parameter, and passes its data/scale through `fp8_weight_cache` / `fp8_weight_scale` so `QuantizedLinearFunction` still computes wgrad for the BF16 master. `register_mxfp4_weight_optimizer_hooks` now clears both module-owned (patched path) and Parameter-owned (native path) caches after `optimizer.step()`.
+- Structural verification: second trace at `examples/qwen3/results/prof_native_weight_cache/kernel_summary.txt` reduces convert and transpose from 992 calls each to **124 calls each** (one per linear per optimizer step), 62.5→4.3 and 71.3→4.8 ms. Quantize/layout falls 575.2→454.3 ms and compute-stream busy 7338.9→7246.6 ms. The profiler inflates the step, so use those as attribution only.
+- Unprofiled A/B: 60 steps each, same code and mock corpus, cache off via `LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1`, median/mean over steps 21–60: off 6093.3/6104.2 ms, on **6019.9/6040.8 ms**, i.e. median **−73.5 ms / 1.21%**. Both zero NaN/skipped; loss@60 2.27216 / 2.27040. Memory rises from ~0.6387 to ~0.6498 of a 251.7-GiB GPU, about **2.8 GiB/GPU**, for both packed weight layouts and scales.
+- Tests: `PYTHONPATH=/home/xdai/Lumen pytest -q tests/quantize/test_mxfp4_weight_cache_hook.py` -> 6 passed; added native Parameter-cache invalidation coverage. The recurring torch weakref shutdown traceback appears after pytest exits but does not change its zero exit code.
+- Next target from the post-fix trace: `_dual_layout_quant_mxfp4_kernel`, 412.5 ms/step and 2976 calls over two iterations. It is now the largest MXFP4-owned non-GEMM kernel. §5.11 already ruled out memory traffic as the limiter; use the CUDA-event harness to sweep register pressure / tile occupancy. Do not revisit GAF: the 8/19 entry bounds its recoverable headroom and rules out the available ASM epilogue path.
+- Status: fixed and measured; report §5.15.
+
 ## Open
 
 ### [2026-08-06 fp8-per-tensor-path-slower-than-bf16]

@@ -902,10 +902,11 @@ def register_mxfp4_weight_optimizer_hooks(
 ) -> None:
     """Register a post-step hook to invalidate MXFP4 weight caches.
 
-    MXFP4 weight quantization (RTN, deterministic) is cached on each module
-    across micro-batches within a gradient accumulation step. After
-    ``optimizer.step()`` updates BF16 master weights, this hook clears the
-    cache so the next forward re-quantizes from the updated weights.
+    MXFP4 weight quantization (RTN, deterministic) is cached on each patched
+    module, or on the weight Parameter for native Lumen linears, across
+    micro-batches within a gradient accumulation step. After ``optimizer.step()``
+    updates BF16 master weights, this hook clears both cache locations so the
+    next forward re-quantizes from the updated weights.
 
     Without this the cached FP4 weight is never invalidated, so forward and
     DGrad keep using the step-0 weights for the whole run — the loss flattens
@@ -924,6 +925,12 @@ def register_mxfp4_weight_optimizer_hooks(
             for m in chunk.modules():
                 if hasattr(m, "_mxfp4_w_cache"):
                     del m._mxfp4_w_cache
+                # Native Lumen parallel linears cache on their Parameter because
+                # they call the shared _do_gemm helper rather than the patched
+                # module forward above.
+                weight = getattr(m, "weight", None)
+                if weight is not None and hasattr(weight, "_mxfp4_w_cache"):
+                    del weight._mxfp4_w_cache
 
     # Megatron's ChainedOptimizer / DistributedOptimizer are not
     # torch.optim.Optimizer subclasses and lack register_step_post_hook, so
