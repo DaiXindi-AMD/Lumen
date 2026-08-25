@@ -1,0 +1,49 @@
+trace: examples/qwen3/results/prof_clean_tail0/gbt350-odcdh2-c02-1_961013.1787683578381857731.pt.trace.json
+iterations: 2   distinct kernels: 105
+total GPU kernel time: 5979.7 ms/iter   (107.0% of a 5591 ms step)
+
+=== streams (summed kernel time vs wall time the stream is busy) ===
+          stream  summed ms/iter  busy ms/iter  kernels/iter
+             0/1          5087.7        5044.8         21895
+             0/5           891.9         891.6          3120
+     all streams          5979.7        5413.9         25032
+
+=== by category ===
+category                 ms/iter   share  calls/iter
+attention                 1551.1   27.7%        1152
+fp4 gemm                  1283.2   23.0%        3456
+grad accumulate            670.3   12.0%        3585
+other gemm                 448.0    8.0%          24
+quantize / layout          423.8    7.6%        4896
+collectives                406.3    7.3%         226
+optimizer                  354.0    6.3%        4516
+norm                       273.3    4.9%        3480
+activation                 236.0    4.2%         576
+rope / embedding           164.0    2.9%        1152
+copy / reshape              71.6    1.3%         391
+elementwise other           65.8    1.2%        1289
+reduce / loss               26.1    0.5%         176
+unclassified                 6.2    0.1%         113
+
+=== top 20 kernels ===
+  ms/iter   share    calls  category             name
+  1157.83   20.7%      288  attention            _ZN5aiter41fmha_bwd_hd128_bf16_causal_br_a32_psskddvE.kd
+   652.83   11.7%     2304  fp4 gemm             _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E.kd
+   572.17   10.2%      864  fp4 gemm             _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x512E.kd
+   503.94    9.0%     2344  grad accumulate      void at::native::vectorized_templated_elementwise_kernel<4, at::native::CUD...
+   406.32    7.3%      226  collectives          ncclDevKernel_Generic_1(ncclDevKernelArgsStorage<4096ul>) [clone .kd]
+   380.25    6.8%     2304  quantize / layout    _dual_layout_quant_mxfp4_kernel.kd
+   307.26    5.5%      288  attention            _ZN5aiter26fmha_fwd_hd128_bf16_causalE.kd
+   162.48    2.9%        8  other gemm           Cijk_Ailk_Bjlk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_...
+   151.52    2.7%      288  activation           _swiglu_bwd_kernel.kd
+   144.08    2.6%        8  other gemm           Cijk_Ailk_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_SN_LDSB...
+   141.45    2.5%        8  other gemm           Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT256x256x64_MI16x16x1_CMS_SN_...
+   127.67    2.3%     1152  grad accumulate      void at::native::vectorized_elementwise_kernel<8, at::native::CUDAFunctor_a...
+   120.99    2.2%      576  norm                 _rmsnorm_bwd_triton.kd
+    97.94    1.8%      576  rope / embedding     void transformer_engine::fused_rope_backward_kernel<hip_bfloat16>(hip_bfloa...
+    84.52    1.5%      288  activation           _swiglu_fwd_kernel.kd
+    77.98    1.4%      576  optimizer            void at::native::reduce_kernel<128, 4, at::native::ReduceOp<c10::BFloat16, ...
+    69.75    1.2%      288  copy / reshape       void at::native::(anonymous namespace)::CatArrayBatchedCopy_contig<at::nati...
+    66.05    1.2%      576  rope / embedding     void transformer_engine::fused_rope_forward_kernel<hip_bfloat16>(hip_bfloat...
+    58.23    1.0%      288  fp4 gemm             _ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_192x256E.kd
+    45.94    0.8%      288  attention            _ZN5aiter30fmha_bwd_hd128_dq_convert_bf16E.kd

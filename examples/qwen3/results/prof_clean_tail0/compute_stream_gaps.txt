@@ -1,0 +1,22 @@
+trace: examples/qwen3/results/prof_clean_tail0/gbt350-odcdh2-c02-1_961013.1787683578381857731.pt.trace.json
+compute stream: pid/tid 0/1   iterations: 2
+window 5618.1 ms/iter   busy 5044.8   idle 573.3 (10.2%)
+
+=== idle intervals by width ===
+           width  count/iter   ms/iter  share of idle  ms/iter w/ comm
+          0-5 us        7778       9.9           1.7%              0.1
+         5-20 us        2724      29.5           5.1%              0.5
+       20-100 us        1742      79.6          13.9%              2.3
+     100-1000 us         434     148.2          25.9%             28.2
+        >1000 us          18     306.1          53.4%            274.4
+
+=== top 6 single idle intervals (>= 20 us) ===
+      ms  comm%  host op
+  293.15   100%  -
+  245.55   100%  -
+    8.79    57%  -
+    8.65    58%  -
+    3.55     0%  -
+    3.52     0%  -
+
+gaps >= 20 us account for 533.9 ms/iter of 573.3 ms idle

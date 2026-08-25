@@ -119,6 +119,20 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - Conclusion: **1.6x is not reachable from MXFP4-side work at this shape.** Ceiling with every transformer linear and its quantization free is 2.20x; the best measured recipe available today is `TAIL_BF16=0`.
 - Status: measured and written up; report §5.16 / §5.17.
 
+### [2026-08-25 tail0-measured-and-the-step-is-573ms-longer-than-its-kernels]
+- Ask, continued from the entry above: measure the `TAIL_BF16=0` projection rather than quoting it, then find what is next.
+- `TAIL_BF16=0` lands where §5.16 projected. 60 steps, median of iterations 21-60, same launcher/corpus/eval-outside as the paired baseline: **5591.0 ms vs BF16 8520.7 = 1.524x** (projection was 1.52x). Loss@60 2.2703 against BF16's 2.2728. IQR 25.6.
+- Clean `TAIL_BF16=0` trace at `examples/qwen3/results/prof_clean_tail0/`; every count closed form (FP4 GEMM 3456 = 36x4x3x8, dual-layout 2304 = 36x4x2x8, Tensile 24 = vocab only, `fmha_fwd` 288).
+- **Two categories move for reasons that are not the recipe.** Attention drops 1734.5 -> 1551.1 ms/iter at identical work (`fmha_bwd` same kernel, same 288 calls, 1336.5 -> 1157.8): FP4 GEMMs draw less power and the rest of the model clocks higher. Treat cross-trace "shared category" comparisons as +-10%. Collectives rise 260.3 -> 406.3 for the same bytes.
+- **The real finding: at `TAIL_BF16=0` the compute stream is busy 5044.8 ms of a 5591 ms step, i.e. 573.3 ms idle, and 302.6 ms of that idle has a collective in flight.** New tool `scripts/trace_compute_stream_gaps.py`. Two intervals per iteration (293.2 and 245.6 ms) are 100% comm-covered and sit at 85% through the step.
+- Exposed comm *grows as MXFP4 gets faster*, because the bytes are fixed (FP32 grad reduce-scatter 32 GB + BF16 param all-gather 16 GB) and the backward available to hide them shrinks: comm-covered idle is 128.0 ms/iter in BF16, 150.9 at `TAIL_BF16=5`, 302.6 at `TAIL_BF16=0`. Total compute-stream idle is 388.3 / 388.2 / 573.3.
+- Host trace names the stall exactly: `ddp.py:448 hook` -> `register_grad_ready` -> `start_grad_sync` -> `param_and_grad_buffer.py:175 check_grads` -> `rerun_state_machine.py:436 validate_result` -> `aten::item`, blocking 293 ms. `check_grads` L2-norms each bucket's grad buffer and runs two `validate_result` (isnan, isinf), each a device sync inside the backward hook. `check_for_nan_in_grad` defaults False in the dataclass but `training.py:975` overwrites it from `args.check_for_nan_in_loss_and_grad` (default True). Cost: **578.8 ms/iter of host block in MXFP4, 927.9 in BF16, 268 syncs/iter**.
+- **Both obvious fixes are negative results.** `--no-check-for-nan-in-loss-and-grad` (verified `check_for_nan_in_grad=False` in the logged config) buys 15.8 ms: 5591.0 -> 5575.2. Adding `--overlap-param-gather` buys 3.1 more: -> 5572.1. Both inside the IQR (25.6-56.6). The sync was waiting on the same collective the compute stream was waiting on, and the exposure is on the gradient reduce-scatter, not the param all-gather.
+- Not chased further, but this is where the next win is: 292 ms for a 28 GB bus volume is ~100 GB/s, low for one node. Candidates are RCCL config (runs log `NCCL WARN NUMA auto balancing enabled`, needs root), bucket-group granularity, and the FP32 reduce dtype. Shared infrastructure, helps both arms.
+- Vocab projection ruled out as the remaining 448.0 ms of BF16 GEMM: the tuned A4W4 table has N in {4096, 6144, 16384, 24576} and the projection is N=151936, so all three of its GEMMs fall back to Triton, which the 8/19 wgrad entry prices well above ASM. Accuracy-hostile on top of that.
+- **Final: best measured 5572.1 ms vs BF16 8520.7 ms = 1.529x.** 1.6x needs 5325.4. A constant *c* off both arms needs c = 658 ms, more than the MXFP4 arm's entire 573.3 ms of idle and well over BF16's 388.3, so no scheduling fix reaches it; the only MXFP4-owned item left is quantization at 423.8 ms/iter and 1.6x wants 58% of it.
+- Status: measured and written up; report §5.18.
+
 ## Open
 
 ### [2026-08-19 coworker-fused-quant-transpose-gfx950-dtype]
