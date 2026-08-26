@@ -165,6 +165,17 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - Honest read of -32.8 ms: ~0.9x the IQR (37.1), so at the edge of what a 40-iter median resolves. Two things argue real: largest single-change delta this campaign (vs -15.8, -18.9, +6.0 for the DDP/NCCL flags), and it was *predicted before measurement* -- microbenchmark 1.13-1.16x on grad shapes implies ~29-45 ms, and 32.8 landed inside. Matching an a-priori prediction beats its own effect size. The 2 DDP flags adding 6.0 ms on top is still noise.
 - Status: HIP rewrite recommended against, with numbers; rounds=4 landed and verified. Report §5.20. **Final: BF16 8520.7 ms, MXFP4 5552.2 ms, 1.535x.**
 
+### [2026-08-26 philox-rounds-4-through-the-precision-harness]
+- Ask: the round reduction changes gradient numerics, so run it through the precision harness before considering it for a default.
+- Config: `run_precision_matrix.sh`, 300 steps real C4 + held-out valid + held-out test, qwen3_8b, TAIL_BF16=0 (quantizes every layer = pays the most SR = strictest test of a dither change), seed 1234, `CACHE_TAG=srphilox` shared by all arms so backend choices are pinned and rounds is the only variable. Logs `lumen_qwen3_8b_srp{7,4,7rep2}tail0_mxfp4.log`.
+- **Ran the control twice**, because a two-arm comparison would not be interpretable: §10 of the precision report already establishes the MXFP4 path is not bitwise reproducible at fixed seed (Qwen3-8B repeat moved 0.005; both BF16 repeats reproduced digit for digit).
+- Results: r7(A) valid 6.3924 / test 6.4004 / 5659.8 ms; r7(B) valid 6.4024 / test 6.4096 / 5651.8 ms; **r4 valid 6.3856 / test 6.3924 / 5629.1 ms**.
+- Same-config noise (the two identical r7 runs): **0.0100 valid, 0.0092 test**. r4 vs r7 mean: **-0.0119 valid, -0.0126 test** = -1.67 sd and -1.94 sd with s from n=2. Not significant at any conventional bar, and **both slices move in the better (lower-loss) direction** -- a dither that lost independence would raise loss. Consistent with §5.20's residual std being 0.02012 at 4 rounds vs 0.02049 at 7 (and 0.09922 at 3): 4 rounds is the same dither with less mixing, not a degraded one.
+- Step time reproduces on a different corpus and step count: -26.6 ms vs the two-run r7 mean, against -32.8 ms on the 60-step mock measurement.
+- Limits: 300 steps bounds short-horizon only; says nothing about long-horizon convergence or RL (gradient-precision changes have bitten this project before -- different mechanism, accumulation dtype, but same class of caution); noise sd rests on 2 samples.
+- **Decision: default stays 7.** Win is 26-33 ms, ~0.5% of step, 1.524x -> 1.533x -- not worth changing gradient numerics by default until it has ridden in a long run. Knob is `LUMEN_SR_PHILOX_ROUNDS`, and it prints a rank-0 line when non-default because the round count is not a Megatron arg and would otherwise leave no trace in the log.
+- Status: harness passed, no evidence of harm, default deliberately unchanged. Report §5.20.
+
 ## Open
 
 ### [2026-08-19 coworker-fused-quant-transpose-gfx950-dtype]

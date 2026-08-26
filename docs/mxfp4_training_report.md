@@ -1868,6 +1868,59 @@ window. A confirmation matching an a-priori prediction is stronger evidence than
 its own effect size. The DDP flags adding a further 6.0 ms remains noise, exactly
 as it was on its own.
 
+#### Through the precision harness
+
+Step time is the cheap half. The round reduction changes gradient numerics, so it
+went through `examples/scripts/run_precision_matrix.sh` at the configuration
+§5.14's C4 tail sweep used — 300 steps of real C4 with held-out validation and a
+held-out test slice, `qwen3_8b`, `TAIL_BF16=0`, seed 1234, both arms sharing one
+autotune cache so the per-shape backend choices are pinned and the round count is
+the only difference.
+
+`TAIL_BF16=0` is deliberate: it quantizes every layer, so it is the arm that pays
+the most SR and the strictest test of a dither change.
+
+A two-arm comparison would not have been interpretable on its own, because the
+MXFP4 path is not bitwise reproducible at a fixed seed (§10: the Qwen3-8B repeat
+moved 0.005 while both BF16 repeats reproduced digit for digit). So the control
+was run twice to measure that noise at this exact configuration:
+
+| arm | held-out valid | test | step time |
+|---|---:|---:|---:|
+| rounds=7 (A) | 6.3924 | 6.4004 | 5659.8 ms |
+| rounds=7 (B, identical repeat) | 6.4024 | 6.4096 | 5651.8 ms |
+| **rounds=4** | **6.3856** | **6.3924** | **5629.1 ms** |
+
+| | validation | test |
+|---|---:|---:|
+| same-config noise, two identical rounds=7 runs | 0.0100 | 0.0092 |
+| rounds=4 vs the rounds=7 mean | **−0.0119** | **−0.0126** |
+| as multiples of the noise sd (s from n=2) | −1.67 sd | −1.94 sd |
+
+**The verdict is no evidence of harm.** The effect is the same order as the noise
+of re-running the identical configuration — 1.7–1.9 sd against a standard
+deviation estimated from two samples, which is not significant at any conventional
+bar — and both held-out slices move in the *better* direction. A dither that had
+lost independence would raise loss, not lower it, and §5.20's residual statistics
+already showed why: at 4 rounds the residual std is 0.02012 against 7 rounds'
+0.02049, while 3 rounds is 0.09922. Four rounds is not a degraded dither, it is
+the same dither computed with less mixing.
+
+The step time reproduces too: −26.6 ms against the two-run rounds=7 mean, on a
+different corpus and step count from the 60-step measurement's −32.8 ms.
+
+Three limits worth stating plainly. 300 steps bounds short-horizon behaviour and
+says nothing about long-horizon convergence. It says nothing about RL, where
+gradient-precision changes have bitten this project before — a different
+mechanism (accumulation dtype, §5.18) but the same class of caution. And the noise
+sd rests on two samples.
+
+So `SR_PHILOX_ROUNDS` **stays at 7 by default**. The knob exists, the win is real
+but small — 26–33 ms, ~0.5% of the step, 1.524× → 1.533× — and that is not worth
+changing gradient numerics by default until it has ridden along in a long run.
+`LUMEN_SR_PHILOX_ROUNDS=4` announces itself on rank 0 when set, because the round
+count is not a Megatron argument and would otherwise leave no trace in the log.
+
 ---
 
 ## 6. Debugging History
