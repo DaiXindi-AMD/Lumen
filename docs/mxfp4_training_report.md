@@ -1558,8 +1558,10 @@ TP=1, 8×MI350X), median of iterations 21–60, eval outside the run:
 | MXFP4 `TAIL_BF16=5` | 5984.6 ms | 5999.1 | 31.0 | 1.424× | 2.271212 |
 | MXFP4 `TAIL_BF16=0` | 5591.0 ms | 5614.7 | 25.6 | **1.524×** | 2.270299 |
 | … + `--no-check-for-nan-in-loss-and-grad` | 5575.2 ms | 5593.0 | 56.6 | 1.528× | 2.272596 |
-| … + `--overlap-param-gather` | **5572.1 ms** | 5585.9 | 37.7 | **1.529×** | 2.269602 |
+| … + `--overlap-param-gather` | 5572.1 ms | 5585.9 | 37.7 | 1.529× | 2.269602 |
 | `TAIL_BF16=0` + `--use-nccl-ub --disable-symmetric-registration --ddp-pad-buckets-for-high-nccl-busbw` | 5597.0 ms | 5606.2 | 16.3 | 1.522× | 2.272475 |
+| `TAIL_BF16=0` + `LUMEN_SR_PHILOX_ROUNDS=4` (§5.20) | 5558.2 ms | 5578.0 | 37.1 | 1.533× | 2.272955 |
+| … + both DDP flags — **best measured** | **5552.2 ms** | 5573.4 | 58.5 | **1.535×** | 2.273108 |
 
 The projection was right: `TAIL_BF16=0` lands at 1.524×, against 1.52× predicted
 from the kernel table. Every DDP flag below it is a negative result — 18.9 ms
@@ -1702,9 +1704,10 @@ all closed:
   these sizes. It is also the layer every FP4 paper keeps in high precision, and
   §5.14's C4 sweep could not resolve tail accuracy to better than ~0.12 nats.
 
-**The answer stands: 1.6× is not available at Qwen3-8B / GBS 128 / seq 8192. The
-best measured recipe is 5572.1 ms against BF16's 8520.7 ms, or 1.53×**, and the
-next real lever is the data-parallel collective, which belongs to both arms.
+**The answer stands: 1.6× is not available at Qwen3-8B / GBS 128 / seq 8192.** At
+the time of writing the best measured recipe was 5572.1 ms against BF16's
+8520.7 ms, or 1.53×; §5.20 then took it to 5552.2 ms (1.535×) by cutting Philox
+rounds, which does not change the conclusion.
 
 ### 5.19 What the quantizer's time is actually spent on
 
@@ -1846,6 +1849,24 @@ step: **5474 ms, or 1.557×**.
 slightly: the reachable range at this shape is ~1.55–1.56×, and 1.6× is not
 available.** The quantizer is not badly written; a third of it is buying entropy
 and the rest is close to the arithmetic it needs.
+
+#### Measured end to end
+
+`LUMEN_SR_PHILOX_ROUNDS=4` at `TAIL_BF16=0`, 60 steps, median of iterations 21–60:
+**5558.2 ms against the 5591.0 ms baseline, −32.8 ms, 1.533×**, loss@60 2.272955
+against the baseline's 2.270299 and inside the spread of every other arm
+(2.2696–2.2731). Stacking the two DDP flags from §5.18 gives the best figure
+measured in this campaign, **5552.2 ms, or 1.535×**.
+
+Read the −32.8 ms honestly: it is ~0.9× the IQR (37.1), so it sits at the edge of
+what a 40-iteration median resolves. Two things argue it is real rather than
+drift. It is the largest single-change delta measured here — against −15.8 and
+−18.9 ms for the DDP flags and +6.0 for the NCCL transport pair — and, unlike
+those, it was *predicted before it was measured*: the microbenchmark's 1.13–1.16×
+on gradient shapes implies ~29–45 ms of step time, and 32.8 landed inside that
+window. A confirmation matching an a-priori prediction is stronger evidence than
+its own effect size. The DDP flags adding a further 6.0 ms remains noise, exactly
+as it was on its own.
 
 ---
 
