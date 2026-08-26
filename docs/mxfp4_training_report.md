@@ -1559,11 +1559,13 @@ TP=1, 8×MI350X), median of iterations 21–60, eval outside the run:
 | MXFP4 `TAIL_BF16=0` | 5591.0 ms | 5614.7 | 25.6 | **1.524×** | 2.270299 |
 | … + `--no-check-for-nan-in-loss-and-grad` | 5575.2 ms | 5593.0 | 56.6 | 1.528× | 2.272596 |
 | … + `--overlap-param-gather` | **5572.1 ms** | 5585.9 | 37.7 | **1.529×** | 2.269602 |
+| `TAIL_BF16=0` + `--use-nccl-ub --disable-symmetric-registration --ddp-pad-buckets-for-high-nccl-busbw` | 5597.0 ms | 5606.2 | 16.3 | 1.522× | 2.272475 |
 
 The projection was right: `TAIL_BF16=0` lands at 1.524×, against 1.52× predicted
-from the kernel table. The two DDP flags below it are negative results — 18.9 ms
-across both, against IQRs of 25.6 and 37.7 — and are reported here only because
-the profile made them look like the obvious next move.
+from the kernel table. Every DDP flag below it is a negative result — 18.9 ms
+across the first two against IQRs of 25.6 and 37.7, and 6.0 ms the *wrong* way for
+the NCCL transport pair against an IQR of 16.3 — and they are reported here only
+because the profile made them look like the obvious next move.
 
 #### The `TAIL_BF16=0` profile
 
@@ -1641,13 +1643,42 @@ ahead into work that has nowhere to go. `--overlap-param-gather` adds a further
 **3.1 ms**, also noise — the exposure is on the gradient reduce-scatter, and
 overlapping the parameter all-gather does not touch it.
 
-What would: the 32 GB FP32 gradient reduce-scatter itself. At 8 ranks its bus
-volume is 28 GB, and 292 ms for it is roughly 100 GB/s, well under what a single
-node's fabric should give. Whether that is RCCL configuration (the run logs
-`NCCL WARN NUMA auto balancing enabled which can lead to variability in the RCCL
-performance`, which needs root to change), bucket-group granularity, or the FP32
-reduce dtype is not yet separated, and it is shared-infrastructure work rather
-than MXFP4 work.
+A third flag pair aimed straight at the transport is also negative:
+`--use-nccl-ub --disable-symmetric-registration --ddp-pad-buckets-for-high-nccl-busbw`
+measures **5597.0 ms, 6.0 ms slower** than the baseline at an IQR of 16.3. (Plain
+`--use-nccl-ub` dies first: `nccl_allocator.py:135` raises "symmetric setting with
+torch.cuda.MemPool requires higher PyTorch version", so the local-registration
+opt-out is required on this PyTorch.) The result is consistent with what the flag
+claims — user-buffer registration lowers the SM count communication takes *while
+overlapped*, and pad-buckets changes transfer sizes. Neither touches the reason
+the collective is exposed in the first place.
+
+So the exposure does not appear to be reachable from DDP-level configuration. Two
+readings remain, and they are not distinguished yet:
+
+- **Wire time.** The FP32 gradient reduce-scatter moves 32 GB; at 8 ranks that is
+  28 GB of bus volume, and 292 ms for it is roughly 100 GB/s. Halving it by
+  reducing in BF16 is not available: `--grad-reduce-in-bf16` sets
+  `DDPConfig.grad_reduce_in_fp32=False`, which makes `grad_dtype` the parameter
+  dtype (`distributed_data_parallel.py:168`), and `param.main_grad` is a view into
+  a buffer allocated at that dtype (`param_and_grad_buffer.py:722`, `:752`). The
+  flag therefore moves the *accumulation* of all 8 micro-batches into BF16, not
+  just the wire — roughly 64-way accumulation at 8 mantissa bits once the
+  cross-rank reduce is included. Megatron's own comment at `arguments.py:759` says
+  bf16 requires fp32 gradient accumulation, and it has been observed to diverge in
+  RL. Out of scope.
+- **Rank skew.** `partition_buckets`' rule 2 gives each bucket group a single
+  bucket when no FP8 buffer is present, and the trace has 226 collective calls per
+  iteration against ~200 buckets at `bucket_size=40000000` — so this is many small
+  reduce-scatters, not two large ones. Two of them nonetheless account for 292 of
+  the 406.3 ms, which is what a collective looks like when it spins waiting for the
+  slowest rank. Only rank 0 was profiled, so this cannot be confirmed from these
+  traces; `--profile-ranks 0 1 2 3 4 5 6 7` and comparing arrival times is the
+  experiment. Both RCCL and AITER print a NUMA-auto-balancing warning every run
+  (`sudo sysctl kernel.numa_balancing=0`, needs root), which is the cheapest thing
+  to rule out first.
+
+Either way this is shared-infrastructure work rather than MXFP4 work.
 
 #### The 1.6× arithmetic, with the profile behind it
 
