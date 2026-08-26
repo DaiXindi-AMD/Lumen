@@ -143,6 +143,16 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - `--grad-reduce-in-bf16` is **out of scope, not untried**: it sets `DDPConfig.grad_reduce_in_fp32=False`, so `grad_dtype` becomes the param dtype (`distributed_data_parallel.py:168`) and `param.main_grad` is a view into a buffer at that dtype (`param_and_grad_buffer.py:722`, `:752`). It moves accumulation of all 8 micro-batches into BF16, not just the wire. Megatron's own `arguments.py:759` says bf16 needs fp32 grad accumulation, and it has been observed to diverge in RL.
 - Status: ruled out (DDP-level comm config); rank-skew hypothesis open.
 
+### [2026-08-26 quantizer-launch-params-exhausted-and-SR-is-a-quarter-of-it]
+- Ask: with the collective ruled out, the quantizer is the only MXFP4-owned item left. Sweep the launch axes §5.11's tile sweep never touched, then find what a rewrite should attack.
+- Triton 3.7's HIP backend `HIPOptions` takes, beyond `num_warps`: `waves_per_eu`, `num_stages`, `matrix_instr_nonkdim`, `kpack`, `schedule_hint`, `num_ctas`, `instrumentation_mode`.
+- **Negative result, `--axis pipeline`** (new mode in `benchmarks/bench_dual_layout_tiles.py`): num_stages x waves_per_eu x MFMA shape at the launcher's own tiles is **1.01x aggregate over one call of each production shape, 2 of 5 shapes slower**, best single shape 1.02x, every delta 0.003-0.010 ms on 0.077-0.505 ms measurements, i.e. noise.
+- **Why num_stages is inert, mechanically:** `_dual_layout_quant_mxfp4_kernel` has no loop. One `tl.load`, two `_calculate_fp4_scales`/`_pack_fp4` pairs, one Hadamard, four stores — straight-line, nothing for software pipelining to stage. `waves_per_eu=0` (unset) also beat every explicit occupancy floor on every shape. Launch-config tuning for this kernel is now exhausted in both directions; do not sweep it again.
+- **`--axis features` is the useful result — SR costs 22-26% of the gradient-path quantizer** (gate_up N=24576 -26%, qkv N=6144 -22%, o/down N=4096 -26%). This **contradicts `_generate_randval`'s docstring**, which claims the four-words-per-round trick dropped SR to "nothing measurable (0.146 -> 0.059 vs 0.057 RTN)". The trick is real and load-bearing, but that measurement is stale at production tiles/shapes. Largest addressable feature. `SR_PHILOX_ROUNDS` is 7 (Philox standard is 10) and could go lower since SR dither has no cryptographic bar — numerics change, needs the §5.14 harness.
+- MFMA Hadamard is load-bearing, not a tuning artifact: butterfly fallback costs +63% to +130%. Leave alone. Fused scale swizzle costs 3-6% and removes the standalone 27.24 ms/iter `swizzle_mxfp4_scale` pass, so net positive. B shuffle is 0-3%, free.
+- **Arithmetic against the 1.6x goal:** SR made entirely free is ~24% of the gradient half of 423.8 ms/iter = ~51 ms = 1.529x -> 1.543x. The step needs 247 ms off. Even a full 2x rewrite (423.8 -> 212) lands 5360 ms = **1.589x**, still short. Production sustains 1734-2687 GB/s against ~8 TB/s HBM so the headroom exists on paper, but the butterfly result says compute-bound on rotation+pack, not a bad memory schedule.
+- Status: launch tuning ruled out; SR identified as the one addressable feature; 1.6x not reachable from the quantizer alone. Report §5.19.
+
 ## Open
 
 ### [2026-08-19 coworker-fused-quant-transpose-gfx950-dtype]
