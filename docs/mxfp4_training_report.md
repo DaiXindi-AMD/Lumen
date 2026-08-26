@@ -1759,6 +1759,94 @@ pack rather than parked on a bad memory schedule. A successful 2× rewrite lands
 423.8 → ~212 ms, i.e. 5360 ms and **1.589×** — still short, and only on the
 assumption that a 2× rewrite lands at all.
 
+### 5.20 Why a hand-written kernel will not double it, and what does help
+
+Before committing to a HIP rewrite, `benchmarks/inspect_dual_layout_asm.py` asks
+what the compiler is already achieving. The answer closes the case for a rewrite
+as a *scheduling* exercise:
+
+| shape | tile | VGPR | spills | LDS | occ (waves/SIMD) | instructions |
+|---|---|---:|---:|---:|---:|---:|
+| grad gate_up | (256, 64) | 118 | **0** | 32 KB | 4 | 2415 |
+| act down | (256, 64) | 117 | **0** | 32 KB | 4 | 1554 |
+| grad qkv | (256, 32) | 88 | **0** | 16 KB | 5 | 1331 |
+| grad o/down | (256, 32) | 88 | **0** | 16 KB | 5 | 1330 |
+| act qkv/o/gate_up | (256, 32) | 84 | **0** | 16 KB | 5 | 885 |
+
+Zero spills everywhere, 4–5 waves/SIMD, and the instruction stream is 66–78%
+plain VALU against 0.6–1.0% MFMA and well under 1% memory. There is no register
+pressure to relieve and no memory schedule to fix; instruction count *is* time.
+A rewrite would have to remove arithmetic, and the AMDGCN says which arithmetic
+there is to remove. On `grad gate_up`, of 2415 instructions:
+
+| what | instructions | share |
+|---|---:|---:|
+| Philox (`v_xor_b32` 386, `v_mul_lo_u32` 210, `v_mul_hi_u32` 200) | **796** | **33%** |
+| address/bit arithmetic (`v_lshlrev` 135, `v_and` 100, `v_add_u32` 89, `v_perm_b32` 88, `v_bfe` 45, …) | ~468 | 19% |
+| amax reduction (`v_max_f32` 152 + 48, `v_max3_f32` 40, `v_max_u16` 22) | ~262 | 11% |
+| FP4 convert/pack (`v_cvt_scalef32_sr_pk_fp4_f32`) | 64 | 3% |
+| Hadamard (`v_mfma_f32_16x16x16_bf16`) | 16 | 0.7% |
+
+A third of the kernel is generating random numbers. That is not something a
+rewrite is better at than Triton — it is Philox, and it costs what it costs.
+
+**The hardware PRNG is not a way out.** gfx950 has `v_prng_b32`, one instruction,
+and `v_cvt_scalef32_sr_pk_fp4_f32` already uses it internally to derive the second
+FP4 lane's dither from the seed it is handed — so half of production's SR noise is
+already hardware PRNG output, which makes "use it for everything" the obvious
+idea. `benchmarks/probe_prng_b32.py` characterises it and the idea fails: it is a
+pure, bijective, *linear* map (popcount not preserved, so not a bit permutation;
+some output bit equals some input bit exactly, so a GF(2) map with a pass-through
+field — an xorshift step). Applied to already-uniform input it is uniform (worst
+bit |p−0.5| = 0.0011 against a 0.00195 tolerance, byte χ²/df = 1.00); applied to
+the counter sequence 0,1,2,… it fails outright (|p−0.5| = 0.5, χ²/df = 4112), and
+`prng(0) = 0` is a fixed point. It stirs entropy, it does not create any. Being a
+bijection on 32 bits, a chain of any length is a deterministic function of its
+seed and carries 32 bits of entropy total, so dithering a 32-element quantization
+block from one chain gives all 32 elements deterministically related noise —
+which is precisely the independence SR exists to provide. The hardware's own use
+shares one seed across *two* adjacent elements, a bounded trade; 32 is not.
+
+**What does help is buying the same entropy for fewer rounds.** The Philox
+instruction count is near-linear in `SR_PHILOX_ROUNDS`, which Lumen already runs
+at 7 against Random123's default of 10. `benchmarks/bench_sr_philox_rounds.py`
+sweeps it for both speed and the property a reduction could break — SR is
+unbiased when E[dequant(quant(x))] = x, so the mean residual over many draws
+should be sampling noise and nothing more:
+
+| rounds | grad gate_up | grad qkv | grad o/down | Philox share | resid mean | resid std |
+|---|---:|---:|---:|---:|---:|---:|
+| 7 (current) | 0.502 ms | 0.159 ms | 0.107 ms | 33% | 0.00004 | 0.02049 |
+| 5 | 1.08× | 1.06× | 1.08× | 25% | 0.00016 | 0.02047 |
+| **4** | **1.13×** | **1.16×** | **1.14×** | 20% | 0.00009 | **0.02012** |
+| 3 | 1.18× | 1.20× | 1.17× | 15% | −0.00033 | 0.09922 |
+| 2 | 1.22× | 1.25× | 1.26× | 9% | 0.00032 | 0.16511 |
+
+The mean stays at sampling noise throughout — SR remains unbiased even at 2 rounds,
+as the hardware instruction guarantees. The **standard deviation** is what fails:
+flat at 0.0205 through 4 rounds, then 4.8× worse at 3 and 8× at 2. That is the
+dither losing independence across the block, showing up as per-element error that
+no longer averages out. **Four rounds is the floor**: statistically
+indistinguishable from seven, 1.13–1.16× on every gradient shape.
+
+`SR_PHILOX_ROUNDS` now reads `LUMEN_SR_PHILOX_ROUNDS` at import, because it has
+to be fixed before tracing — Triton 3.7 rejects a global that changed after
+compiling, so a sweep cannot patch it in place.
+
+Which leaves the honest accounting for a rewrite. Philox at 4 rounds is 20% of
+the stream and irreducible; the MFMA Hadamard is 0.7% and already optimal; amax is
+11% and is a reduction tree with little slack. The one place a hand-written kernel
+should beat Triton is the 19% of address and bit arithmetic, where precomputed
+offsets and strength reduction might recover half. That is ~10% of the stream, or
+about **1.1× on the kernel** — not 2×. Stacked on the round reduction, the
+quantizer might reach ~1.3× overall, 423.8 → ~326 ms/iter, which is ~98 ms off the
+step: **5474 ms, or 1.557×**.
+
+**So the conclusion of §5.18 survives the deeper look, with the ceiling raised
+slightly: the reachable range at this shape is ~1.55–1.56×, and 1.6× is not
+available.** The quantizer is not badly written; a third of it is buying entropy
+and the rest is close to the arithmetic it needs.
+
 ---
 
 ## 6. Debugging History

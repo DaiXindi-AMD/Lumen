@@ -29,6 +29,7 @@ Fused Hadamard + Quant kernel:
 """
 
 import math
+import os
 
 import triton
 import triton.language as tl
@@ -40,7 +41,19 @@ _E2M1_EMAX = 2  # largest normal biased exponent for E2M1
 # authors report Philox4x32-7 already passing BigCrush, and rounding noise asks
 # less of a generator than a simulation does. Dropping the three spare rounds
 # takes 8-12% off the dual-layout quantizer, where SR is a fifth of the work.
-SR_PHILOX_ROUNDS = 7
+#
+# It is worth more than that comment suggests. The compiled kernel spends a third
+# of its instructions here -- on ``grad gate_up``, 796 of 2415 are the mulhi,
+# mullo and xor triplets of the Philox rounds -- and the kernel is VALU-bound
+# with no spills, so instructions are time (report §5.20). The count is close to
+# linear in the round count, which makes this the largest single lever left in
+# the quantizer.
+#
+# Read from the environment because it has to be a compile-time constant: a
+# sweep cannot patch it in place, since Triton rejects a global that changed
+# after tracing. Lowering it is a numerics change and belongs in the precision
+# harness before it belongs in a run.
+SR_PHILOX_ROUNDS = int(os.environ.get("LUMEN_SR_PHILOX_ROUNDS", "7"))
 SR_PHILOX_ROUNDS_C = tl.constexpr(SR_PHILOX_ROUNDS)
 
 
