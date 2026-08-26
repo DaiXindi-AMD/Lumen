@@ -53,8 +53,21 @@ _E2M1_EMAX = 2  # largest normal biased exponent for E2M1
 # sweep cannot patch it in place, since Triton rejects a global that changed
 # after tracing. Lowering it is a numerics change and belongs in the precision
 # harness before it belongs in a run.
-SR_PHILOX_ROUNDS = int(os.environ.get("LUMEN_SR_PHILOX_ROUNDS", "7"))
+SR_PHILOX_ROUNDS_DEFAULT = 7
+SR_PHILOX_ROUNDS = int(os.environ.get("LUMEN_SR_PHILOX_ROUNDS", SR_PHILOX_ROUNDS_DEFAULT))
 SR_PHILOX_ROUNDS_C = tl.constexpr(SR_PHILOX_ROUNDS)
+
+# The round count changes gradient numerics but is not a Megatron argument, so it
+# does not appear in the argument dump every run logs. A run that quietly used
+# fewer rounds would be indistinguishable from a default one after the fact, so
+# say so once, on one rank, and only when it is not the default.
+if SR_PHILOX_ROUNDS != SR_PHILOX_ROUNDS_DEFAULT and os.environ.get("RANK", "0") == "0":
+    print(
+        f"[lumen] LUMEN_SR_PHILOX_ROUNDS={SR_PHILOX_ROUNDS} "
+        f"(default {SR_PHILOX_ROUNDS_DEFAULT}): stochastic-rounding dither uses "
+        f"fewer Philox rounds; this changes gradient numerics.",
+        flush=True,
+    )
 
 
 # ---------------------------------------------------------------------------
