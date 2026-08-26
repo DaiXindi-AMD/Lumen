@@ -1706,6 +1706,59 @@ all closed:
 best measured recipe is 5572.1 ms against BF16's 8520.7 ms, or 1.53×**, and the
 next real lever is the data-parallel collective, which belongs to both arms.
 
+### 5.19 What the quantizer's time is actually spent on
+
+With the collective ruled out at the configuration level (§5.18), the quantizer is
+the only MXFP4-owned item left. Its launch parameters are now exhausted in both
+directions. §5.11's tile sweep had already found the launcher's BLOCK_M/BLOCK_N
+rule optimal and `num_warps` 8 and 16 slower than the default 4 everywhere;
+`--axis pipeline` adds `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` and
+`kpack`, and the aggregate over one call of each production shape is **1.01×,
+with two of the five shapes slower**, every win inside run-to-run noise.
+
+`num_stages` doing nothing has a mechanical reason worth recording:
+`_dual_layout_quant_mxfp4_kernel` contains no loop. It is one `tl.load`, two
+`_calculate_fp4_scales`/`_pack_fp4` pairs, one Hadamard, four stores — straight-line
+code, so there is no loop nest for software pipelining to stage. `waves_per_eu=0`
+(unset, i.e. let the scheduler choose) also beat every explicit floor on every
+shape. Nothing about *how* this kernel is launched is on the table any more.
+
+So `--axis features` asks the other question — which *computation* a rewrite should
+attack. Each row turns one thing off and holds the rest at what production passes.
+None is a shippable configuration; they are cost attributions:
+
+| shape | production | SR → RTN | MFMA → butterfly | swizzle off |
+|---|---:|---:|---:|---:|
+| grad gate_up (N=24576) | 0.482 ms | **−26%** | +101% | +6% |
+| grad qkv (N=6144) | 0.141 ms | **−22%** | +63% | +6% |
+| grad o/down (N=4096) | 0.099 ms | **−26%** | +65% | +4% |
+| act down (N=12288) | 0.192 ms | — | +130% | +4% |
+| act qkv/o/gate_up (N=4096) | 0.074 ms | — | +96% | +3% |
+
+Three things follow, and one of them contradicts a comment in the source:
+
+- **Stochastic rounding costs 22–26% of the gradient-path quantizer.**
+  `_generate_randval`'s docstring claims the four-words-per-round trick dropped SR
+  to "nothing measurable (0.146 → 0.059 vs 0.057 RTN)". That is stale — the trick
+  is real and load-bearing, but at production tiles and shapes SR is back to a
+  quarter of the kernel on every gradient shape. It is the largest addressable
+  feature. `SR_PHILOX_ROUNDS` is already reduced from Philox's standard 10 to 7 and
+  could go lower, since SR dither has no cryptographic requirement — but that is a
+  numerics change and has to go through §5.14's harness.
+- **The MFMA Hadamard is load-bearing, not a tuning artifact.** Falling back to the
+  butterfly costs 63–130%. Leave it alone.
+- **Fusing the scale swizzle into the quantizer is net positive.** It costs 3–6%
+  here while removing the standalone `swizzle_mxfp4_scale` pass, 27.24 ms/iter.
+
+None of it reaches 1.6×. Making SR entirely free is worth ~24% of the gradient half
+of 423.8 ms/iter, call it 51 ms, which moves 1.529× to 1.543×. The step needs 247 ms.
+A rewrite would have to roughly **double** the whole kernel — production sustains
+1734–2687 GB/s against ~8 TB/s of HBM, so the headroom exists on paper, but the
+butterfly result says the kernel is genuinely compute-bound on the rotation and
+pack rather than parked on a bad memory schedule. A successful 2× rewrite lands
+423.8 → ~212 ms, i.e. 5360 ms and **1.589×** — still short, and only on the
+assumption that a 2× rewrite lands at all.
+
 ---
 
 ## 6. Debugging History

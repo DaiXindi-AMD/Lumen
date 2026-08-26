@@ -128,8 +128,16 @@ def _generate_randval(m: tl.constexpr, n: tl.constexpr, philox_seed, philox_offs
     Philox emits four words per round whether or not the caller reads them, so
     taking one word per element pays four times the rounds it needs. Spreading
     each round's four words across four adjacent columns covers the same tile in
-    a quarter of the rounds: on the dual-layout quantizer that drops SR from 44%
-    of kernel time to nothing measurable (0.146 ms -> 0.059 ms vs 0.057 ms RTN).
+    a quarter of the rounds, which took SR from 44% of kernel time to 12% on the
+    shape it was tuned on (0.146 ms -> 0.059 ms against 0.057 ms RTN).
+
+    That 12% is not what production pays. At the tiles and shapes a Qwen3-8B step
+    actually issues, SR is 22-26% of the dual-layout quantizer on every gradient
+    shape (report §5.19, ``bench_dual_layout_tiles.py --axis features``), and is
+    the largest single feature in it. ``SR_PHILOX_ROUNDS`` is the knob left: it is
+    already 7 against Philox's standard 10, and SR dither has no cryptographic
+    requirement, so it can go lower -- but that is a numerics change and belongs
+    in the precision harness, not here.
     """
     if n % 4 == 0:
         QN: tl.constexpr = n // 4
