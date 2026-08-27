@@ -279,6 +279,19 @@ def _build_bf16_skip_prefixes(
     return prefixes
 
 
+def is_under_bf16_prefix(name: str, bf16_prefixes: Set[str]) -> bool:
+    """Whether ``name`` is one of the BF16 layers, or lives inside one.
+
+    A plain ``startswith`` is wrong here: the prefixes are layer module paths
+    ending in an index, so ``decoder.layers.1`` also prefixes ``decoder.layers.10``
+    through ``.19``. That silently drags every one of those layers into BF16, and
+    only for the configurations where a skipped index happens to prefix another
+    one -- a tail of 5 in 36 layers (indices 31-35) is clean, while a *start* of 2
+    pulls in 10-19 as well. Requiring the boundary dot makes the match exact.
+    """
+    return any(name == p or name.startswith(p + ".") for p in bf16_prefixes)
+
+
 def _patch_linear_layers(
     model: nn.Module,
     manager: ScalingManager,
@@ -312,7 +325,7 @@ def _patch_linear_layers(
     skipped = 0
     for name, module in model.named_modules():
         if isinstance(module, quantizable_types):
-            if bf16_prefixes and any(name.startswith(p) for p in bf16_prefixes):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
                 continue
 

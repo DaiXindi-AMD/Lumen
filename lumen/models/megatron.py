@@ -832,6 +832,8 @@ def enable_fp8_for_parallel_linear(
     # own linear types, and --lumen-linear has already swapped those out by the
     # time it runs -- so on this path the flag used to select nothing at all and
     # every layer went to MXFP4 regardless.
+    from lumen.quantize import is_under_bf16_prefix
+
     bf16_prefixes: Set[str] = set()
     if quant_config is not None and quant_config.first_last_layers_bf16:
         from lumen.quantize import _build_bf16_skip_prefixes
@@ -855,7 +857,7 @@ def enable_fp8_for_parallel_linear(
         if isinstance(
             module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
         ):
-            if any(name.startswith(p) for p in bf16_prefixes):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
                 continue
             _mgr = scaling_manager
