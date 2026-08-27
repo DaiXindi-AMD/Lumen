@@ -574,7 +574,7 @@ in interpretability). 1000 steps, seq 8192 × micro-batch 2 × global batch 32, 
 | | Lumen MXFP4 | TE MXFP4 |
 |---|---|---|
 | launcher | `train_qwen3_8b.sh` | `train_qwen3_8b_te.sh` |
-| entry | `pretrain_llama31.py --backend megatron` | `scripts/pretrain_qwen3_te.py` |
+| entry | `pretrain_llama31.py --backend megatron` | `examples/qwen3/scripts/pretrain_qwen3_te.py` |
 | Megatron | `core_r0.15.0_rocm` | `rocm_dev` |
 | quant selection | `--linear-fp8-format mxfp4` | `--fp4-format e2m1 --fp4-recipe mxfp4` |
 | Hadamard | on (H16) | off (`MXFP4BlockScaling.use_hadamard` default) |
@@ -635,7 +635,7 @@ What it does isolate is the data: `pretrain_qwen3_te.py` loads Lumen's
 would execute Lumen's Megatron patches through the package `__init__` — and
 reproduces Lumen's batch construction call for call. Both arms therefore consume
 the same token stream in the same order, which is what makes the per-step Δ paired.
-Hyperparameters live in the shared `scripts/qwen3_8b_common_args.sh` so the two
+Hyperparameters live in the shared `examples/qwen3/scripts/qwen3_8b_common_args.sh` so the two
 launchers cannot drift apart.
 
 #### 4.6.2 TE on ROCm: the two blockers worth knowing
