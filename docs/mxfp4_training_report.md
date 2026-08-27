@@ -1943,6 +1943,10 @@ sd rests on two samples.
 So `SR_PHILOX_ROUNDS` **stays at 7 by default**. The knob exists, the win is real
 but small — 26–33 ms, ~0.5% of the step, 1.524× → 1.533× — and that is not worth
 changing gradient numerics by default until it has ridden along in a long run.
+Every figure here is at `TAIL_BF16=0`; §5.21 prices the same knob at the shipped
+`TAIL_BF16=5` recipe, where it is worth 0.21% rather than 0.48%, and adds the
+argument that carries more weight than either number — 4 is the last value before
+the dither collapses, so it has no margin to spare as a default.
 `LUMEN_SR_PHILOX_ROUNDS=4` announces itself on rank 0 when set, because the round
 count is not a Megatron argument and would otherwise leave no trace in the log.
 
@@ -1980,9 +1984,55 @@ that silently cost performance.
 Logs `lumen_qwen3_8b_recheck0827_bf16.log`,
 `lumen_qwen3_8b_recheck0827tail5_mxfp4.log` and
 `lumen_qwen3_8b_recheck0827tail0_mxfp4.log`. Step time only — these are 40-step
-mock-corpus runs, so they carry no loss figure comparable to §5.18's loss@60, and
-the best-measured 1.535× recipe (`TAIL_BF16=0` plus `LUMEN_SR_PHILOX_ROUNDS=4`
-plus the two DDP flags) was not re-run, since §5.20 keeps rounds=7 as the default.
+mock-corpus runs, so they carry no loss figure comparable to §5.18's loss@60.
+
+#### `SR_PHILOX_ROUNDS=4` priced at both recipes, and why 7 is still the default
+
+§5.20 measured rounds=4 only at `TAIL_BF16=0`, where it was worth −32.8 ms. But
+the *shipped* recipe is `TAIL_BF16=5`, and the knob cannot be worth the same
+there: five of 36 layers stay in BF16 and pay no SR at all, and the step carries
+644 ms more BF16 GEMM in the denominator. So it was measured at both.
+
+Both rounds=4 arms came back with a larger IQR than their rounds=7 counterpart
+(64.1 against 24.6, 47.1 against 9.1), which is not something fewer Philox rounds
+can cause. Machine interference is one-sided — a disturbed iteration is slower,
+never faster — so the lower quantiles are the robust read and are quoted
+alongside the median rather than instead of it:
+
+| recipe | rounds=7 | rounds=4 | Δ median | Δ p25 | Δ fastest | vs BF16 |
+|---|---:|---:|---:|---:|---:|---|
+| `TAIL_BF16=5` (default) | 6009.5 ms | 5999.9 ms | −9.6 | −12.8 | −13.0 | 1.416× → 1.418× |
+| `TAIL_BF16=0` | 5598.1 ms | 5571.4 ms | −26.7 | −28.6 | −31.6 | 1.520× → 1.527× |
+
+`TAIL_BF16=0`'s −27 to −32 ms agrees with §5.20's −32.8 and the precision
+harness's −26.6, so the effect is real and its size is settled. The new number is
+the other row: **at the recipe that ships, the knob is worth about 13 ms, 0.21% of
+the step.**
+
+**The default stays at 7, and not because 4 looks bad.** It does not. Residual std
+at 4 rounds matches 7 within 3%, the 300-step harness put r4's held-out loss
+*below* r7's on both slices, and both arms above ran 40/40 steps with zero NaN.
+Two other things decide it:
+
+1. 0.21% at the shipped recipe is too little to spend a gradient-numerics change
+   on. §5.20 reached the same conclusion from the tail0 figure alone, which at
+   0.48% was the more generous of the two.
+2. **4 has no margin below it.** Residual std is flat across 7, 5 and 4 (0.0205)
+   and then jumps to 0.0992 at 3 — a 4.8× step. Four is the last good value. For
+   an opt-in knob that is fine, because whoever sets it has measured their own
+   configuration. For a default it is not: if some future shape, sequence length
+   or recipe shifts dither quality even slightly, 7 degrades gradually while 4
+   falls off a cliff, and the symptom is a loss curve that slowly gets worse
+   rather than anything that raises.
+
+So the guidance is per-recipe rather than global. A run already at
+`TAIL_BF16=0` can set `LUMEN_SR_PHILOX_ROUNDS=4` for roughly 29 ms, having
+accepted that it sits on the edge of the plateau; the knob announces itself on
+rank 0 so the choice leaves a trace in the log. At the default `TAIL_BF16=5`
+there is little point.
+
+Logs `lumen_qwen3_8b_recheck0827tail5srp4_mxfp4.log` and
+`lumen_qwen3_8b_recheck0827tail0srp4_mxfp4.log`.
 
 ---
 

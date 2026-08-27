@@ -139,6 +139,15 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - Logs `lumen_qwen3_8b_recheck0827{,tail5,tail0}_*.log`. Step time only: 40-step mock corpus, so no loss figure comparable to loss@60, and the 1.535x best recipe was not re-run since rounds=7 remains the default.
 - Status: report §5.21 plus a §5.15 forward pointer and a §8 Done entry.
 
+### [2026-08-27 philox-rounds-4-priced-at-the-shipped-recipe-not-just-tail0]
+- Ask: challenged on why the default is 7. §5.20 only ever measured rounds=4 at `TAIL_BF16=0`, but the shipped recipe is `TAIL_BF16=5`, so the knob was priced at both on this branch. `LUMEN_SR_PHILOX_ROUNDS=4` confirmed reaching the workers (`/proc/<pid>/environ`) and firing the rank-0 announcement, so neither arm is a silent no-op.
+- Both rounds=4 arms came back with a *larger* IQR than their rounds=7 counterpart (64.1 vs 24.6 at tail5, 47.1 vs 9.1 at tail0). Fewer Philox rounds cannot cause that. Interference is one-sided — a disturbed iteration is slower, never faster — so the lower quantiles are the robust estimator here, not the mean, which the excursions drag toward zero effect (tail0 mean moves only -7.3 against a median of -26.7, and one 5726.2 ms iteration accounts for much of it).
+- **`TAIL_BF16=5`: 6009.5 -> 5999.9 ms.** median -9.6, p25 -12.8, fastest -13.0. **~13 ms = 0.21% of step**, 1.416x -> 1.418x.
+- **`TAIL_BF16=0`: 5598.1 -> 5571.4 ms.** median -26.7, p25 -28.6, fastest -31.6. 1.520x -> 1.527x. Agrees with §5.20's -32.8 and the harness's -26.6, so the effect size is settled.
+- **Decision: default stays 7.** Not evidence against 4 — residual std at 4 matches 7 within 3%, the 300-step harness put r4's held-out loss *below* r7's on both slices, both arms ran 40/40 with zero NaN. The two reasons are (1) 0.21% at the recipe that ships is too little to buy a gradient-numerics change with, and (2) the load-bearing one, **4 has no margin**: residual std is flat at 7/5/4 (0.0205) then jumps 4.8x to 0.0992 at 3. Four is the last good value. An opt-in knob can sit on a cliff edge because whoever sets it measured their own config; a default should not, because a future shape or seq length that shifts dither quality slightly makes 7 degrade gradually and 4 fall off, with a slowly worsening loss curve as the only symptom.
+- Guidance is therefore per-recipe: a run already at `TAIL_BF16=0` can opt in for ~29 ms; at the default `TAIL_BF16=5` there is little point. Logs `lumen_qwen3_8b_recheck0827tail{5,0}srp4_mxfp4.log`.
+- Status: measured at both recipes, default deliberately unchanged, reasoning recorded in report §5.21 with a pointer added from §5.20.
+
 ### [2026-08-27 optimization-test-coverage-audit-and-the-fp8-suite-failure-taxonomy]
 - Ask: does every optimization migrated to `feature/mxfp4` have a test, and what are the ~10 failures in `tests/quantize/`?
 - **Coverage audit.** Of the 12 migrated commits only 3 touch production code; the rest are docs plus `benchmarks/`/`scripts/` tools, which are not tests. Result was 1 partial and 2 missing:
