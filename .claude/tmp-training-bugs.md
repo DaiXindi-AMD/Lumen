@@ -131,6 +131,14 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 - **Decision: default stays 7.** Win is 26-33 ms, ~0.5% of step, 1.524x -> 1.533x -- not worth changing gradient numerics by default until it has ridden in a long run. Knob is `LUMEN_SR_PHILOX_ROUNDS`, and it prints a rank-0 line when non-default because the round count is not a Megatron arg and would otherwise leave no trace in the log.
 - Status: harness passed, no evidence of harm, default deliberately unchanged. Report §5.20.
 
+### [2026-08-27 step-time-re-verified-after-the-branch-migration]
+- Ask: every step time in §5.15-§5.20 was measured on `bench/mxfp4-ablation-staircase`. The optimization work now lives on `feature/mxfp4`, which additionally carries the `is_under_bf16_prefix` fix. Re-measure before trusting the report's numbers for this branch.
+- Same §5.18 setup — Qwen3-8B 36L, GBS 128, seq 8192, MBS 2, TP=1, 8xMI350X, native launch, seed 1234, `EVAL_INTERVAL=100000`, same autotune cache — shortened to 40 steps, median over iterations 21-40. Window start matches §5.18; §5.20's logs show the plateau reached by iteration 21, so the cut costs width, not steady state.
+- **BF16 8510.2 ms** (mean 8528.7, IQR 16.6) vs 8520.7, **-10.5**. **`TAIL_BF16=5` 6009.5 ms** (6022.8, 24.6) vs 5984.6, **+24.9**, 1.416x vs 1.424x. **`TAIL_BF16=0` 5598.1 ms** (5598.3, 9.1) vs 5591.0, **+7.1**, 1.520x vs 1.524x.
+- Read: all three reproduce. BF16 and tail0 deltas are under their own IQRs; tail5's +24.9 is ~1.0x its IQR and 0.8x the 31.0 the §5.18 arm had, so at the edge of a 20-iteration median's resolution rather than comfortably inside it. This does not separate the branches — it rules out a migration that silently cost performance, which was the point.
+- Logs `lumen_qwen3_8b_recheck0827{,tail5,tail0}_*.log`. Step time only: 40-step mock corpus, so no loss figure comparable to loss@60, and the 1.535x best recipe was not re-run since rounds=7 remains the default.
+- Status: report §5.21 plus a §5.15 forward pointer and a §8 Done entry.
+
 ### [2026-08-27 optimization-test-coverage-audit-and-the-fp8-suite-failure-taxonomy]
 - Ask: does every optimization migrated to `feature/mxfp4` have a test, and what are the ~10 failures in `tests/quantize/`?
 - **Coverage audit.** Of the 12 migrated commits only 3 touch production code; the rest are docs plus `benchmarks/`/`scripts/` tools, which are not tests. Result was 1 partial and 2 missing:

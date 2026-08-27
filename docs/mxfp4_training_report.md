@@ -1435,7 +1435,9 @@ lands in the step time.
 | BF16 | 8520.7 ms | 8539.5 ms | 8482.4 – 8635.5 |
 | **MXFP4, `TAIL_BF16=5`** | **5984.6 ms** | 5999.1 ms | 5961.2 – 6090.3 |
 
-**MXFP4 is 1.424× BF16** — 2536.1 ms/step faster, 29.8% less time.
+**MXFP4 is 1.424× BF16** — 2536.1 ms/step faster, 29.8% less time. Both arms were
+re-measured on `feature/mxfp4` on 2026-08-27 and reproduce at 8510.2 and 6009.5 ms
+(1.416×); see §5.21.
 
 #### Where those 2536 ms come from
 
@@ -1944,6 +1946,44 @@ changing gradient numerics by default until it has ridden along in a long run.
 `LUMEN_SR_PHILOX_ROUNDS=4` announces itself on rank 0 when set, because the round
 count is not a Megatron argument and would otherwise leave no trace in the log.
 
+### 5.21 Re-measured on `feature/mxfp4` (2026-08-27)
+
+Every step time in §5.15–§5.20 was measured on `bench/mxfp4-ablation-staircase`.
+The optimization work has since been migrated to `feature/mxfp4`, which also
+carries the module-boundary fix to the BF16-skip prefixes (§5.13) that the bench
+branch did not. A migration that moves ten commits across branches can drop a
+wiring change without failing anything, so the headline arms were re-measured on
+the branch that now owns them.
+
+Same shape and launch as §5.18 — Qwen3-8B 36L, GBS 128, seq 8192, MBS 2, TP=1,
+8×MI350X, native launch, seed 1234, `EVAL_INTERVAL=100000` so no eval lands
+inside the window, and the same `mxfp4_autotune_qwen3_8b.json` so per-shape
+backend choices are pinned the same way. Shortened to 40 steps with the median
+taken over iterations 21–40: the warm-up plateau is reached by iteration 21
+(§5.20's logs show 5749 ms at iteration 5 settling to 5576–5597 from 21 on), so
+the change costs window width, not steady state.
+
+| arm | median | mean | IQR | vs BF16 | §5.18 median | Δ |
+|---|---:|---:|---:|---:|---:|---:|
+| BF16 | 8510.2 ms | 8528.7 | 16.6 | 1.000× | 8520.7 ms | −10.5 ms |
+| MXFP4 `TAIL_BF16=5` | 6009.5 ms | 6022.8 | 24.6 | 1.416× | 5984.6 ms | +24.9 ms |
+| MXFP4 `TAIL_BF16=0` | 5598.1 ms | 5598.3 | 9.1 | **1.520×** | 5591.0 ms | +7.1 ms |
+
+All three reproduce. The two ratios move by 0.008 and 0.004, and every step-time
+delta sits at or under the IQR of the arm it belongs to — BF16 −10.5 against 16.6,
+`TAIL_BF16=0` +7.1 against 9.1. `TAIL_BF16=5`'s +24.9 is the one worth naming
+honestly: that is about 1.0× its own IQR and 0.8× the 31.0 the §5.18 arm had, so
+it is at the edge of what a 20-iteration median resolves rather than comfortably
+inside it. Nothing here separates the branches; what it rules out is a migration
+that silently cost performance.
+
+Logs `lumen_qwen3_8b_recheck0827_bf16.log`,
+`lumen_qwen3_8b_recheck0827tail5_mxfp4.log` and
+`lumen_qwen3_8b_recheck0827tail0_mxfp4.log`. Step time only — these are 40-step
+mock-corpus runs, so they carry no loss figure comparable to §5.18's loss@60, and
+the best-measured 1.535× recipe (`TAIL_BF16=0` plus `LUMEN_SR_PHILOX_ROUNDS=4`
+plus the two DDP flags) was not re-run, since §5.20 keeps rounds=7 as the default.
+
 ---
 
 ## 6. Debugging History
@@ -2040,6 +2080,7 @@ Key insights:
 - [x] **TransformerEngine built for gfx950 with CK fused attention** — required for any GQA model on ROCm; AOTriton rejects GQA outright (§4.6.2)
 - [x] **Recipe/implementation split resolved** — 4-arm ladder attributes 85% of Lumen's convergence advantage to the Hadamard, 9% to the BF16 tail, ~0.004 nats to everything else; TE remains 1.29× faster at matched recipe (§4.7)
 - [x] **Dual-layout gradient quantization** — `dual_layout_quant_mxfp4` emits both MXFP4 layouts from one dense read, bit-exact against the two kernels it replaces, −13.2 ms/step (§5.11)
+- [x] **Step time re-verified on `feature/mxfp4`** (2026-08-27) — BF16 8510.2 ms, MXFP4 `TAIL_BF16=5` 6009.5 ms (1.416×), `TAIL_BF16=0` 5598.1 ms (1.520×); every delta at or under the arm's own IQR, so the migration off the ablation branch cost nothing (§5.21)
 
 ### Open Issues
 
