@@ -1201,6 +1201,13 @@ The remaining headroom is in that bandwidth number, not in further fusion — a
 dense read alone sustains 5129 GB/s (§5.10), so the kernel is compute- and
 register-bound, and the next thing to look at is its register pressure.
 
+**Superseded (2026-08-26): "register-bound" is wrong.** §5.19 compiles the kernel
+and finds **zero spills on all five production shapes** (VGPR 84–118, 4–5
+waves/SIMD), so there is no register pressure to relieve; §5.17 closes tile and
+warp tuning and §5.19 closes occupancy. The limiter is raw instruction count:
+66–78% plain VALU, a third of it Philox. Read those sections before spending time
+here.
+
 ### 5.12 WGrad's activation operand, emitted by the forward quantizer
 
 At parity (Lumen 1526.5 ms, TE 1526.5 ms median) the two stacks were profiled
@@ -1387,12 +1394,28 @@ for both packed weight layouts and expanded scales.
 
 After this fix the largest MXFP4-owned non-GEMM kernel is unambiguous:
 `_dual_layout_quant_mxfp4_kernel`. The trace put it at 412.5 ms/step; §5.16 shows
-that figure counts a validation pass and the training-step cost is 322.7 ms.
-§5.11 already showed it is compute/register-bound rather than bandwidth-bound;
-register pressure and tile occupancy, measured with the six-second CUDA-event
-harness, were the next MXFP4-specific target. Attention is larger but is BF16
-work, and grad accumulation's available headroom is ruled out in the 2026-08-19
-findings.
+that figure counts a validation pass, and the training-step cost is **322.7 ms at
+`TAIL_BF16=5` (1984 calls) and 380.3 ms at `TAIL_BF16=0` (2304 calls)** — the
+`quantize / layout` category around it being 359.1 and 423.8 ms respectively.
+§5.11 already showed it is compute/register-bound rather than bandwidth-bound, so
+register pressure and tile occupancy looked like the next MXFP4-specific target.
+
+**They were not, and §5.17–§5.19 close all three axes — do not sweep them again.**
+Tile and warp configuration: the launcher's BLOCK_M/BLOCK_N rule is already the
+fastest of 27 configurations on every shape, and `num_warps` 8 and 16 are slower
+than the default 4 everywhere. Occupancy: `waves_per_eu` unset, i.e. the
+scheduler's own choice, beats every explicit floor on every shape. Register
+pressure: the premise is simply false — the compiled kernel has **zero spills on
+all five production shapes** at VGPR 84–118 and 4–5 waves/SIMD. Adding
+`num_stages` and the MFMA-shape knobs on top, the whole launch-parameter space is
+worth 1.01× in aggregate with two of five shapes *slower*.
+
+The real limiter is the instruction count: the stream is 66–78% plain VALU, and a
+third of it (796 of 2415 instructions on `grad gate_up`) is Philox generating
+stochastic-rounding dither. That is what §5.20 attacks, via `SR_PHILOX_ROUNDS`.
+
+Attention is larger but is BF16 work, and grad accumulation's available headroom
+is ruled out in the 2026-08-19 findings.
 
 ### 5.16 The whole speedup against BF16, kernel by kernel
 
@@ -2052,11 +2075,14 @@ Key insights:
    activation half is still open: `dequant_transpose_mxfp4` + `hadamard_quant_mxfp4`
    remain two passes, and the first only exists because the WGrad operand has to be
    rebuilt from the saved FP4 activation. Folding the dequant into the rotation
-   would remove a full BF16 (K, M) roundtrip. Before that, note §5.11's kernel only
-   sustains ~900 GB/s against a 5129 GB/s dense-read ceiling, so cutting its
-   register pressure is probably worth more than the next fusion. Use the
-   CUDA-event harness from §5.10, which reproduces the trace to 0.2% in 6 seconds,
-   rather than full training runs.
+   would remove a full BF16 (K, M) roundtrip. §5.11 suggested cutting the kernel's
+   register pressure first, since it only sustains ~900 GB/s against a 5129 GB/s
+   dense-read ceiling — **that suggestion is dead: §5.19 measures zero spills on
+   every production shape, and tile, occupancy and register tuning are all closed
+   as negative results (§5.17, §5.19).** The gap is instruction count, not
+   scheduling. Use
+   the CUDA-event harness from §5.10, which reproduces the trace to 0.2% in 6
+   seconds, rather than full training runs.
 9. **Gradient-accumulation fusion** — ~370 ms/step, the largest single kernel in
    both stacks' traces, currently disabled by `--no-gradient-accumulation-fusion`
    in the shared launcher config. Not a Lumen-vs-TE gap; it would pay in both.
