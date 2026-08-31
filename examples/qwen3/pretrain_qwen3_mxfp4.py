@@ -222,10 +222,12 @@ def main():
                         "built-in one-layer-ahead behaviour; higher values trade "
                         "peak memory for earlier all-gather issue.")
     p.add_argument("--defer-grad-sync", action="store_true",
-                   help="Under gradient accumulation, reduce-scatter once per "
-                        "optimizer step rather than once per micro-batch. Same "
-                        "gradient, ga-times less reduce traffic, at the cost of "
-                        "holding the unsharded gradients until the last backward.")
+                   help="Under gradient accumulation, run the collectives once "
+                        "per optimizer step rather than once per micro-batch: "
+                        "reduce-scatter the gradient only on the last backward, "
+                        "and keep parameters unsharded across the window instead "
+                        "of re-all-gathering them every micro-batch. Same "
+                        "gradient, ga-times less traffic, paid for in memory.")
     p.add_argument("--fsdp-reduce-dtype", choices=("fp32", "bf16"), default="fp32",
                    help="Dtype of the FSDP2 gradient reduce-scatter under a quantized "
                         "mode. The model is BF16, so fp32 doubles the bytes moved "
@@ -490,11 +492,16 @@ def main():
                 it = iter(train_loader)
                 batch = next(it)
             if defer_grad_sync:
-                # Reduce-scatter the gradient once per optimizer step instead of
-                # once per micro-batch. The sum is the same; what changes is that
-                # the partial gradients stay unsharded until the last backward,
-                # which costs one full set of gradients in memory.
-                model.set_requires_gradient_sync(micro == ga - 1)
+                # Treat the accumulation window as one unit rather than ga
+                # independent steps. Both collectives the window repeats are
+                # redundant: the reduce-scatter, because the optimizer only
+                # consumes the sum, and the all-gather, because each
+                # micro-batch re-gathers parameters the previous one just
+                # freed. Memory pays for the unsharded gradients and, until
+                # the last backward, the unsharded parameters.
+                last = micro == ga - 1
+                model.set_requires_gradient_sync(last)
+                model.set_reshard_after_backward(last)
             loss = compute_loss(batch)
             (loss / ga).backward()
             # Keep this on the device: .item() here would block the host every
