@@ -221,6 +221,12 @@ def main():
                    help="Layers to all-gather ahead in FSDP2 forward. 0 keeps the "
                         "built-in one-layer-ahead behaviour; higher values trade "
                         "peak memory for earlier all-gather issue.")
+    p.add_argument("--quantize-output-layer", action="store_true",
+                   help="Also quantize the vocab projection. It is the largest "
+                        "matmul left in BF16 (three GEMMs of 8192x4096x151936 per "
+                        "micro-batch), but it feeds the loss directly, so treat "
+                        "this as a measurement knob until a real-data loss check "
+                        "says otherwise.")
     p.add_argument("--defer-grad-sync", action="store_true",
                    help="Under gradient accumulation, run the collectives once "
                         "per optimizer step rather than once per micro-batch: "
@@ -335,6 +341,7 @@ def main():
         linear_fp8_cache_frozen_weight=False, linear_fp8_bpreshuffle=False,
         grad_quant_type=None,
         first_last_layers_bf16=tail_bf16,
+        quantize_output_layer=args.quantize_output_layer,
         num_layers_at_start_in_bf16=0,
         num_layers_at_end_in_bf16=tail_count,
         num_layers=num_layers,
