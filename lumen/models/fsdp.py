@@ -640,11 +640,20 @@ def apply_fsdp2(
 
     _use_mxfp4_comm = getattr(args, "fsdp_mxfp4_comm", False)
 
+    # The quantized paths inherited reduce_dtype=float32 from the FP8 work while
+    # the BF16 path below reduces in bfloat16. The model is bfloat16 either way,
+    # so float32 does not preserve any precision the gradient had: it only makes
+    # the reduce-scatter move twice the bytes, and only on the quantized arm.
+    _reduce_dtype = {
+        "fp32": torch.float32,
+        "bf16": torch.bfloat16,
+    }[getattr(args, "fsdp_reduce_dtype", "fp32") or "fp32"]
+
     if _use_mxfp4_comm:
         # Same as fsdp_fp8_param_storage: param_dtype=None preserves subclass
-        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32)
+        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=_reduce_dtype)
     elif getattr(args, "fsdp_fp8_param_storage", False):
-        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32)
+        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=_reduce_dtype)
     elif getattr(args, "linear_fp8", False):
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,

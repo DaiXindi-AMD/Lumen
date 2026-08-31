@@ -221,6 +221,11 @@ def main():
                    help="Layers to all-gather ahead in FSDP2 forward. 0 keeps the "
                         "built-in one-layer-ahead behaviour; higher values trade "
                         "peak memory for earlier all-gather issue.")
+    p.add_argument("--fsdp-reduce-dtype", choices=("fp32", "bf16"), default="fp32",
+                   help="Dtype of the FSDP2 gradient reduce-scatter under a quantized "
+                        "mode. The model is BF16, so fp32 doubles the bytes moved "
+                        "without recovering precision the gradient ever had; the BF16 "
+                        "baseline already reduces in bf16.")
     p.add_argument("--aiter-attn", action="store_true")
     p.add_argument("--no-mxfp4-comm", action="store_true",
                    help="Keep the FSDP2 all-gather in BF16 instead of FP4. The FP4 "
@@ -343,6 +348,7 @@ def main():
             fsdp_fp8_param_storage=False,
             fsdp_mxfp4_comm=(args.mode == "mxfp4" and not args.no_mxfp4_comm),
             fsdp_forward_prefetch=args.fsdp_forward_prefetch,
+            fsdp_reduce_dtype=args.fsdp_reduce_dtype,
         ))
         rank0(f"> FSDP2 ready (sharding={args.sharding})")
     else:
