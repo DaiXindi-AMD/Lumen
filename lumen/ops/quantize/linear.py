@@ -33,7 +33,7 @@ import functools
 import logging as _logging
 import os
 import threading
-from typing import Optional
+from typing import Optional, Set
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -1726,6 +1726,35 @@ def dispatch_gemm(a, w, scale_a=None, scale_w=None, scaling_type="none", bias=No
 # ---------------------------------------------------------------------------
 
 
+_MXFP4_MAX_OPERAND_ELEMS = 2 ** 31
+_mxfp4_int32_warned: Set[str] = set()
+
+
+def _mxfp4_operands_fit_int32(input: torch.Tensor, weight: torch.Tensor) -> bool:
+    """Can every operand this layer's MXFP4 path builds be indexed in 32 bits?
+
+    A Qwen3-8B run at micro-batch 8 dies with an illegal memory access in the
+    vocab projection's dgrad -- M=16384, N=151936, so the grad_output operand
+    holds 2.49e9 elements. 2**31 is 2.15e9. Every other GEMM in that same step
+    stays under the line (the widest is 16384x12288 = 2.01e9) and every one of
+    them runs, and halving the micro-batch puts the vocab layer at 1.24e9 and
+    it runs too. That is a 32-bit index wrapping, in a kernel Lumen does not
+    own.
+
+    Catching it after the fact is not an option: an illegal access poisons the
+    HIP context, so the BF16 fallback in backward never gets to run, and the
+    error surfaces from whatever happens to synchronize next rather than from
+    the kernel that caused it. The shape simply must not be dispatched.
+
+    Checks all three products because the operands differ per pass: forward
+    reads M*K, dgrad reads M*N, wgrad reads both, and the weight is N*K.
+    """
+    k = input.shape[-1]
+    m = input.numel() // k if k else 0
+    n = weight.shape[0]
+    return max(m * k, m * n, n * k) < _MXFP4_MAX_OPERAND_ELEMS
+
+
 class QuantizedLinearFunction(torch.autograd.Function):
     """FP8 quantized linear: quant -> GEMM -> dequant, for both fwd and bwd.
 
@@ -1762,6 +1791,18 @@ class QuantizedLinearFunction(torch.autograd.Function):
         fp8_weight_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # weight is [N, K] — standard PyTorch Linear convention
+        if scaling_type == "mxfp4" and not _mxfp4_operands_fit_int32(input, weight):
+            if tensor_id not in _mxfp4_int32_warned:
+                _mxfp4_int32_warned.add(tensor_id)
+                _logger.warning(
+                    "mxfp4 %s: operand exceeds %.2fe9 elements at input %s x weight "
+                    "%s; AITER's kernels index in 32 bits, so this layer stays BF16. "
+                    "Shrink the micro-batch to quantize it.",
+                    tensor_id, _MXFP4_MAX_OPERAND_ELEMS / 1e9,
+                    tuple(input.shape), tuple(weight.shape),
+                )
+            scaling_type = "none"
+
         if scaling_type == "none":
             output = gemm_bf16(input, weight, bias)
             if fp8_activation_store:
