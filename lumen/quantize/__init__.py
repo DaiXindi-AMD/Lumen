@@ -622,6 +622,7 @@ def _replace_forward(
                 w._lumen_frozen = True
             _wcache, _wscale = _mxfp4_cached_weight(
                 module, w, _wcache, _wscale, scaling_type, fp8_dtype, block_size,
+                gemm_rows=input_tensor.numel() // input_tensor.shape[-1],
             )
             return quantized_linear(
                 input_tensor,
