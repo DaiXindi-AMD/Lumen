@@ -221,6 +221,11 @@ def main():
                    help="Layers to all-gather ahead in FSDP2 forward. 0 keeps the "
                         "built-in one-layer-ahead behaviour; higher values trade "
                         "peak memory for earlier all-gather issue.")
+    p.add_argument("--defer-grad-sync", action="store_true",
+                   help="Under gradient accumulation, reduce-scatter once per "
+                        "optimizer step rather than once per micro-batch. Same "
+                        "gradient, ga-times less reduce traffic, at the cost of "
+                        "holding the unsharded gradients until the last backward.")
     p.add_argument("--fsdp-reduce-dtype", choices=("fp32", "bf16"), default="fp32",
                    help="Dtype of the FSDP2 gradient reduce-scatter under a quantized "
                         "mode. The model is BF16, so fp32 doubles the bytes moved "
@@ -439,6 +444,11 @@ def main():
     # --- Training loop ---
     model.train()
     ga = args.gradient_accumulation_steps
+    defer_grad_sync = (
+        args.defer_grad_sync and ga > 1 and hasattr(model, "set_requires_gradient_sync")
+    )
+    if args.defer_grad_sync and ga > 1 and not defer_grad_sync:
+        rank0("> --defer-grad-sync ignored: needs FSDP2 (fully_shard)")
     it = iter(train_loader)
     rank0(f"> Training starts: {args.max_steps} steps, batch_size={args.micro_batch_size}x{ga}x{world_size}")
 
@@ -472,16 +482,26 @@ def main():
             torch.cuda.nvtx.range_push(f"step{step}")
         t0 = time.perf_counter()
         opt.zero_grad()
-        acc_loss = 0.0
-        for _ in range(ga):
+        acc_loss = None
+        for micro in range(ga):
             try:
                 batch = next(it)
             except StopIteration:
                 it = iter(train_loader)
                 batch = next(it)
+            if defer_grad_sync:
+                # Reduce-scatter the gradient once per optimizer step instead of
+                # once per micro-batch. The sum is the same; what changes is that
+                # the partial gradients stay unsharded until the last backward,
+                # which costs one full set of gradients in memory.
+                model.set_requires_gradient_sync(micro == ga - 1)
             loss = compute_loss(batch)
             (loss / ga).backward()
-            acc_loss += loss.item()
+            # Keep this on the device: .item() here would block the host every
+            # micro-batch, and the wait lands on the next micro-batch's
+            # all-gather rather than on work that had to finish anyway.
+            loss = loss.detach()
+            acc_loss = loss if acc_loss is None else acc_loss + loss
         if args.max_grad_norm > 0:
             if args.fsdp_version == 2:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -495,7 +515,7 @@ def main():
             torch.cuda.nvtx.range_pop()
 
         if step % args.log_interval == 0:
-            train_loss = acc_loss / ga
+            train_loss = acc_loss.item() / ga
             lr = sched.get_last_lr()[0]
             mem_gb = torch.cuda.max_memory_allocated(local_rank) / (1024 ** 3)
             rank0(f"  step {step}/{args.max_steps} | loss {train_loss:.4f} | lr {lr:.2e} | step_time_ms {step_time_ms:.1f} | mem {mem_gb:.1f}GB")
