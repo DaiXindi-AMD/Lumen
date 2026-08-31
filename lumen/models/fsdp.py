@@ -36,6 +36,39 @@ def _rank0_print(msg: str) -> None:
         logger.info(msg)
 
 
+def freeze_gc(warmup_steps: int = 20) -> None:
+    """Take the process's permanent Python objects out of the collector's reach.
+
+    A step allocates enough short-lived Python objects to reach a generation-2
+    collection every few steps, and that collection walks *every* tracked object
+    in the process: the imported modules, the Triton and AITER kernel caches,
+    every parameter and every autograd node. It lands on whichever step it falls
+    in, so the run's step time is fine at the median and has a tail of steps that
+    cost half again as much.
+
+    Almost all of what it walks is alive for the whole run. ``gc.freeze()`` moves
+    the objects that exist when it is called into a permanent generation the
+    collector never visits, so later collections scan only the step's own
+    garbage. Call it after warmup so the kernel caches, which fill in on the
+    shapes' first call, are frozen too.
+
+    This is the FSDP counterpart of ``install_gc_freeze_hook`` in
+    ``lumen/models/megatron.py``, which cannot be reused because it patches
+    Megatron's ``train_step``. Set ``LUMEN_GC_FREEZE=0`` for stock behaviour.
+    """
+    if os.environ.get("LUMEN_GC_FREEZE", "1") == "0":
+        return
+
+    import gc
+
+    gc.collect()
+    gc.freeze()
+    _rank0_print(
+        f"> GC: froze {gc.get_freeze_count()} objects after {warmup_steps} "
+        f"steps (later collections skip them)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Common CLI argument groups
 # ---------------------------------------------------------------------------
@@ -641,17 +674,17 @@ def apply_fsdp2(
         n_mxfp4 = _wrap_params_as_mxfp4_comm(model, block_size=32, world_size=world_size)
         _rank0_print(f"> MXFP4CommTensor wrapping: {n_mxfp4} weights (4x comm reduction)")
 
-    sharded_layers = False
+    layers = None
     for module in model.modules():
         if hasattr(module, "layers") and isinstance(module.layers, nn.ModuleList):
-            for layer in module.layers:
+            layers = list(module.layers)
+            for layer in layers:
                 fully_shard(
                     layer,
                     mesh=mesh,
                     mp_policy=mp_policy,
                     reshard_after_forward=reshard,
                 )
-            sharded_layers = True
             break
 
     fully_shard(
@@ -661,13 +694,19 @@ def apply_fsdp2(
         reshard_after_forward=reshard,
     )
 
-    n_layers = "unknown"
-    if sharded_layers:
-        for m in model.modules():
-            if hasattr(m, "layers") and isinstance(m.layers, nn.ModuleList):
-                n_layers = len(m.layers)
-                break
+    prefetch = int(getattr(args, "fsdp_forward_prefetch", 0) or 0)
+    if prefetch and layers:
+        # FSDP2 implicitly prefetches one layer ahead. Going deeper issues the
+        # all-gather earlier, which only helps when the copy-out wait is latency
+        # rather than bandwidth: each extra layer in flight costs one more
+        # unsharded parameter buffer of peak memory.
+        for i, layer in enumerate(layers):
+            ahead = layers[i + 1 : i + 1 + prefetch]
+            if ahead:
+                layer.set_modules_to_forward_prefetch(ahead)
+        _rank0_print(f"> FSDP2 forward prefetch: {prefetch} layers ahead")
 
+    n_layers = len(layers) if layers else "unknown"
     _rank0_print(f"> FSDP2 applied (fully_shard, {n_layers} layers, " f"reshard={reshard}, mp_policy={mp_policy})")
     return model
 

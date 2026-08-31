@@ -108,8 +108,41 @@ class C4StreamingDataset(IterableDataset):
             yield from self._token_stream()
 
 
+class SyntheticDataset(IterableDataset):
+    """Uniform random token ids, generated on the fly.
+
+    For throughput work only: a step costs the same no matter what the tokens
+    are, so this measures exactly what wikitext/C4 would, but needs no network
+    and cannot stall mid-run. Loss on it is meaningless.
+    """
+
+    def __init__(self, vocab_size, seq_length, rank=0, seed=1234, limit=None):
+        self.vocab_size = vocab_size
+        self.chunk_len = seq_length + 1
+        self.seed = seed + rank
+        self.limit = limit
+
+    def __iter__(self):
+        gen = torch.Generator().manual_seed(self.seed)
+        emitted = 0
+        while self.limit is None or emitted < self.limit:
+            yield {"input_ids": torch.randint(0, self.vocab_size, (self.chunk_len,),
+                                              generator=gen, dtype=torch.long)}
+            emitted += 1
+
+
 def build_dataloaders(args, tokenizer, global_rank, world_size):
-    if args.dataset == "wikitext":
+    if args.dataset == "synthetic":
+        vocab = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
+        rank0(f"> Data: synthetic random tokens (vocab {vocab}) — throughput measurement only")
+        train_ds = SyntheticDataset(vocab, args.seq_length, rank=global_rank, seed=args.seed)
+        val_ds = SyntheticDataset(vocab, args.seq_length, rank=global_rank, seed=args.seed + 9973,
+                                  limit=args.val_batches * args.micro_batch_size)
+        train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size,
+                                  num_workers=args.num_workers, pin_memory=True)
+        val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size,
+                                num_workers=0, pin_memory=True)
+    elif args.dataset == "wikitext":
         train_ds = WikitextDataset("train", tokenizer, args.seq_length)
         val_ds = WikitextDataset("validation", tokenizer, args.seq_length)
         rank0(f"> Data: wikitext-2, {len(train_ds)} train / {len(val_ds)} val chunks")
@@ -165,7 +198,7 @@ def main():
     p.add_argument("--model", type=str, default="Qwen/Qwen3-0.6B",
                    help="HF model id for config + tokenizer (weights are NOT downloaded, model is randomly initialized)")
     p.add_argument("--mode", choices=["bf16", "fp8_blockwise2d", "mxfp4"], default="mxfp4")
-    p.add_argument("--dataset", choices=["wikitext", "c4"], default="c4")
+    p.add_argument("--dataset", choices=["wikitext", "c4", "synthetic"], default="c4")
     p.add_argument("--seq-length", type=int, default=512)
     p.add_argument("--micro-batch-size", type=int, default=2)
     p.add_argument("--gradient-accumulation-steps", type=int, default=1)
@@ -177,6 +210,17 @@ def main():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
     p.add_argument("--sharding", choices=["full_shard", "shard_grad_op"], default="full_shard")
     p.add_argument("--fsdp-version", type=int, choices=[1, 2], default=2)
+    p.add_argument("--gc-freeze-step", type=int, default=20,
+                   help="Step after which to gc.freeze() the long-lived objects. "
+                        "0 disables. See lumen.models.fsdp.freeze_gc.")
+    p.add_argument("--tail-bf16-layers", type=int, default=None,
+                   help="Trailing layers kept in BF16 under --mode mxfp4. Default "
+                        "is round(15%% of depth); 0 quantizes every layer, which is "
+                        "faster but changes convergence, so pair it with a loss check.")
+    p.add_argument("--fsdp-forward-prefetch", type=int, default=0,
+                   help="Layers to all-gather ahead in FSDP2 forward. 0 keeps the "
+                        "built-in one-layer-ahead behaviour; higher values trade "
+                        "peak memory for earlier all-gather issue.")
     p.add_argument("--aiter-attn", action="store_true")
     p.add_argument("--no-mxfp4-comm", action="store_true",
                    help="Keep the FSDP2 all-gather in BF16 instead of FP4. The FP4 "
@@ -263,9 +307,14 @@ def main():
         use_quant, fmt, scaling, blk = False, "fp8_e4m3", "delayed", 128
 
     # MXFP4: keep last ~15% layers in BF16 (NVFP4 paper §4:末尾层最敏感)
-    tail_bf16 = args.mode == "mxfp4"
     num_layers = getattr(config, "num_hidden_layers", 0)
-    tail_count = max(1, round(num_layers * 0.15)) if tail_bf16 else 0
+    if args.mode != "mxfp4":
+        tail_count = 0
+    elif args.tail_bf16_layers is None:
+        tail_count = max(1, round(num_layers * 0.15))
+    else:
+        tail_count = min(args.tail_bf16_layers, num_layers)
+    tail_bf16 = tail_count > 0
 
     cfg = LumenConfig.from_args(Namespace(
         linear_fp8=use_quant, linear_fp8_format=fmt, linear_fp8_scaling=scaling,
@@ -293,6 +342,7 @@ def main():
             linear_fp8=use_quant, sharding_strategy=args.sharding,
             fsdp_fp8_param_storage=False,
             fsdp_mxfp4_comm=(args.mode == "mxfp4" and not args.no_mxfp4_comm),
+            fsdp_forward_prefetch=args.fsdp_forward_prefetch,
         ))
         rank0(f"> FSDP2 ready (sharding={args.sharding})")
     else:
@@ -399,10 +449,21 @@ def main():
             record_shapes=True,
         )
 
+    # roctx ranges let rocprofv3 --marker-trace label each step in the timeline,
+    # which is the only practical way to find a specific slow step in a trace
+    # holding hundreds of thousands of dispatches.
+    roctx = os.environ.get("LUMEN_ROCTX_STEPS") == "1"
+
     for step in range(1, args.max_steps + 1):
+        if args.gc_freeze_step and step == args.gc_freeze_step + 1:
+            from lumen.models.fsdp import freeze_gc
+
+            freeze_gc(args.gc_freeze_step)
         if prof is not None and step == profile_warmup + 1:
             prof.start()
         torch.cuda.synchronize()
+        if roctx:
+            torch.cuda.nvtx.range_push(f"step{step}")
         t0 = time.perf_counter()
         opt.zero_grad()
         acc_loss = 0.0
@@ -424,6 +485,8 @@ def main():
         sched.step()
         torch.cuda.synchronize()
         step_time_ms = (time.perf_counter() - t0) * 1e3
+        if roctx:
+            torch.cuda.nvtx.range_pop()
 
         if step % args.log_interval == 0:
             train_loss = acc_loss / ga
