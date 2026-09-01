@@ -131,7 +131,21 @@ class SyntheticDataset(IterableDataset):
             emitted += 1
 
 
+def _worker_ctx(num_workers: int):
+    """Start method for DataLoader workers, or None when there are none.
+
+    Default-forked workers inherit the W&B client, which since 0.29 refuses to
+    run in a forked child and takes the whole step down with a ForkedError.
+    Workers are started lazily on first iteration, which is after wandb.init(),
+    so every run with both --wandb-project and --num-workers > 0 hits it.
+    forkserver forks from a clean template process instead, so the child never
+    sees the client.
+    """
+    return {"multiprocessing_context": "forkserver"} if num_workers > 0 else {}
+
+
 def build_dataloaders(args, tokenizer, global_rank, world_size):
+    worker_ctx = _worker_ctx(args.num_workers)
     if args.dataset == "synthetic":
         vocab = getattr(tokenizer, "vocab_size", None) or len(tokenizer)
         rank0(f"> Data: synthetic random tokens (vocab {vocab}) — throughput measurement only")
@@ -139,7 +153,8 @@ def build_dataloaders(args, tokenizer, global_rank, world_size):
         val_ds = SyntheticDataset(vocab, args.seq_length, rank=global_rank, seed=args.seed + 9973,
                                   limit=args.val_batches * args.micro_batch_size)
         train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size,
-                                  num_workers=args.num_workers, pin_memory=True)
+                                  num_workers=args.num_workers, pin_memory=True,
+                                  **worker_ctx)
         val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size,
                                 num_workers=0, pin_memory=True)
     elif args.dataset == "wikitext":
@@ -148,7 +163,8 @@ def build_dataloaders(args, tokenizer, global_rank, world_size):
         rank0(f"> Data: wikitext-2, {len(train_ds)} train / {len(val_ds)} val chunks")
         train_sampler = DistributedSampler(train_ds, num_replicas=world_size, rank=global_rank, shuffle=True)
         train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size, sampler=train_sampler,
-                                  num_workers=args.num_workers, pin_memory=True, drop_last=True)
+                                  num_workers=args.num_workers, pin_memory=True, drop_last=True,
+                                  **worker_ctx)
         val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size, shuffle=False,
                                 num_workers=0, pin_memory=True, drop_last=True)
     else:
@@ -159,7 +175,8 @@ def build_dataloaders(args, tokenizer, global_rank, world_size):
                                     world_size=world_size, split="validation",
                                     val_samples=args.val_batches)
         train_loader = DataLoader(train_ds, batch_size=args.micro_batch_size,
-                                  num_workers=args.num_workers, pin_memory=True)
+                                  num_workers=args.num_workers, pin_memory=True,
+                                  **worker_ctx)
         val_loader = DataLoader(val_ds, batch_size=args.micro_batch_size,
                                 num_workers=0, pin_memory=True)
     return train_loader, val_loader
