@@ -72,11 +72,14 @@ def build_bshd_rollout_batch(
     *,
     pad_multiplier: int,
     device: torch.device,
+    min_seq_len: int = 0,
 ) -> dict[str, Any]:
-    """Build a bshd rollout dict for CP=1 (Megatron Miles actor layout)."""
+    """Build a bshd rollout dict for CP=1 (Megatron GRPO actor layout)."""
     total_lengths = [len(sample.tokens) for sample in samples]
     response_lengths = [sample.response_length for sample in samples]
     max_seq_len = _pad_to_multiple(max(total_lengths), pad_multiplier)
+    if min_seq_len > max_seq_len:
+        max_seq_len = _pad_to_multiple(min_seq_len, pad_multiplier)
 
     token_rows: list[torch.Tensor] = []
     loss_mask_rows: list[torch.Tensor] = []

@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -74,7 +74,7 @@
 
   <div class="header">
     <h1>FlyDSL Agent SFT Pipeline v5e</h1>
-    <p>九轮 SFT 迭代 (v1→v5e)。沙箱编译率 0% → 21.9%。SFT 阶段完成，转入 RFT。</p>
+    <p>Nine rounds of SFT iteration (v1→v5e). Sandbox compile rate 0% → 21.9%. SFT stage complete; transitioning to RFT.</p>
   </div>
 
   <!-- Key Metrics -->
@@ -88,7 +88,7 @@
   <div class="divider"></div>
 
   <!-- Sandbox Evolution -->
-  <h2>沙箱编译率演进</h2>
+  <h2>Sandbox Compile Rate Evolution</h2>
   <div class="grid-2">
     <div class="card">
       <div class="card-header">Sandbox Compile Rate (%) <span class="pill pill-success">0% → 21.9%</span></div>
@@ -101,15 +101,15 @@
   </div>
 
   <div class="callout callout-success">
-    <div class="callout-title">关键转折：正例洪水 (v5e)</div>
-    <p>v5d 证明穷举负例是打地鼠（消灭 <code>flyc.kernel_context</code>，冒出 <code>flyc.load</code>）。
-    v5e 转向大幅提升正确 kernel 比例 (35%→52%)，沙箱编译率一举从 9.9% 翻倍到 21.9%。</p>
+    <div class="callout-title">Key Turning Point: Positive Flooding (v5e)</div>
+    <p>v5d showed that exhaustive negative examples are whack-a-mole (fix <code>flyc.kernel_context</code>, and <code>flyc.load</code> pops up).
+    v5e pivoted to sharply increasing the correct-kernel ratio (35%→52%), and sandbox compile rate doubled in one step from 9.9% to 21.9%.</p>
   </div>
 
   <div class="divider"></div>
 
   <!-- Version History -->
-  <h2>SFT 九轮迭代</h2>
+  <h2>Nine Rounds of SFT Iteration</h2>
   <div class="table-wrap">
     <table>
       <thead><tr><th>Version</th><th>Samples</th><th>Kernel%</th><th>Overall</th><th>Sandbox</th><th>Key Change</th></tr></thead>
@@ -151,27 +151,27 @@
   <div class="divider"></div>
 
   <!-- Data Composition -->
-  <h2>v5e 数据组成</h2>
+  <h2>v5e Data Composition</h2>
   <div class="grid-2">
     <div class="card">
       <div class="card-header">Source Distribution <span class="pill pill-info">3,889 samples</span></div>
       <div class="card-body"><div class="chart-container"><canvas id="chartSources"></canvas></div></div>
     </div>
     <div class="card">
-      <div class="card-header">v5e 增强策略</div>
+      <div class="card-header">v5e Augmentation Strategy</div>
       <div class="card-body" style="font-size:0.85rem">
-        <p><strong>正例洪水 (+787 条):</strong></p>
+        <p><strong>Positive flooding (+787 samples):</strong></p>
         <ul style="margin:8px 0 0 20px;color:var(--text-secondary)">
-          <li>247 去重正确 kernel ×3 prompt 变体 = <strong>741 条</strong></li>
-          <li>8 个精简 mini-kernel ×5 重复 = <strong>40 条</strong></li>
-          <li>flyc 边界 QA ×3 = <strong>6 条</strong></li>
+          <li>247 deduplicated correct kernels ×3 prompt variants = <strong>741 samples</strong></li>
+          <li>8 compact mini-kernels ×5 repetitions = <strong>40 samples</strong></li>
+          <li>flyc boundary QA ×3 = <strong>6 samples</strong></li>
         </ul>
-        <p style="margin-top:12px"><strong>模块摘要 (+270 条):</strong></p>
+        <p style="margin-top:12px"><strong>Module digest (+270 samples):</strong></p>
         <ul style="margin:8px 0 0 20px;color:var(--text-secondary)">
-          <li>58 种幻觉负例 ×3 = 174 条</li>
-          <li>12 kernel skeleton + 6 correct kernel + 7 QA + 7 import fix = 96 条 (×3)</li>
+          <li>58 hallucination negative examples ×3 = 174 samples</li>
+          <li>12 kernel skeleton + 6 correct kernel + 7 QA + 7 import fix = 96 samples (×3)</li>
         </ul>
-        <p style="margin-top:12px;color:var(--success)"><strong>结果: 正确 kernel 比例 35% → 52%</strong></p>
+        <p style="margin-top:12px;color:var(--success)"><strong>Result: correct kernel ratio 35% → 52%</strong></p>
       </div>
     </div>
   </div>
@@ -179,12 +179,12 @@
   <div class="divider"></div>
 
   <!-- Remaining Issues -->
-  <h2>剩余问题 &amp; SFT 天花板</h2>
+  <h2>Remaining Issues &amp; SFT Ceiling</h2>
   <div class="callout callout-warning">
-    <div class="callout-title">SFT 天花板已触及</div>
-    <p><code>from flydsl.expr import fx</code> 横跨 v5c/v5d/v5e 均为 17 次，模型从预训练继承的 Python 惯性模式无法被 SFT 数据翻转。
-    已验证这 17 个候选即使修了 import 也全因后续幻觉失败。flyc 属性幻觉（Stage/SmemAllocator/if_）持续打地鼠。
-    需要 RL 阶段通过编译反馈信号来突破。</p>
+    <div class="callout-title">SFT Ceiling Reached</div>
+    <p><code>from flydsl.expr import fx</code> appears 17 times across v5c/v5d/v5e; the model's pretrained Python inertia cannot be overturned by SFT data alone.
+    Verified that all 17 candidates fail on subsequent hallucinations even after fixing the import. flyc attribute hallucinations (Stage/SmemAllocator/if_) remain whack-a-mole.
+    RL stage with compile feedback signals is needed to break through.</p>
   </div>
 
   <div class="table-wrap">

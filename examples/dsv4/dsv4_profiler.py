@@ -43,7 +43,7 @@ def _default_results_dir() -> str:
 def categorize_operator(name: str) -> str:
     n = name.lower()
     if "nccl" in n or "rccl" in n or "all_gather" in n or "reduce_scatter" in n:
-        return "通信 (NCCL/RCCL/MoE EP)"
+        return "Comm (NCCL/RCCL/MoE EP)"
     if "gemm" in n or "mm_" in n or "baddbmm" in n or "bmm" in n:
         if any(k in n for k in ("a8w8", "fp8", "blockscale", "e4m3", "e5m2")):
             return "FP8 GEMM"
@@ -57,19 +57,19 @@ def categorize_operator(name: str) -> str:
     if any(k in n for k in ("moe", "expert", "dispatch", "combine", "alltoall", "router")):
         return "MoE router/dispatch"
     if any(k in n for k in ("copy_", "clone", "contiguous", "cat", "split")):
-        return "拷贝/cat"
+        return "Copy/cat"
     if any(k in n for k in ("elementwise", "vectorized", "dropout", "swiglu", "silu")):
         return "elementwise"
     if "norm" in n or "rms" in n:
         return "Norm"
     if "tilelang" in n or n.startswith("tl_"):
         return "TileLang (other)"
-    return "其他"
+    return "Other"
 
 
 def kernel_type(category: str, name: str) -> str:
     n = name.lower()
-    if "通信" in category or "nccl" in n or "rccl" in n:
+    if category.startswith("Comm") or "nccl" in n or "rccl" in n:
         return "comm"
     if any(k in category for k in ("GEMM", "MLA", "Attention", "MHC", "Indexer", "MoE", "TileLang")):
         return "compute"
@@ -159,23 +159,23 @@ def write_operator_breakdown_xlsx(
 
     # Sheet 1 — category summary
     ws1 = wb.active
-    ws1.title = "汇总"
+    ws1.title = "Summary"
     ws1.append([title])
     ws1.append([source_note])
     ws1.append([])
-    ws1.append(["算子类别", "算子数/step", "ms/step", "占比 %"])
+    ws1.append(["Operator category", "Ops/step", "ms/step", "Share %"])
     for cat in sorted(by_cat, key=lambda c: -by_cat[c]["self_ms"]):
         count_per_step = by_cat[cat]["count"] / nsteps
         ms_per_step = by_cat[cat]["self_ms"] / nsteps
         share = (ms_per_step / total_self_ms * 100.0) if total_self_ms > 0 else 0.0
         ws1.append([cat, round(count_per_step, 1), round(ms_per_step, 2), round(share, 1)])
     ws1.append([])
-    ws1.append(["GPU self-time 合计 ms/step", round(total_self_ms, 2)])
+    ws1.append(["GPU self-time total ms/step", round(total_self_ms, 2)])
     ws1["A1"].font = Font(bold=True)
 
     # Sheet 2 — per-kernel by category
-    ws2 = wb.create_sheet("算子明细")
-    ws2.append(["算子类别", "GPU kernel / op", "数/step", "ms/step", "占比 %"])
+    ws2 = wb.create_sheet("Operator detail")
+    ws2.append(["Operator category", "GPU kernel / op", "Count/step", "ms/step", "Share %"])
     ranked = sorted(events, key=lambda e: -e.self_cuda_ms)
     for evt in ranked:
         if evt.self_cuda_ms <= 0:
@@ -193,29 +193,29 @@ def write_operator_breakdown_xlsx(
         )
 
     # Sheet 3 — notes
-    ws3 = wb.create_sheet("说明")
+    ws3 = wb.create_sheet("Notes")
     notes = [
-        "单位: 数/step = 每步 op 调用次数; ms/step = 每步 torch.profiler Self CUDA time 合计。",
+        "Units: count/step = op invocations per step; ms/step = torch.profiler Self CUDA time per step.",
         f"Profile window: Megatron train steps {prof_start}-{prof_end} ({nsteps} steps), rank 0 only.",
-        "Self CUDA 为多 stream 上的 kernel self-time 之和，可大于 wall step time（计算/通信重叠）。",
-        "算子类别由 kernel/op 名称启发式归类（GEMM / Sparse MLA / MHC / MoE / comm / copy 等）。",
-        "DSV4 4-layer 默认: TileLang Sparse MLA + TileLang MHC + Megatron MoE EP (NCCL alltoall)。",
+        "Self CUDA sums kernel self-time across streams and may exceed wall step time (compute/comm overlap).",
+        "Categories are heuristic from kernel/op names (GEMM / Sparse MLA / MHC / MoE / comm / copy, etc.).",
+        "DSV4 4-layer default: TileLang Sparse MLA + TileLang MHC + Megatron MoE EP (NCCL alltoall).",
     ]
     for line in notes:
         ws3.append([line])
 
-    # Sheet 4 — top kernels (qwen3 单算子明细 style)
-    ws4 = wb.create_sheet("单算子明细")
+    # Sheet 4 — top kernels (per-operator detail, qwen3 style)
+    ws4 = wb.create_sheet("Per-operator detail")
     ws4.append(
         [
             "#",
             "kernel / op",
             "shape",
             "calls/step",
-            "实测 ms/step",
-            "类型",
-            "占比 %",
-            "说明",
+            "Measured ms/step",
+            "Type",
+            "Share %",
+            "Notes",
         ]
     )
     ws4.append([source_note])
@@ -330,14 +330,14 @@ def install_dsv4_profiler() -> None:
 
     title = os.environ.get(
         "LUMEN_PROF_TITLE",
-        "DSV4 Flash 4-layer Megatron pretrain — 单算子 Self CUDA 耗时",
+        "DSV4 Flash 4-layer Megatron pretrain — per-operator Self CUDA time",
     )
     source_note = os.environ.get(
         "LUMEN_PROF_SOURCE",
         (
             f"torch.profiler steps {prof_start}-{prof_end} | "
             f"MLA={os.environ.get('V4_SPARSE_MLA_BACKEND', '?')} "
-            f"MHC={os.environ.get('MHC_BACKEND', '?')} "
+            "MHC=aiter "
             f"seq={os.environ.get('SEQ_LEN', '?')} "
             f"GBS={os.environ.get('GBS', '?')}"
         ),

@@ -44,7 +44,6 @@ DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 source "${SCRIPT_DIR}/dsv4_flash_megatron_args.sh"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
-MHC_BACKEND="${MHC_BACKEND:-triton}"
 V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
@@ -103,7 +102,7 @@ echo "  Steps     : ${TRAIN_ITERS}"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
 echo "  Ckpt load : LOAD_CKPT=${LOAD_CKPT}"
 echo "  Preflight : PREFLIGHT_ID=${PREFLIGHT_ID:-n/a}"
-echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} TileKernels=${TILEKERNELS_DIR}"
+echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=aiter"
 echo "  HC mult   : ${DSV4_HC_MULT}"
 echo "  Optimizer : CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
 echo "  Ckpt path : ${TORCH_DIST} (used only when LOAD_CKPT=1)"
@@ -112,6 +111,7 @@ echo "════════════════════════�
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${AITER_DIR}:/workspace/aiter"
     -v "${MODEL_DIR}:/root/models"
     -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
@@ -122,9 +122,6 @@ fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_MOUNTS+=(-v "${MILES_DIR}:/workspace/miles")
 fi
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
-fi
 if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
     DOCKER_MOUNTS+=(-v "${BOOTSTRAP_MOUNT}:/bootstrap:ro")
 fi
@@ -134,10 +131,13 @@ fi
 
 DOCKER_ENV=(
     -e LUMEN_DIR=/workspace/Lumen
+    -e AITER_DIR=/workspace/aiter
     -e LUMEN_DSV4_PRETRAIN=1
     -e MODEL_DIR=/root/models
     -e MODEL_NAME="${MODEL_NAME}"
     -e TRAIN_ITERS="${TRAIN_ITERS}"
+    -e PRETRAIN_LR="${PRETRAIN_LR:-1e-6}"
+    -e PRETRAIN_MIN_LR="${PRETRAIN_MIN_LR:-${PRETRAIN_LR:-1e-6}}"
     -e GBS="${GBS}"
     -e MBS="${MBS}"
     -e SEQ_LEN="${SEQ_LEN}"
@@ -151,9 +151,10 @@ DOCKER_ENV=(
     -e MASTER_ADDR="${MASTER_ADDR}"
     -e MASTER_PORT="${MASTER_PORT}"
     -e OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION}"
+    -e EXP_AVG_DTYPE="${EXP_AVG_DTYPE:-bf16}"
+    -e EXP_AVG_SQ_DTYPE="${EXP_AVG_SQ_DTYPE:-bf16}"
     -e DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES}"
     -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
     -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
     -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
     -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
@@ -167,13 +168,14 @@ DOCKER_ENV=(
     -e HSA_FORCE_FINE_GRAIN_PCIE=1
     -e TORCHDYNAMO_DISABLE=1
     -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-ens14np0}"
+    -e GLOO_SOCKET_IFNAME="${GLOO_SOCKET_IFNAME:-${NCCL_SOCKET_IFNAME:-ens14np0}}"
     -e NCCL_IB_HCA="${NCCL_IB_HCA:-mlx5_0,mlx5_1,mlx5_2,mlx5_3,mlx5_4,mlx5_5,mlx5_6,mlx5_7}"
     -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+    -e NCCL_IB_GDR_LEVEL="${NCCL_IB_GDR_LEVEL:-0}"
+    -e NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-LOC}"
+    -e MEGATRON_NO_BATCH_P2P_COMM="${MEGATRON_NO_BATCH_P2P_COMM:-1}"
     -e MEGATRON_PATH="${MEGATRON_PATH}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
 fi

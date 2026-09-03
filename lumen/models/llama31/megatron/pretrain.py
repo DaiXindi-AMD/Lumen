@@ -51,12 +51,13 @@ from lumen.models.megatron import (  # noqa: F401
     apply_lora,
     loss_func,
 )
+from lumen.models.utils import safe_add_argument
+from lumen.patches.builders import apply_args_patches
 from lumen.models.megatron import lumen_gpt_builder as _lumen_gpt_builder_generic
 from lumen.models.megatron import (  # noqa: F401
     make_forward_step,
     reset_fp8_state,
 )
-from lumen.models.utils import safe_add_argument
 
 __all__ = [
     "PretrainTextDataset",
@@ -216,7 +217,7 @@ forward_step = make_forward_step(get_batch, loss_func)
 def add_pretrain_args(parser):
     """Add pretrain-specific arguments."""
     # Pre-register args whose defaults differ from the shared module before
-    # calling add_common_megatron_args (safe_add_argument skips duplicates).
+    # apply_args_patches (safe_add_argument skips duplicates).
     safe_add_argument(
         parser,
         "--lumen-fp8-quant-type",
@@ -228,13 +229,9 @@ def add_pretrain_args(parser):
     safe_add_argument(parser, "--linear-fp8-amax-algo", type=str, default="most_recent", choices=["max", "most_recent"])
     safe_add_argument(parser, "--linear-fp8-amax-history", type=int, default=4)
 
-    add_common_megatron_args(parser)
-
-    mlperf = parser.add_argument_group(title="mlperf")
-    mlperf.add_argument("--size", type=str, default="8b", choices=["8b"], help="Model size (for Docker compatibility).")
-    mlperf.add_argument("--nodes", type=int, default=None, help="Number of nodes (Docker compat, unused by Megatron).")
-    mlperf.add_argument(
-        "--gpus-per-node", type=int, default=None, help="GPUs per node (Docker compat, unused by Megatron)."
+    apply_args_patches(
+        parser,
+        names={"common_megatron_args", "llama_pretrain_args"},
     )
 
     return parser

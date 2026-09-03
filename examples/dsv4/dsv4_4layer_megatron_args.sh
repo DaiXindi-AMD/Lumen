@@ -54,7 +54,6 @@ DSV4_MODEL_ARGS=(
     --moe-shared-expert-intermediate-size 2048
     --moe-router-pre-softmax
     --moe-router-score-function sqrtsoftplus
-    --moe-router-enable-expert-bias
     --moe-router-load-balancing-type seq_aux_loss
     --moe-token-dispatcher-type alltoall
     --moe-aux-loss-coeff 0
@@ -80,6 +79,11 @@ DSV4_MODEL_ARGS=(
     --no-bias-swiglu-fusion
     --no-activation-func-clamp-shared-expert
 )
+
+# 4-layer torch_dist from Miles convert omits router expert_bias shards.
+if [[ "${DSV4_ENABLE_EXPERT_BIAS:-0}" == "1" ]]; then
+    DSV4_MODEL_ARGS+=(--moe-router-enable-expert-bias)
+fi
 
 # Parallel layout for 8×MI308X smoke (torchrun flags in run_dsv4_4layer_pretrain_inner.sh).
 TP=8

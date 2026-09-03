@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Shared NFS preflight for 2-node DSV4 pretrain launches.
+# Shared NFS preflight for 2-node DSV4 GRPO finetune launches.
 #
 # Ensures head and worker use identical torchrun args before any rank enters
-# Megatron (avoids NCCL hang from LOAD_CKPT / GBS mismatch across nodes).
+# Megatron (avoids NCCL hang from GBS / rollout path mismatch across nodes).
 #
-# Called from run_dsv4_flash_pretrain.sh when NNODES > 1.
+# Called from run_dsv4.sh when DSV4_PROFILE=flash and NNODES > 1.
 # Set SKIP_PREFLIGHT=1 to bypass (not recommended).
 
 preflight_dsv4_multinode() {
@@ -54,20 +54,15 @@ preflight_dsv4_multinode() {
     local run_dir="${preflight_root}/runs/${launch_id}"
     mkdir -p "${run_dir}"
 
-    if [[ "${MHC_BACKEND}" == "triton" && ! -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        echo "[preflight][ERROR] MHC_BACKEND=triton but TileKernels missing: ${TILEKERNELS_DIR}/tile_kernels"
-        echo "  Sync TileKernels to this node or set TILEKERNELS_DIR to a valid path."
-        return 1
-    fi
-
-    local tilekernels_mounted=0
-    if [[ -d "${TILEKERNELS_DIR}/tile_kernels" ]]; then
-        tilekernels_mounted=1
-    fi
-
-    local _load_ckpt="${LOAD_CKPT:-0}"
     local _train_iters="${TRAIN_ITERS:-${NUM_ROLLOUT:-10}}"
     local _eval_iters="${EVAL_ITERS:-0}"
+    local _megatron_no_batch_p2p="${MEGATRON_NO_BATCH_P2P_COMM:-1}"
+    local _rollout_path="${FAKE_ROLLOUT_DATA:-}"
+    if [[ -z "${_rollout_path}" && "${NNODES}" -gt 1 && -n "${DATA_ROOT:-}" ]]; then
+        _rollout_path="${DATA_ROOT}/models/fake_rollout.pt"
+    elif [[ -z "${_rollout_path}" ]]; then
+        _rollout_path="/root/models/fake_rollout.pt"
+    fi
     local manifest="${run_dir}/node${NODE_RANK}.manifest"
     local tmp_manifest="${manifest}.$$"
     cat > "${tmp_manifest}" <<EOF
@@ -78,7 +73,7 @@ NNODES=${NNODES}
 NPROC_PER_NODE=${NPROC_PER_NODE}
 MASTER_ADDR=${MASTER_ADDR}
 MASTER_PORT=${MASTER_PORT}
-LOAD_CKPT=${_load_ckpt}
+FAKE_ROLLOUT_DATA=${_rollout_path}
 GBS=${GBS}
 MBS=${MBS}
 SEQ_LEN=${SEQ_LEN}
@@ -87,11 +82,19 @@ EVAL_ITERS=${_eval_iters}
 MODEL_NAME=${MODEL_NAME}
 DSV4_HC_MULT=${DSV4_HC_MULT}
 SKIP_PREPARE=${SKIP_PREPARE}
+TP=${TP:-4}
+PP=${PP:-4}
+EP=${EP:-4}
+ETP=${ETP:-1}
+DECODER_FIRST_PP_LAYERS=${DECODER_FIRST_PP_LAYERS:-11}
+DECODER_LAST_PP_LAYERS=${DECODER_LAST_PP_LAYERS:-10}
+MEGATRON_NO_BATCH_P2P_COMM=${_megatron_no_batch_p2p}
+NCCL_IB_DISABLE=${NCCL_IB_DISABLE:-0}
+NCCL_IB_GDR_LEVEL=${NCCL_IB_GDR_LEVEL:-}
+NCCL_NET_GDR_LEVEL=${NCCL_NET_GDR_LEVEL:-}
+NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-ens14np0}
 V4_SPARSE_MLA_BACKEND=${V4_SPARSE_MLA_BACKEND}
-MHC_BACKEND=${MHC_BACKEND}
 V4_INDEXER_IMPL=${V4_INDEXER_IMPL}
-TILEKERNELS_DIR=${TILEKERNELS_DIR}
-TILEKERNELS_MOUNTED=${tilekernels_mounted}
 LUMEN_DIR=${LUMEN_DIR}
 MEGATRON_PATH=${MEGATRON_PATH}
 OPTIMIZER_OFFLOAD_FRACTION=${OPTIMIZER_OFFLOAD_FRACTION}
@@ -159,6 +162,6 @@ EOF
     fi
 
     echo "[preflight] OK — all ${NNODES} nodes agree (PREFLIGHT_ID=${launch_id})"
-    echo "[preflight]   LOAD_CKPT=${LOAD_CKPT} GBS=${GBS} MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND} TK_mount=${tilekernels_mounted}"
+    echo "[preflight]   rollout=${_rollout_path} GBS=${GBS} MLA=${V4_SPARSE_MLA_BACKEND} MHC=aiter"
     return 0
 }

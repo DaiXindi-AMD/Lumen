@@ -21,6 +21,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 LOGFILE="${LOG_DIR}/lumen_dsv4_4layer_finetune_$(date +%Y%m%d_%H%M%S).log"
 
@@ -30,12 +32,16 @@ DSV4_HC_MULT="${DSV4_HC_MULT:-4}"
 DATA_DIR="${DATA_DIR:-${DATA_ROOT}/datasets}"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
-MHC_BACKEND="${MHC_BACKEND:-triton}"
-V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
+V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-aiter}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
 SKIP_PREPARE="${SKIP_PREPARE:-0}"
 NUM_ROLLOUT="${NUM_ROLLOUT:-10}"
+GBS="${GBS:-256}"
+
+# shellcheck source=examples/dsv4/dsv4_finetune_common.sh
+source "${SCRIPT_DIR}/dsv4_finetune_common.sh"
+dsv4_apply_finetune_batch_defaults
 
 USE_BOOTSTRAP=0
 BOOTSTRAP_MOUNT="${BOOTSTRAP_DIR}"
@@ -74,8 +80,10 @@ echo "  Mode      : native torchrun GRPO (debug-train-only)"
 echo "  Logs      : Miles format rollout/step/perf per GRPO step"
 echo "  Spec      : lumen.models.dsv4.megatron.spec get_dsv4_spec"
 echo "  Rollouts  : ${NUM_ROLLOUT}"
-echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
+echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
+echo "  HC mult   : ${DSV4_HC_MULT} (AIter)"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
+dsv4_print_gemm_env
 echo "  Ckpt      : ${TORCH_DIST}"
 echo "  Miles     : ${MILES_DIR}"
 echo "  Log       : ${LOGFILE}"
@@ -83,6 +91,7 @@ echo "════════════════════════�
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${AITER_DIR}:/workspace/aiter"
     -v "${MILES_DIR}:/workspace/miles"
     -v "${MODEL_DIR}:/root/models"
     -v "${DATA_DIR}:/root/datasets"
@@ -90,9 +99,6 @@ DOCKER_MOUNTS=(
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
     -v "${PIP_CACHE_DIR}:/root/.cache/pip"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
-fi
 if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
     DOCKER_MOUNTS+=(-v "${BOOTSTRAP_MOUNT}:/bootstrap:ro")
 fi
@@ -108,29 +114,14 @@ DOCKER_ENV=(
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
     -e SKIP_PREPARE="${SKIP_PREPARE}"
     -e NUM_ROLLOUT="${NUM_ROLLOUT}"
-    -e GBS="${GBS:-256}"
-    -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
-    -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
-    -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
-    -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
+    -e GBS="${GBS}"
+    -e MBS="${MBS}"
+    -e SEQ_LEN="${SEQ_LEN}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
-DOCKER_ENV+=(
-    -e HIP_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-    -e CUDA_DEVICE_MAX_CONNECTIONS=1
-    -e NCCL_NVLS_ENABLE=0
-    -e RCCL_MSCCL_ENABLE=0
-    -e HSA_FORCE_FINE_GRAIN_PCIE=1
-    -e TORCHDYNAMO_DISABLE=1
-)
-if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/bootstrap)
-elif [[ "${IMAGE}" == "lumen/dsv4-lumen:mi308x" ]]; then
-    DOCKER_ENV+=(-e BOOTSTRAP_DIR=/opt/dsv4-bootstrap -e WRITABLE_ROOT=/opt/dsv4-runtime)
-fi
+dsv4_docker_append_kernel_env
+dsv4_docker_append_gemm_env
+dsv4_docker_append_rocm_env
+dsv4_docker_append_bootstrap_env
 
 docker rm -f lumen-dsv4-finetune 2>/dev/null || true
 

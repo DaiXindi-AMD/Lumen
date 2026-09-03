@@ -58,7 +58,7 @@ python examples/llama2/scripts/convert_dataset.py \
 ### Step 2 — Launch training
 
 ```bash
-bash examples/llama2/run_tp1_dp8.sh
+bash examples/llama2/run_lora_finetune_llama2_70b.sh
 ```
 
 The script applies system tunables (`runtime_tunables.sh`), launches a Docker container
@@ -96,27 +96,26 @@ rocm-smi --showtemp && rocm-smi --showpower
 ### Script chain
 
 ```
-[Host]  bash run_tp1_dp8.sh
+[Host]  bash run_lora_finetune_llama2_70b.sh
   ├── runtime_tunables.sh (CPU perf governor, THP, cache drop, NUMA/ASLR)
   └── docker run lumen_unit_test:latest bash -c '...'
         │
         ├── pip install runtime deps (huggingface-hub, sentencepiece, peft, ...)
         ├── Fix numpy.product → numpy.prod (Megatron compat)
         │
-        ├── python scripts/patch_gpt_layer_specs.py   # RMSNorm / FusedRMSNorm compat
-        ├── python scripts/patch_checkpointing.py     # LoRA base_layer key remap + mmap
-        ├── python scripts/patch_requires_grad.py     # Grad flow fix for LoRA + recompute
-        ├── python scripts/patch_lora_scaling.py      # LoRA alpha/rank scaling fix
-        ├── python scripts/patch_sft_loss_norm.py     # SFT loss normalization alignment
+        ├── PYTHONPATH=/workspace/Lumen python3 examples/dsv4/patch_megatron_source.py ${MEGATRON_ROOT} --tag llama,lora
         │
-        └── CONFIG=config_MI300X_tp1_dp8.sh bash run_finetune.sh
+        └── CONFIG=config_MI300X_lora_70b.sh bash run_finetune.sh
               └── torchrun --nproc_per_node=8 finetune_llama2.py \
                     --linear-fp8 --fp8-param-storage --lora-rank 16 ...
 ```
 
-The five Megatron patches are applied at runtime because they modify the container's
-Megatron-LM-AMD installation (not part of the Lumen repo). The patches are idempotent
-and skip themselves if already applied.
+The Megatron SOURCE patches are applied at launch via
+``examples/dsv4/patch_megatron_source.py``
+(``--tag llama`` for RMSNorm; ``--tag llama,lora`` for LoRA finetune).
+They modify the container's Megatron-LM-AMD checkout and are idempotent on re-apply.
+
+See [Megatron Patches](#megatron-patches) below for the full patch catalog.
 
 ### Key training parameters
 
@@ -222,13 +221,13 @@ comparison against the AMD MLPerf reference.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `SIGKILL` during checkpoint load | CPU OOM — 8 ranks each loading 128 GB | Ensure `patch_checkpointing.py` ran (adds `mmap=True`) |
+| `SIGKILL` during checkpoint load | CPU OOM — 8 ranks each loading 128 GB | Ensure ``--tag llama,lora`` ran (`lora_checkpoint_load` adds `mmap=True`) |
 | `HIP out of memory` in forward pass | Activation memory overflow | Verify `RECOMPUTE_NUM_LAYERS=21` in config |
-| `grad_norm: 0.000` every step | Broken autograd chain with LoRA + recompute | Ensure `patch_requires_grad.py` ran |
-| NCCL timeout on step 1 | AITER kernel tuning takes > default timeout | Set `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200` (already in `run_tp1_dp8.sh`) |
-| Loss spikes / divergence | Missing patches or incomplete env var set | Use `run_tp1_dp8.sh` as-is — all patches and env vars are required |
-| `numpy.product` error on save | Deprecated numpy API in Megatron | Already patched in `run_tp1_dp8.sh` |
-| val\_loss stuck at ~0.937 | Data not shuffled | Set `LUMEN_SHUFFLE_TRAIN=1` (default in `run_tp1_dp8.sh`) |
+| `grad_norm: 0.000` every step | Broken autograd chain with LoRA + recompute | Ensure ``--tag llama,lora`` ran (`lora_requires_grad`) |
+| NCCL timeout on step 1 | AITER kernel tuning takes > default timeout | Set `TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC=7200` (already in `run_lora_finetune_llama2_70b.sh`) |
+| Loss spikes / divergence | Missing patches or incomplete env var set | Use `run_lora_finetune_llama2_70b.sh` as-is — SOURCE patches and env vars are required |
+| `numpy.product` error on save | Deprecated numpy API in Megatron | Already patched in `run_lora_finetune_llama2_70b.sh` |
+| val\_loss stuck at ~0.937 | Data not shuffled | Set `LUMEN_SHUFFLE_TRAIN=1` (default in `run_lora_finetune_llama2_70b.sh`) |
 | Step time ~400ms above target | GPU thermal throttling at 750W TDP | Normal at thermal equilibrium; check `rocm-smi --showtemp` |
 | AITER JIT compile hangs on first run | 8 ranks wait for rank 0 to finish JIT build | Expected — first launch takes ~5 min extra for kernel compilation |
 
@@ -249,18 +248,32 @@ See `run_finetune.sh` for the full list of environment variables and defaults.
 
 ## Megatron Patches
 
-When running inside the Docker container, five patches are applied to the container's
-Megatron-LM-AMD installation. These live in `scripts/` and are applied at launch:
+When running inside the Docker container, Megatron-LM patches are applied at launch.
+
+**RMSNorm / layer norm (SOURCE registry):**
+
+```bash
+PYTHONPATH=/workspace/Lumen python3 examples/dsv4/patch_megatron_source.py /path/to/Megatron-LM --tag llama
+```
+
+Registered in `lumen/patches/source/llama.py` (`llama_megatron_fused_rmsnorm`, `llama_gpt_layer_specs_rmsnorm`, `llama_transformer_block_rmsnorm`). The legacy `scripts/patch_gpt_layer_specs.py` is a deprecated wrapper.
+
+**LoRA finetune** (``run_lora_finetune_llama2_70b.sh``) applies SOURCE registry patches:
+
+```bash
+PYTHONPATH=/workspace/Lumen python3 examples/dsv4/patch_megatron_source.py /path/to/Megatron-LM --tag llama,lora
+```
+
+Registered in `lumen/patches/source/llama_lora.py`:
 
 | Patch | Purpose |
 |-------|---------|
-| `patch_gpt_layer_specs.py` | Creates `MegatronFusedRMSNorm` wrapper; patches `gpt_layer_specs.py` and `transformer_block.py` to use it when RMSNorm is detected |
-| `patch_checkpointing.py` | Remaps checkpoint keys for LoRA `base_layer` wrapping; injects `mmap=True` into `torch.load` to prevent CPU OOM with 8 ranks loading a 128 GB checkpoint |
-| `patch_requires_grad.py` | Forces `hidden_states.requires_grad_(True)` before `_checkpointed_forward` so LoRA gradients flow through activation checkpointing |
-| `patch_lora_scaling.py` | Fixes LoRA alpha/rank scaling to match the MLPerf reference implementation |
-| `patch_sft_loss_norm.py` | Aligns SFT loss normalization with the MLPerf reference (per-sample vs per-token) |
+| `lora_checkpoint_load` | LoRA `base_layer` ckpt remap + `mmap=True` on `torch.load` |
+| `lora_requires_grad` | Grad flow through activation checkpointing with frozen embeddings |
+| `lora_adapter_scaling` | LoRA alpha/rank scaling (NeMo / PEFT convention) |
+| `lora_sft_loss_default` | Default `--sft=True` for MLPerf val loss normalization |
 
-All patches are idempotent and skip themselves if already applied.
+Legacy `scripts/patch_*.py` files are deprecated wrappers.
 
 ## Reference Logs
 

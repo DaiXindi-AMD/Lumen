@@ -11,9 +11,11 @@ all-gather, reduce-scatter, etc.) and route the GEMM through Lumen's
 :func:`~lumen.ops.quantize.linear.quantized_linear`.
 
 When ``scaling_type="none"`` (the default) and ``delay_wgrad=False``,
-plain BF16 ``F.linear`` is used.  When ``delay_wgrad=True``, even BF16
-routes through ``quantized_linear`` (with ``scaling_type="none"``) so
-that the autograd backward can defer wgrad computation.
+plain BF16 ``F.linear`` is used unless ``use_gemm_bf16=True``.  Tuned
+AITER GEMM has no autograd, so ``use_gemm_bf16`` routes through
+:func:`~lumen.ops.quantize.linear.quantized_linear` with
+``scaling_type="none"``.  ``delay_wgrad=True`` uses the same path so
+backward can defer wgrad.
 
 To enable FP8, call :func:`enable_fp8` on the module or set
 ``scaling_type`` to one of the supported quantization modes.
@@ -233,12 +235,13 @@ def _do_gemm(
     deferred_wgrad=None,
     activation_tensor_id=None,
     pre_quantized_input=None,
+    use_gemm_bf16=False,
 ):
     """Route to Lumen FP8 GEMM or standard F.linear.
 
-    When ``delay_wgrad=True``, always routes through
-    :func:`~lumen.ops.quantize.linear.quantized_linear` (even for BF16)
-    so that the autograd backward can defer the wgrad computation.
+    ``delay_wgrad=True`` or ``use_gemm_bf16=True`` always routes through
+    :func:`~lumen.ops.quantize.linear.quantized_linear` (even for BF16).
+    Tuned AITER GEMM has no autograd; ``_QuantizedLinearFn`` supplies it.
 
     When the weight carries ``_fp8_desc`` (FP8 param storage), the weight
     is already in FP8 format.  For FP8 GEMMs we pass the pre-quantized
@@ -311,7 +314,7 @@ def _do_gemm(
     if _fp8_stored:
         orig_dtype = getattr(weight, "_fp8_original_dtype", torch.bfloat16)
         weight_bf16 = (weight.data.to(torch.float32) / weight._fp8_desc.scale).to(orig_dtype)
-        if delay_wgrad:
+        if delay_wgrad or use_gemm_bf16:
             _discard_swiglu_fp8_cache_safe()
             return quantized_linear(
                 input_,
@@ -328,7 +331,7 @@ def _do_gemm(
         _discard_swiglu_fp8_cache_safe()
         return F.linear(input_, weight_bf16, bias)
 
-    if scaling_type != "none" or delay_wgrad:
+    if scaling_type != "none" or delay_wgrad or use_gemm_bf16:
         _pqi = _resolve_pre_quantized_input_with_swiglu_cache(
             pre_quantized_input,
             consume_fp8_activation=(scaling_type != "none"),
@@ -426,6 +429,7 @@ class LumenColumnParallelLinear(nn.Module):
         self.delay_wgrad = False
         self.fp8_activation_store = False
         self._deferred_wgrad = _DeferredWgrad()
+        self.use_gemm_bf16 = False
 
         # Pipeline overlap config (fused comm-GEMM)
         _cfg_mode = getattr(config, "lumen_tp_comm_overlap_mode", None)
@@ -459,6 +463,9 @@ class LumenColumnParallelLinear(nn.Module):
                         world_size=self.tp_size,
                         skip_set_tensor_parallel_attributes=True,
                     )
+                set_tensor_model_parallel_attributes(
+                    tensor=self.weight, is_parallel=True, dim=0, stride=stride
+                )
             else:
                 self.weight = Parameter(
                     torch.empty(
@@ -546,9 +553,11 @@ class LumenColumnParallelLinear(nn.Module):
             if self.use_sdma and self.tp_size > 1:
                 input_parallel = self._forward_sdma_pre_gemm(input_)
             else:
-                if self.allreduce_dgrad or self.sequence_parallel or self.explicit_expert_comm:
+                if self.sequence_parallel or self.explicit_expert_comm:
                     input_parallel = input_
                 else:
+                    # The copy region is the only source of the dgrad all-reduce here,
+                    # since _do_gemm implements no allreduce_dgrad path of its own.
                     input_parallel = copy_to_tensor_model_parallel_region(input_, group=self.tp_group)
 
                 if self.sequence_parallel and not self.explicit_expert_comm:
@@ -571,6 +580,7 @@ class LumenColumnParallelLinear(nn.Module):
                 delay_wgrad=self.delay_wgrad,
                 deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
                 activation_tensor_id=getattr(self, "_activation_tensor_id", None),
+                use_gemm_bf16=self.use_gemm_bf16,
             )
 
         gather = self.gather_output
@@ -600,7 +610,7 @@ class LumenColumnParallelLinear(nn.Module):
         )
 
         comm = self._get_sdma_comm()
-        if self.allreduce_dgrad or self.sequence_parallel or self.explicit_expert_comm:
+        if self.sequence_parallel or self.explicit_expert_comm:
             input_parallel = input_
         else:
             input_parallel = sdma_copy_to_tensor_model_parallel_region(input_, comm)
@@ -638,6 +648,7 @@ class LumenColumnParallelLinear(nn.Module):
             delay_wgrad=self.delay_wgrad,
             deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
             activation_tensor_id=_act_tid,
+            use_gemm_bf16=self.use_gemm_bf16,
         )
 
         input_gathered = comm.wait_allgather_dim0(stream=sdma_stream)
@@ -655,6 +666,7 @@ class LumenColumnParallelLinear(nn.Module):
             delay_wgrad=self.delay_wgrad,
             deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
             activation_tensor_id=_act_tid,
+            use_gemm_bf16=self.use_gemm_bf16,
         )
         output_parallel = torch.cat([out_local, out_remaining], dim=0)
         return output_parallel, self.bias if self.skip_bias_add else None
@@ -811,6 +823,7 @@ class LumenRowParallelLinear(nn.Module):
         self.delay_wgrad = False
         self.fp8_activation_store = False
         self._deferred_wgrad = _DeferredWgrad()
+        self.use_gemm_bf16 = False
 
         _cfg_mode = getattr(config, "lumen_tp_comm_overlap_mode", None)
         self._overlap_mode = _cfg_mode if _cfg_mode is not None else _overlap_mode_from_args()
@@ -927,6 +940,7 @@ class LumenRowParallelLinear(nn.Module):
                 delay_wgrad=self.delay_wgrad,
                 deferred_wgrad=self._deferred_wgrad if self.delay_wgrad else None,
                 activation_tensor_id=getattr(self, "_activation_tensor_id", None),
+                use_gemm_bf16=self.use_gemm_bf16,
             )
 
             if self.explicit_expert_comm:

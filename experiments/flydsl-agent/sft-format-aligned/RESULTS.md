@@ -2,59 +2,59 @@
 
 ## v5f Approach (replaces v1 patch-on-v5e)
 
-v1 尝试在 v5e 上叠加 LoRA 做格式对齐，导致双重 LoRA 叠加不稳定 + 非 kernel 能力隐式保持。
-v5f 改为从 base model 全量重训，将 v5e 数据 + format alignment 合并成统一数据集。
+v1 attempted to stack LoRA on top of v5e for format alignment, causing unstable double-LoRA stacking and implicit retention of non-kernel capabilities.
+v5f instead does a full retrain from the base model, merging v5e data + format alignment into a unified dataset.
 
-### v5f 数据构造
+### v5f Data Construction
 
-策略：**保留 v5e 全量数据不动** + 增加双段格式副本。不替换任何原始样本。
+Strategy: **Keep the full v5e dataset unchanged** + add dual-segment format copies. Do not replace any original samples.
 
-| 类别 | 来源 | 数量 | 格式 | 说明 |
-|------|------|------|------|------|
-| v5e 全量 (原样) | v5e SFT 不动 | ~3889 | 原始 | 保护 v5e 代码能力 |
-| kernel 双段副本 (新增) | Claude plan + v5e kernel code | ~1500 | `<plan>+<code>` | 教模型双段格式 |
-| Cat2 通用推理 | Claude 生成 | ~700 | `<plan>+<code>` | 推理保持 |
-| Cat3 复杂 CoT | Claude 生成 | ~350 | `<plan>+<code>` | 推理深度 |
-| **总计** | | **~6400** | 混合 | |
+| Category | Source | Count | Format | Notes |
+|----------|--------|-------|--------|-------|
+| Full v5e (verbatim) | v5e SFT unchanged | ~3889 | Original | Preserve v5e code capability |
+| Kernel dual-segment copies (new) | Claude plan + v5e kernel code | ~1500 | `<plan>+<code>` | Teach model dual-segment format |
+| Cat2 General reasoning | Claude generated | ~700 | `<plan>+<code>` | Reasoning preservation |
+| Cat3 Complex CoT | Claude generated | ~350 | `<plan>+<code>` | Reasoning depth |
+| **Total** | | **~6400** | Mixed | |
 
-关键设计：kernel 双段副本的 user prompt 加了 suffix ("Explain your tiling decisions." 等)，
-使模型学到 "当用户要求解释时 → 用 plan+code 格式"，而非无条件改变输出格式。
+Key design: kernel dual-segment copies add a suffix to the user prompt ("Explain your tiling decisions." etc.),
+so the model learns "when the user asks for explanation → use plan+code format", rather than unconditionally changing output format.
 
-### v5f 训练配置 (与 v5e 相同)
+### v5f Training Config (same as v5e)
 
 | Parameter | Value |
 |-----------|-------|
-| Base model | Qwen2.5-Coder-32B (原始, 非 v5e) |
+| Base model | Qwen2.5-Coder-32B (original, NOT v5e) |
 | Method | LoRA r=64, alpha=128, dropout=0.1 |
 | Epochs | 3 |
 | LR | 1e-5 |
 | SEQ_LEN | 16384 |
 
-### v5f vs v1 的关键区别
+### Key Differences: v5f vs v1
 
-1. **保留原始信号**：v5e 全量数据原样保留，双段格式作为额外样本添加（不替换）
-2. **一次训练 vs 双重 LoRA**：从 base 直接训到 v5f，不叠加 v5e
-3. **Plan-code 因果校验**：`_extract_code_decisions` 确保 plan 引用 code 中的实际设计决策
-4. **简化 system prompt**：去掉格式示例，改为简短指令 (防止 template regurgitation)
-5. **条件格式**：user prompt 含"Explain your decisions"时 → plan+code；否则 → 原始格式
+1. **Preserve original signal**: Full v5e data kept verbatim; dual-segment format added as extra samples (not replaced)
+2. **Single training vs double LoRA**: Train directly from base to v5f, without stacking on v5e
+3. **Plan-code causal validation**: `_extract_code_decisions` ensures the plan references actual design decisions in the code
+4. **Simplified system prompt**: Remove format examples; use brief instructions instead (prevents template regurgitation)
+5. **Conditional format**: When user prompt contains "Explain your decisions" → plan+code; otherwise → original format
 
-### 运行流程
+### Run Workflow
 
 ```bash
-# 1. 生成 v5f 数据 (需要 Claude API)
+# 1. Generate v5f data (requires Claude API)
 python generate_v5f_data.py \
     --sft-data /home/danyzhan/flydsl-agent-dataset/data/sft/train-00000-of-00001.jsonl \
     --val-data /home/danyzhan/flydsl-agent-dataset/data/sft/validation-00000-of-00001.jsonl \
     --output /home/danyzhan/flydsl-agent-dataset/data/v5f/train.jsonl \
     --val-output /home/danyzhan/flydsl-agent-dataset/data/v5f/validation.jsonl
 
-# 2. 训练 (3 epochs, ~3h on 8xMI350X)
+# 2. Train (3 epochs, ~3h on 8xMI350X)
 bash run_v5f.sh
 
-# 3. 导出 HF 模型
+# 3. Export HF model
 bash export_v5f.sh
 
-# 4. 评估
+# 4. Evaluate
 bash eval_v5f.sh
 ```
 
@@ -450,18 +450,19 @@ then a <code> section with complete FlyDSL kernel code.
 
 ### Fix 3: Structural plan-code consistency validation (addresses Root Causes 1+2)
 
-v1 的 `validate_plan_code_consistency` 只做数字重叠检查，plan 和 code 之间
-没有真正的语义关联。这导致模型学到"先输出一段看起来像推理的文字，然后输出代码"，
-而不是"分析 tiling/pipeline/swizzle 决策，再写对应代码"。
+v1's `validate_plan_code_consistency` only checked numeric overlap; there was no
+real semantic link between plan and code. This caused the model to learn
+"first output reasoning-like text, then output code" rather than
+"analyze tiling/pipeline/swizzle decisions, then write corresponding code".
 
-v2 改用结构化校验 (`_extract_code_decisions` + 多维度验证):
-1. 从 code 中静态解析 tile sizes, pipeline stages, swizzle pattern, MFMA, split-K
-2. 验证 plan 是否用自然语言提到了这些具体决策 (不只是数字匹配，而是关键词语义匹配)
-3. 检查 plan 是否有 ≥3 个实质句子 (防止空洞模板)
-4. 60% 通过率门槛，不一致的样本丢弃重新生成
+v2 uses structured validation (`_extract_code_decisions` + multi-dimensional checks):
+1. Statically parse tile sizes, pipeline stages, swizzle pattern, MFMA, split-K from code
+2. Verify the plan mentions these specific decisions in natural language (keyword semantic match, not just numeric overlap)
+3. Check the plan has ≥3 substantive sentences (prevent hollow templates)
+4. 60% pass-rate threshold; inconsistent samples are discarded and regenerated
 
-这对 HRD 至关重要 — HRD 假设 plan tokens 解释了 code tokens 的设计选择，
-reward decomposition 依赖这个因果链。如果 plan 是套话，HRD 的 plan reward 就在奖励空洞推理。
+This is critical for HRD — HRD assumes plan tokens explain the design choices in code tokens,
+and reward decomposition depends on this causal chain. If the plan is boilerplate, HRD's plan reward rewards hollow reasoning.
 
 ### Fix 4: Add v5e kernel preservation set (addresses Root Cause 3)
 
@@ -487,13 +488,14 @@ reward decomposition 依赖这个因果链。如果 plan 是套话，HRD 的 pla
 
 ### v1 → v2 key difference: plan-code causal link
 
-v1 的核心缺陷不只是格式问题，而是 **plan 和 code 之间缺乏因果关联**。
-模型学到的是"先输出推理状文字，再输出代码"的表面模式，而非"分析决策→据此写代码"的因果推理。
+v1's core flaw was not just a format issue, but **lack of causal linkage between plan and code**.
+The model learned the surface pattern of "output reasoning-like text first, then code",
+rather than the causal reasoning of "analyze decisions → write code accordingly".
 
-v2 通过结构化校验 (`_extract_code_decisions`) 确保每条训练数据中:
-- plan 提到的 tile size 确实出现在 code 的常量中
-- code 用了 pipeline/swizzle/MFMA，plan 必须解释为什么
-- plan 不能是空洞的 3 句话模板
+v2 ensures via structured validation (`_extract_code_decisions`) that in every training sample:
+- Tile sizes mentioned in the plan actually appear as constants in the code
+- If code uses pipeline/swizzle/MFMA, the plan must explain why
+- The plan cannot be a hollow 3-sentence template
 
-这个改变对下游 HRD 至关重要：如果 plan 和 code 脱节，HRD 的 reward decomposition
-就无法学到"好的推理→好的代码"这个信用分配关系。
+This change is critical for downstream HRD: if plan and code are decoupled, HRD's reward decomposition
+cannot learn the credit assignment relationship of "good reasoning → good code".

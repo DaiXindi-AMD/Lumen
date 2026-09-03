@@ -13,3 +13,5 @@ third_party/aiter/docker/
 **/.pytest_cache/
 .claude/
 *.log
+examples/dsv4/.bootstrap-build/tilelang/
+examples/dsv4/miles_compat/

@@ -31,7 +31,6 @@ source "${SCRIPT_DIR}/dsv4_4layer_megatron_args.sh"
 TORCH_DIST="${MODEL_DIR}/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
-MHC_BACKEND="${MHC_BACKEND:-triton}"
 V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
@@ -79,14 +78,10 @@ echo "  Workspace : ${WORKSPACE_ROOT}  (data: ${DATA_ROOT})"
 echo "  Bootstrap : $([[ ${USE_BOOTSTRAP} -eq 1 ]] && echo yes || echo no)"
 echo "  Steps     : ${TRAIN_ITERS}"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
-echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
+echo "  HC mult   : ${DSV4_HC_MULT} (AIter)"
 echo "  FP8       : $([[ ${LUMEN_DSV4_LINEAR_FP8} -eq 1 ]] && echo "Lumen (${LUMEN_DSV4_FP8_SCALING})" || echo BF16)"
 echo "  MoE EP    : $([[ ${LUMEN_DSV4_MOE_MORI} -eq 1 ]] && echo "MORI" || echo NCCL alltoall)"
-if [[ -n "${TILEKERNELS_DIR}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" ]]; then
-    echo "  mHC       : overlay ${TILEKERNELS_DIR}/tile_kernels/{mhc,modeling/mhc}"
-else
-    echo "  mHC       : bootstrap site-packages (set TILEKERNELS_DIR for local overlay)"
-fi
+echo "  mHC       : AIter DSV4 fused kernels"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND} (triton -> aiter sparse_mla_dsv4_train)"
 echo "  Ckpt      : ${TORCH_DIST}"
 echo "  Log       : ${LOGFILE}"
@@ -94,6 +89,7 @@ echo "════════════════════════�
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${AITER_DIR}:/workspace/aiter"
     -v "${MODEL_DIR}:/root/models"
     -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
@@ -101,15 +97,13 @@ DOCKER_MOUNTS=(
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_MOUNTS+=(-v "${MILES_DIR}:/workspace/miles")
 fi
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
-fi
 if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
     DOCKER_MOUNTS+=(-v "${BOOTSTRAP_MOUNT}:/bootstrap:ro")
 fi
 
 DOCKER_ENV=(
     -e LUMEN_DIR=/workspace/Lumen
+    -e AITER_DIR=/workspace/aiter
     -e LUMEN_DSV4_PRETRAIN=1
     -e MODEL_DIR=/root/models
     -e MODEL_NAME="${MODEL_NAME}"
@@ -122,7 +116,6 @@ DOCKER_ENV=(
     -e EVAL_ITERS="${EVAL_ITERS}"
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
     -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
     -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
     -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
     -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
@@ -131,9 +124,6 @@ DOCKER_ENV=(
     -e LUMEN_DSV4_MOE_MORI="${LUMEN_DSV4_MOE_MORI}"
     -e DSV4_ENABLE_RECOMPUTE="${DSV4_ENABLE_RECOMPUTE:-1}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
 fi

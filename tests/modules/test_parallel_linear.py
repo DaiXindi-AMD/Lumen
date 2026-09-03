@@ -35,6 +35,29 @@ def _make_config():
 
 
 @mock.patch("lumen.modules.parallel_linear._get_tp_group", return_value=None)
+@mock.patch("lumen.modules.parallel_linear._pg_size", return_value=2)
+@mock.patch("lumen.modules.parallel_linear._pg_rank", return_value=0)
+@mock.patch("lumen.modules.parallel_linear._use_sdma_from_args", return_value=False)
+@mock.patch("lumen.modules.parallel_linear._initialize_affine_weight_cpu")
+def test_column_parallel_cpu_init_preserves_partition_stride(*_):
+    config = _make_config()
+    config.perform_initialization = True
+    config.use_cpu_initialization = True
+    module = LumenColumnParallelLinear(
+        64,
+        128,
+        config=config,
+        init_method=lambda weight: weight.zero_(),
+        bias=False,
+        stride=2,
+    )
+
+    assert module.weight.tensor_model_parallel is True
+    assert module.weight.partition_dim == 0
+    assert module.weight.partition_stride == 2
+
+
+@mock.patch("lumen.modules.parallel_linear._get_tp_group", return_value=None)
 @mock.patch("lumen.modules.parallel_linear._pg_size", return_value=1)
 @mock.patch("lumen.modules.parallel_linear._pg_rank", return_value=0)
 @mock.patch("lumen.modules.parallel_linear._use_sdma_from_args", return_value=False)

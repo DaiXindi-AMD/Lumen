@@ -99,7 +99,9 @@ docker run --rm --init \
 set -euo pipefail
 
 LUMEN_ROOT="/workspace/Lumen"
-EX="${LUMEN_ROOT}/examples/llama31"
+# Shared Megatron pretrain driver lives under examples/llama31/.
+PRETRAIN_DIR="${LUMEN_ROOT}/examples/llama31"
+PATCH_SCRIPT="${LUMEN_ROOT}/examples/dsv4/patch_megatron_source.py"
 DATA_DIR="/results/mock_data"
 TRAIN_JSONL="${DATA_DIR}/mock_train.jsonl"
 mkdir -p "${DATA_DIR}"
@@ -107,7 +109,7 @@ mkdir -p "${DATA_DIR}"
 python -c "import megatron" 2>/dev/null || { echo "ERROR: megatron not found in image"; exit 1; }
 
 MEGATRON_ROOT="${MEGATRON_ROOT:-/workspace/megatron_lm}"
-python "${LUMEN_ROOT}/examples/llama2/scripts/patch_gpt_layer_specs.py" "${MEGATRON_ROOT}"
+PYTHONPATH="${LUMEN_ROOT}" python3 "${PATCH_SCRIPT}" "${MEGATRON_ROOT}" --tag llama
 
 python - <<PYEOF
 import os, json, random
@@ -127,7 +129,7 @@ with open(path, "w") as f:
 print(f"[mock-data] wrote {docs} docs to {path}")
 PYEOF
 
-cd "${EX}"
+cd "${PRETRAIN_DIR}"
 set -x
 torchrun --nproc_per_node=8 --nnodes=1 pretrain_llama31.py \
     --backend megatron \

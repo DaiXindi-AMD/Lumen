@@ -1,4 +1,10 @@
-"""Patch Megatron MLP to use FP8 activation storage for SwiGLU intermediates.
+"""OBSOLETE — use ``lumen.models.megatron_patches.install_mlp_fp8_store()`` instead.
+
+Set ``LUMEN_MLP_FP8_STORE=1`` and import ``lumen.models.megatron`` (or call
+``install_all()``). This file-level disk patch is kept only for Megatron-only
+workflows outside the Lumen import path.
+
+Patch Megatron MLP to use FP8 activation storage for SwiGLU intermediates.
 
 TransformerEngine achieves lower activation memory via fused SwiGLU with FP8
 storage (USE_TE_SWIGLU=1 + FP8_ACTIVATION=1). In Lumen's Megatron path the

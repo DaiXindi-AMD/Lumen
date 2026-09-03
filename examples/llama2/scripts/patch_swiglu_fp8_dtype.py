@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Patch fused_bias_swiglu.py to use ROCm-compatible FP8 dtype.
+"""OBSOLETE — use ``install_swiglu_fp8()`` via ``import lumen.models.megatron`` instead.
+
+Set ``LUMEN_FUSED_SWIGLU_QUANT=1`` when needed. The Lumen import path patches
+``SwiGLUFunction`` at runtime in ``lumen/patches/runtime/megatron_import.py``;
+this disk script is only for Megatron-only workflows outside Lumen.
+
+Patch fused_bias_swiglu.py to use ROCm-compatible FP8 dtype.
 
 Megatron's SwiGLUFunction uses ``torch.float8_e4m3fn`` for FP8 activation
 storage, but MI300X requires ``torch.float8_e4m3fnuz``.  This patch replaces

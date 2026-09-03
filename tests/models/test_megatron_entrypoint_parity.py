@@ -15,6 +15,7 @@ LLAMA31_EXAMPLE = REPO_ROOT / "examples" / "llama31" / "pretrain_llama31.py"
 LLAMA2_EXAMPLE = REPO_ROOT / "examples" / "llama2" / "finetune_llama2.py"
 LLAMA31_MEGATRON = REPO_ROOT / "lumen" / "models" / "llama31" / "megatron" / "pretrain.py"
 LLAMA2_MEGATRON = REPO_ROOT / "lumen" / "models" / "llama2" / "megatron" / "sft.py"
+LLAMA_BUILDERS = REPO_ROOT / "lumen" / "patches" / "builders" / "llama.py"
 SHARED_MEGATRON = REPO_ROOT / "lumen" / "models" / "megatron.py"
 
 MOVED_SHARED_FLAGS = {
@@ -75,6 +76,31 @@ def _get_call_keywords(path: Path, function_name: str, callee_name: str):
     return set()
 
 
+def _get_apply_training_patch_names(path: Path, function_name: str):
+    tree = _parse_module(path)
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == function_name:
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                func = child.func
+                name = (
+                    func.id
+                    if isinstance(func, ast.Name)
+                    else func.attr if isinstance(func, ast.Attribute) else None
+                )
+                if name != "apply_training_patches":
+                    continue
+                for kw in child.keywords:
+                    if kw.arg == "names" and isinstance(kw.value, ast.Set):
+                        return {
+                            elt.value
+                            for elt in kw.value.elts
+                            if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                        }
+    return set()
+
+
 class TestMegatronExampleParity:
     def test_llama31_uses_shared_model_provider_helper(self):
         calls = _get_function_calls(LLAMA31_EXAMPLE, "_run_megatron")
@@ -85,20 +111,24 @@ class TestMegatronExampleParity:
         assert "make_lumen_model_provider" in calls
 
     def test_llama31_installs_shared_fp8_param_hook(self):
-        calls = _get_function_calls(LLAMA31_EXAMPLE, "_run_megatron")
-        assert "install_fp8_param_gather_hook" in calls
+        names = _get_apply_training_patch_names(LLAMA31_EXAMPLE, "_run_megatron")
+        assert "fp8_param_gather_hook" in names
 
     def test_llama2_installs_shared_fp8_param_hook(self):
-        calls = _get_function_calls(LLAMA2_EXAMPLE, "_run_megatron")
-        assert "install_fp8_param_gather_hook" in calls
+        names = _get_apply_training_patch_names(LLAMA2_EXAMPLE, "_run_megatron")
+        assert "fp8_param_gather_hook" in names
+        assert "fp8_param_storage_hook" in names
+        assert "hip_graphs_hook" in names
+        assert "val_loss_early_stop_hook" in names
 
     def test_llama31_installs_mxfp4_weight_cache_hook(self):
-        calls = _get_function_calls(LLAMA31_EXAMPLE, "_run_megatron")
-        assert "install_mxfp4_weight_cache_hook" in calls
+        names = _get_apply_training_patch_names(LLAMA31_EXAMPLE, "_run_megatron")
+        assert "mxfp4_weight_cache_hook" in names
+        assert "gc_freeze_hook" in names
 
     def test_llama2_installs_mxfp4_weight_cache_hook(self):
-        calls = _get_function_calls(LLAMA2_EXAMPLE, "_run_megatron")
-        assert "install_mxfp4_weight_cache_hook" in calls
+        names = _get_apply_training_patch_names(LLAMA2_EXAMPLE, "_run_megatron")
+        assert "mxfp4_weight_cache_hook" in names
 
 
 class TestLlama31MegatronArgsParity:
@@ -107,7 +137,7 @@ class TestLlama31MegatronArgsParity:
         assert not (MOVED_SHARED_FLAGS & literals)
 
     def test_llama31_keeps_docker_compat_only_flags(self):
-        literals = _string_literals(LLAMA31_MEGATRON)
+        literals = _string_literals(LLAMA_BUILDERS)
         assert "--size" in literals
         assert "--nodes" in literals
         assert "--gpus-per-node" in literals

@@ -1,12 +1,10 @@
-"""Lumen FP8 hooks for DSV4 on the Miles/Megatron training path."""
+"""Lumen FP8 hooks for DSV4 native Megatron training."""
 
 from __future__ import annotations
 
 import os
 from argparse import Namespace
 from typing import Optional
-
-_HOOK_INSTALLED = False
 
 
 def dsv4_linear_fp8_enabled() -> bool:
@@ -83,70 +81,8 @@ def enable_fp8_for_dsv4_model(model, args: Optional[Namespace] = None) -> None:
     )
 
 
-def install_dsv4_fp8_model_provider_hook(args=None) -> None:
-    """Wrap Miles model provider to enable Lumen FP8 after GPTModel construction.
-
-    Invoked via ``--custom-megatron-init-path`` when ``LUMEN_DSV4_LINEAR_FP8=1``.
-    Does not re-check the env var on Ray workers (init path is the enable signal).
-    """
-    del args
-    global _HOOK_INSTALLED
-    if _HOOK_INSTALLED:
-        return
-
-    import miles.backends.megatron_utils.model_provider as model_provider_mod
-
-    _orig_get_provider = model_provider_mod.get_model_provider_func
-
-    def get_model_provider_func(args, role="actor"):
-        provider = _orig_get_provider(args, role)
-
-        def wrapped_provider(
-            pre_process=True,
-            post_process=True,
-            vp_stage=None,
-            config=None,
-            pg_collection=None,
-        ):
-            model = provider(
-                pre_process=pre_process,
-                post_process=post_process,
-                vp_stage=vp_stage,
-                config=config,
-                pg_collection=pg_collection,
-            )
-            enable_fp8_for_dsv4_model(model, _build_fp8_args())
-            return model
-
-        return wrapped_provider
-
-    model_provider_mod.get_model_provider_func = get_model_provider_func
-    _HOOK_INSTALLED = True
-
-
 def register_dsv4_megatron_cli(parser) -> None:
-    """Register Lumen FP8 CLI flags on the Miles/Megatron parser."""
-    from lumen.models.megatron import add_common_megatron_args
+    """Register Lumen FP8 CLI flags on the Megatron parser."""
+    from lumen.patches.builders import apply_args_patches
 
-    add_common_megatron_args(parser)
-
-
-def install_dsv4_miles_cli_hook() -> None:
-    """Extend Miles Megatron arg parser with Lumen ``--linear-fp8`` flags."""
-    if not dsv4_linear_fp8_enabled():
-        return
-
-    from miles.utils import arguments as miles_arguments
-
-    _orig_provider = miles_arguments.get_miles_extra_args_provider
-
-    def get_miles_extra_args_provider(add_custom_arguments=None):
-        inner = _orig_provider(add_custom_arguments)
-
-        def provider(parser):
-            inner(parser)
-            register_dsv4_megatron_cli(parser)
-
-        return provider
-
-    miles_arguments.get_miles_extra_args_provider = get_miles_extra_args_provider
+    apply_args_patches(parser, names={"common_megatron_args"})

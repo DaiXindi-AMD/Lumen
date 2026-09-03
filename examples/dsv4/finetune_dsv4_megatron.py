@@ -1,9 +1,9 @@
-"""Native torchrun GRPO finetune entry for DSV4 (debug-train-only, no Ray/Miles train.py).
+"""Native torchrun GRPO finetune entry for DSV4 (debug-train-only, no Ray).
 
 Reads ``fake_rollout.pt``, runs GRPO policy loss updates via ``megatron.training.pretrain``
 with a patched train loop (see ``lumen.models.dsv4.megatron.finetune_loop``).
 
-Launched by ``run_dsv4_4layer_finetune_inner.sh`` or ``run_dsv4_flash_finetune_inner.sh``.
+Launched by ``run_dsv4_inner.sh``.
 """
 
 from __future__ import annotations
@@ -18,7 +18,9 @@ if MEGATRON_PATH not in sys.path:
 
 os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
 
-from lumen.models.dsv4.megatron.spec import get_dsv4_spec  # noqa: E402, F401
+from lumen.models.megatron_patches import install_all  # noqa: E402
+
+install_all()  # IMPORT patches (incl. mmap) before Megatron checkpoint load
 
 from model_provider import model_provider as _megatron_model_provider  # noqa: E402
 
@@ -53,9 +55,9 @@ def _extra_args_provider(parser):
 
 def main() -> None:
     if os.environ.get("LUMEN_DSV4_LINEAR_FP8", "0") == "1":
-        from lumen.models.megatron import install_fp8_param_gather_hook
+        from lumen.patches import apply_training_patches
 
-        install_fp8_param_gather_hook()
+        apply_training_patches(names={"fp8_param_gather_hook"})
 
     run_dsv4_grpo_finetune(
         _build_model_provider(),

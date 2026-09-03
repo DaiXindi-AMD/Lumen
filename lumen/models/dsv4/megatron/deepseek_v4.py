@@ -3,29 +3,20 @@
 from __future__ import annotations
 
 import copy
-import os
 
 import einops
 import torch
-import torch.nn as nn
-
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
-from megatron.core.models.gpt import experimental_attention_variant_module_specs as _eav_specs
-from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
-    get_transformer_block_with_experimental_attention_variant_spec,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.mappings import (
-    copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAIndexerSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from torch import nn
 
 from lumen.models.dsv4.megatron.layers import (
     LumenColumnParallelLinear,
@@ -33,11 +24,9 @@ from lumen.models.dsv4.megatron.layers import (
     LumenNorm,
     LumenRowParallelLinear,
 )
-from lumen.models.dsv4.megatron.moe_mori import mori_ep_enabled, patch_megatron_moe_mori
-from lumen.models.dsv4.megatron.spec_provider import LumenDSV4SpecProvider
 from lumen.models.dsv4.megatron.v4_indexer import V4Indexer
-from lumen.models.dsv4.ops import (
-    DeepSeekV4Compressor,
+from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,
     fp8_simulate_qat,
@@ -47,9 +36,33 @@ from lumen.models.dsv4.ops import (
     get_window_topk_idxs_cp,
     wrapped_precompute_freqs_cis,
 )
-from lumen.models.dsv4.ops.sparse_mla_backend import get_sparse_attn_fn
+from lumen.ops.dsv4.sparse_mla import get_sparse_attn_fn
 
 _sparse_attn_fn = get_sparse_attn_fn()
+
+
+def _allreduce_kv_grad_fp32(tensor: torch.Tensor, group) -> torch.Tensor:
+    """Forward identity; all-reduce ``dkv`` in fp32 over ``group``.
+
+    ROCm Megatron's ``copy_to_tensor_model_parallel_region`` has no
+    ``all_reduce_grad_fp32`` argument, so this matches Miles' fp32 dkv reduce.
+    """
+
+    class _AllReduceKvGradFp32(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x):
+            ctx.group = group
+            return x
+
+        @staticmethod
+        def backward(ctx, grad):
+            if grad is None:
+                return None
+            g = grad.contiguous().float()
+            torch.distributed.all_reduce(g, group=ctx.group)
+            return g.to(dtype=grad.dtype)
+
+    return _AllReduceKvGradFp32.apply(tensor)
 
 
 def _enable_deepseek_v4_tf32():
@@ -65,8 +78,8 @@ class DeepSeekV4Attention(MegatronModule):
         submodules=None,
         layer_number: int = 1,
         attn_mask_type=None,
-        attention_type: str = None,
-        cp_comm_type: str = None,
+        attention_type: str | None = None,
+        cp_comm_type: str | None = None,
         pg_collection=None,
     ):
         _enable_deepseek_v4_tf32()
@@ -109,7 +122,7 @@ class DeepSeekV4Attention(MegatronModule):
         config_no_sp = copy.copy(config)
         config_no_sp.sequence_parallel = False
 
-        self.attn_sink = nn.Parameter(torch.empty(self.n_local_heads, dtype=torch.float32))
+        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
         self.attn_sink._keep_fp32 = True
         self.attn_sink.tensor_model_parallel = True
         self.attn_sink.partition_dim = 0
@@ -152,13 +165,16 @@ class DeepSeekV4Attention(MegatronModule):
         for p in list(self.wq_a.parameters()) + list(self.wkv.parameters()):
             p.sequence_parallel = False
 
-        self.wo_a = ColumnParallelLinear(
+        self.wo_a = LumenColumnParallelLinear(
             self.n_heads * self.head_dim // self.n_groups,
             self.n_groups * self.o_lora_rank,
             config=config_no_sp,
             init_method=config.init_method,
             bias=False,
             gather_output=False,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=self.tp_group,
         )
         self.wo_b = LumenRowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -183,23 +199,7 @@ class DeepSeekV4Attention(MegatronModule):
                 cp_group=self.cp_group,
             )
             if self.compress_ratio == 4:
-                indexer_impl = os.environ.get("V4_INDEXER_IMPL", "tilelang")
-                topk_backend = config.miles_dsa_topk_backend
-                if indexer_impl == "tilelang":
-                    self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
-                else:
-                    if topk_backend != "torch":
-                        raise ValueError(
-                            "DeepSeek V4 miles DSA topk backend is only supported with "
-                            f"V4_INDEXER_IMPL=tilelang; got {topk_backend=} with {indexer_impl=}."
-                        )
-                    indexer_submodules = DSAIndexerSubmodules(
-                        linear_wq_b=LumenDuplicatedLinear,
-                        linear_wk=LumenDuplicatedLinear,
-                        k_norm=LumenNorm,
-                        linear_weights_proj=LumenDuplicatedLinear,
-                    )
-                    self.indexer = DSAIndexer(config=config, submodules=indexer_submodules)
+                self.indexer = V4Indexer(config=config, pg_collection=pg_collection)
             else:
                 self.indexer = None
 
@@ -267,7 +267,9 @@ class DeepSeekV4Attention(MegatronModule):
         apply_rotary_emb(kv_vanilla[..., -rd:], freqs_cis)
         if self.use_fp8_qat:
             kv_vanilla = kv_vanilla.clone()
-            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(kv_vanilla[..., : self.nope_head_dim], 64)
+            kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(
+                kv_vanilla[..., : self.nope_head_dim], 64
+            )
 
         seqlen_global = seqlen_local * self.cp_size
         q_positions = get_q_positions_for_cp(
@@ -304,7 +306,9 @@ class DeepSeekV4Attention(MegatronModule):
             if kv_compress_sbd is not None:
                 kv_compress = einops.rearrange(kv_compress_sbd, "s b d -> b s d")
 
-        assert self.attn_sink.dtype == torch.float32
+        attn_sink = self.attn_sink
+        if attn_sink.dtype != torch.float32:
+            attn_sink = attn_sink.float()
 
         if self.cp_size > 1:
             kv_vanilla = all_gather_cp(kv_vanilla, dim=1, cp_group=self.cp_group)
@@ -317,9 +321,9 @@ class DeepSeekV4Attention(MegatronModule):
         else:
             kv = kv_vanilla
 
-        kv = copy_to_tensor_model_parallel_region(kv, group=self.tp_group, all_reduce_grad_fp32=True)
+        kv = _allreduce_kv_grad_fp32(kv, self.tp_group)
 
-        o = _sparse_attn_fn(q, kv, self.attn_sink, topk_idxs, self.softmax_scale)
+        o = _sparse_attn_fn(q, kv, attn_sink, topk_idxs, self.softmax_scale)
 
         apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
 
@@ -333,7 +337,7 @@ class DeepSeekV4Attention(MegatronModule):
         if self.sequence_parallel:
             output = scatter_to_sequence_parallel_region(output, group=self.tp_group)
 
-        return output
+        return output, None
 
     def _compute_indexer_mask(self, *, q_positions: torch.Tensor, seqlen_global: int) -> torch.Tensor:
         ratio = 4
@@ -352,9 +356,9 @@ def _dsv4_attention_module_spec(config, backend=None):
     )
 
 
-def _patch_megatron_no_te() -> None:
-    """Allow Megatron optimizer init without Transformer Engine (Lumen bootstrap path)."""
-    if getattr(_patch_megatron_no_te, "_done", False):
+def patch_dsv4_megatron_bootstrap() -> None:
+    """One-time Megatron core init shims for the DSV4 spec path."""
+    if getattr(patch_dsv4_megatron_bootstrap, "_done", False):
         return
 
     import megatron.core.utils as mu
@@ -373,16 +377,16 @@ def _patch_megatron_no_te() -> None:
 
     oc.is_te_min_version = _is_te_min_version
 
-    import megatron.core.transformer.moe.moe_utils as moe_utils
+    from megatron.core.transformer.moe import moe_utils
 
     if not getattr(moe_utils, "HAVE_TE", False):
         moe_utils.te_general_gemm = None
 
-    import megatron.core.jit as jit
+    from megatron.core import jit
 
     jit.disable_jit_fuser()
 
-    _patch_megatron_no_te._done = True
+    patch_dsv4_megatron_bootstrap._done = True
 
 
 def get_dsv4_spec(args, config, vp_stage):
@@ -392,25 +396,9 @@ def get_dsv4_spec(args, config, vp_stage):
 
         --spec lumen.models.dsv4.megatron.spec get_dsv4_spec
     """
-    config.miles_dsa_topk_backend = getattr(args, "miles_dsa_topk_backend", "torch")
-    _patch_megatron_no_te()
-    if mori_ep_enabled():
-        patch_megatron_moe_mori()
-    _orig_get_spec = _eav_specs.get_experimental_attention_variant_module_spec
-    _orig_get_backend = _eav_specs._get_backend_spec_provider
+    from lumen.patches.builders import apply_config_build, apply_model_build
+    from lumen.patches.builders.dsv4 import build_dsv4_transformer_block_spec
 
-    def _patched_get_spec(config, backend=None):
-        if config.experimental_attention_variant == "dsv4":
-            return _dsv4_attention_module_spec(config, backend)
-        return _orig_get_spec(config, backend)
-
-    def _lumen_backend_spec_provider(config):
-        return LumenDSV4SpecProvider()
-
-    _eav_specs.get_experimental_attention_variant_module_spec = _patched_get_spec
-    _eav_specs._get_backend_spec_provider = _lumen_backend_spec_provider
-    try:
-        return get_transformer_block_with_experimental_attention_variant_spec(config, vp_stage=vp_stage)
-    finally:
-        _eav_specs.get_experimental_attention_variant_module_spec = _orig_get_spec
-        _eav_specs._get_backend_spec_provider = _orig_get_backend
+    apply_config_build(config, args, tags={"dsv4", "spec"})
+    apply_model_build(config=config, args=args, tags={"dsv4", "spec"})
+    return build_dsv4_transformer_block_spec(config, vp_stage)

@@ -17,6 +17,10 @@ MASTER_ADDR="${MASTER_ADDR:?MASTER_ADDR required}"
 MASTER_PORT="${MASTER_PORT:-29500}"
 OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION:-0.75}"
 DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
+# DP=1 keeps a full optimizer state per rank (~18.4B params), so 8 fp32 copies per
+# node exceed host RAM; bf16 moments halve the offloaded footprint.
+EXP_AVG_DTYPE="${EXP_AVG_DTYPE:-bf16}"
+EXP_AVG_SQ_DTYPE="${EXP_AVG_SQ_DTYPE:-bf16}"
 
 # shellcheck source=examples/dsv4/dsv4_flash_megatron_args.sh
 source examples/dsv4/dsv4_flash_megatron_args.sh
@@ -68,6 +72,8 @@ fi
 echo "[pretrain-full] launching torchrun ${NNODES}×${NPROC_PER_NODE} (node_rank=${NODE_RANK}) ..."
 echo "[pretrain-full] parallel: TP=${TP} PP=${PP} EP=${EP} | batch GBS=${GBS} MBS=${MBS} seq=${SEQ_LEN}"
 echo "[pretrain-full] optimizer CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
+echo "[pretrain-full] optimizer moments: exp_avg=${EXP_AVG_DTYPE} exp_avg_sq=${EXP_AVG_SQ_DTYPE}"
+echo "[pretrain-full] lr=${PRETRAIN_LR:-1e-6} min_lr=${PRETRAIN_MIN_LR:-${PRETRAIN_LR:-1e-6}} iters=${TRAIN_ITERS}"
 echo "[pretrain-full] CPU memory: num_workers=0, pin_cpu_grads/params=off (mock-data smoke)"
 
 torchrun \
@@ -101,6 +107,7 @@ torchrun \
     --no-pin-cpu-grads \
     --no-pin-cpu-params \
     --split 100,0,0 \
+    --seed "${SEED:-1234}" \
     --bf16 \
     --no-gradient-accumulation-fusion \
     --accumulate-allreduce-grads-in-fp32 \
@@ -108,9 +115,13 @@ torchrun \
     --optimizer adam \
     --optimizer-cpu-offload \
     --use-precision-aware-optimizer \
+    --use-torch-optimizer-for-cpu-offload \
     --overlap-cpu-optimizer-d2h-h2d \
     --optimizer-offload-fraction "${OPTIMIZER_OFFLOAD_FRACTION}" \
-    --lr 1e-6 \
+    --exp-avg-dtype "${EXP_AVG_DTYPE}" \
+    --exp-avg-sq-dtype "${EXP_AVG_SQ_DTYPE}" \
+    --lr "${PRETRAIN_LR:-1e-6}" \
+    --min-lr "${PRETRAIN_MIN_LR:-${PRETRAIN_LR:-1e-6}}" \
     --lr-decay-style constant \
     --weight-decay 0.1 \
     --adam-beta1 0.9 \

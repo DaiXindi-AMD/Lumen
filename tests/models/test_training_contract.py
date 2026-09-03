@@ -22,6 +22,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 MODELS_DIR = REPO_ROOT / "lumen" / "models"
+BUILDERS_DIR = REPO_ROOT / "lumen" / "patches" / "builders"
 
 
 def _load_module(module_name: str, path: Path):
@@ -149,7 +150,10 @@ class TestSharedTrainingContractArgs:
 
 class TestSharedTrainingContractIntegration:
     def test_megatron_source_uses_shared_checkpoint_and_experiment_helpers(self):
-        calls = _get_function_calls(_parse_module(MODELS_DIR / "megatron.py"), "add_common_megatron_args")
+        calls = _get_function_calls(
+            _parse_module(BUILDERS_DIR / "megatron_args.py"),
+            "add_common_megatron_args",
+        )
         assert "add_shared_checkpoint_args" in calls
         assert "add_shared_experiment_args" in calls
 

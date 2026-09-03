@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 _ROLLOUT_STATE: dict[str, Any] = {}
 
 
-def _is_miles_log_rank() -> bool:
-    """Match Miles ``is_first_replica_megatron_main_rank`` (PP last, TP0, DP0)."""
+def _is_grpo_log_rank() -> bool:
+    """Primary logging rank for GRPO metrics (PP last, TP0, DP0, CP0)."""
     return (
         mpu.is_pipeline_last_stage(ignore_virtual=True)
         and mpu.get_tensor_model_parallel_rank() == 0
@@ -74,7 +74,7 @@ def add_dsv4_finetune_args(parser):
         "--data-pad-size-multiplier",
         type=int,
         default=128,
-        help="Pad seq len to TP*multiplier (Miles default 128).",
+        help="Pad seq len to TP*multiplier (default 128).",
     )
     return parser
 
@@ -92,6 +92,7 @@ def _prepare_rollout_state(args) -> None:
         advantages,
         pad_multiplier=pad_multiplier,
         device=device,
+        min_seq_len=args.seq_length,
     )
     num_samples = len(samples)
     if args.global_batch_size != num_samples:
@@ -118,7 +119,7 @@ def _prepare_rollout_state(args) -> None:
 
 
 def _aggregate_train_losses(losses_reduced: list[dict[str, Any]]) -> dict[str, float]:
-    """Megatron/Miles-style DP reduction over micro-batch loss metrics."""
+    """DP reduction over micro-batch loss metrics."""
     if not losses_reduced:
         return {}
 
@@ -148,7 +149,7 @@ def _aggregate_train_losses(losses_reduced: list[dict[str, Any]]) -> dict[str, f
 
 
 def _log_rollout_summary(rollout_id: int, rollout: dict[str, Any]) -> None:
-    """Miles-style ``rollout {id}: {...}`` summary (debug-train-only batch)."""
+    """Log ``rollout {id}: {...}`` summary (debug-train-only batch)."""
     advantages = rollout.get("advantages") or []
     rollout_log_probs = rollout.get("rollout_log_probs") or []
     adv_vals = [float(a.mean()) for a in advantages if a.numel()]
@@ -173,7 +174,7 @@ def _log_train_step(
     opt_param_scheduler,
     optimizer,
 ) -> None:
-    """Miles-style ``step {accumulated_step_id}: {'train/...': ...}``."""
+    """Log ``step {accumulated_step_id}: {'train/...': ...}``."""
     accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
     log_dict = {f"train/{key}": val for key, val in loss_dict.items()}
     log_dict["train/grad_norm"] = float(grad_norm)
@@ -184,7 +185,7 @@ def _log_train_step(
 
 
 def _log_perf_data(rollout_id: int, actor_train_time: float, total_lengths: list[int]) -> None:
-    """Miles-style ``perf {rollout_id}: {'perf/actor_train_time': ...}``."""
+    """Log ``perf {rollout_id}: {'perf/actor_train_time': ...}``."""
     log_dict: dict[str, float] = {"perf/actor_train_time": actor_train_time}
     if actor_train_time > 0:
         log_dict["perf/actor_train_tok_per_s"] = sum(total_lengths) / actor_train_time
@@ -298,7 +299,7 @@ def run_dsv4_grpo_finetune(
             iterator = _build_data_iterator(args)
             iterator.reset()
 
-            if _is_miles_log_rank():
+            if _is_grpo_log_rank():
                 _log_rollout_summary(rollout_id, rollout)
 
             for model_module in model:
@@ -310,14 +311,15 @@ def run_dsv4_grpo_finetune(
             train_start = time.perf_counter()
 
             get_model_config(model[0])
+            train_seq_len = _ROLLOUT_STATE["max_seq_len"]
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=iterator,
                 model=model,
                 num_microbatches=num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=train_seq_len,
                 micro_batch_size=args.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
+                decoder_seq_length=train_seq_len,
                 forward_only=False,
             )
 
@@ -329,7 +331,7 @@ def run_dsv4_grpo_finetune(
                 torch.cuda.synchronize()
             actor_train_time = time.perf_counter() - train_start
 
-            if _is_miles_log_rank() and update_successful:
+            if _is_grpo_log_rank() and update_successful:
                 loss_dict = _aggregate_train_losses(losses_reduced)
                 _log_train_step(
                     rollout_id,

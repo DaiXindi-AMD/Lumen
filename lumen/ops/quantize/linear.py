@@ -1634,7 +1634,7 @@ def _get_fast_gemm_fn(op_name):
 
 
 def gemm_bf16(a, w, bias=None):
-    """BF16 GEMM: Y = X @ W^T via AITER tuned_gemm (hipBLASLt / ASM / Triton)."""
+    """BF16 GEMM ``Y = X @ W.T`` via AIter tuned_gemm. No autograd."""
     if _FAST_GEMM_DISPATCH:
         fn = _get_fast_gemm_fn("gemm_bf16")
         if fn is not None:

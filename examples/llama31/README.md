@@ -38,6 +38,10 @@ See `run_pretrain.sh` for all environment variables.
 in either BF16 or FP8 delayed/hybrid with all validated Lumen fusion
 optimizations, using mock data (no dataset download needed).
 
+It applies SOURCE patches with ``--tag llama`` via
+``examples/dsv4/patch_megatron_source.py`` before ``torchrun``.
+The non-Docker ``run_pretrain.sh`` Megatron path does the same when ``MEGATRON_ROOT`` is set.
+
 ### Launch
 
 ```bash

@@ -9,8 +9,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 from lumen.models.dsv4.megatron.layers import LumenDuplicatedLinear
-from lumen.models.dsv4.ops import (
-    DeepSeekV4Compressor,
+from lumen.models.dsv4.ops.compressor import DeepSeekV4Compressor
+from lumen.ops.dsv4 import (
     all_gather_cp,
     apply_rotary_emb,
     fp8_simulate_qat,
@@ -18,11 +18,9 @@ from lumen.models.dsv4.ops import (
     get_freqs_cis_for_cp,
     wrapped_precompute_freqs_cis,
 )
-from lumen.models.dsv4.ops.kernel.tilelang_indexer_fwd import (
-    _make_causal_cu_seqlens,
-    batched_indexer_fwd,
-)
-from lumen.models.dsv4.ops.utils import rotate_activation
+from lumen.ops.dsv4.indexer import get_batched_indexer_fwd
+from lumen.ops.dsv4.indexer_utils import make_causal_cu_seqlens
+from lumen.ops.dsv4.utils import rotate_activation
 
 
 class V4Indexer(MegatronModule):
@@ -36,7 +34,7 @@ class V4Indexer(MegatronModule):
         self.index_n_heads = config.dsa_indexer_n_heads
         self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
-        self.topk_backend = config.miles_dsa_topk_backend
+        self.topk_backend = config.dsv4_dsa_topk_backend
         self.rope_head_dim = config.qk_pos_emb_head_dim
         self.compress_ratio = 4
         self.use_fp8_qat = config.fp8 is not None
@@ -128,11 +126,12 @@ class V4Indexer(MegatronModule):
 
         seqlen_global = seqlen * cp_size
         seqlen_kv = k.shape[0]
-        cu_ks, cu_ke = _make_causal_cu_seqlens(seqlen_global, seqlen_kv, self.compress_ratio, q.device)
+        cu_ks, cu_ke = make_causal_cu_seqlens(seqlen_global, seqlen_kv, self.compress_ratio, q.device)
         if cp_size > 1 and cp_group is not None:
             cp_rank = cp_group.rank()
             cu_ks = cu_ks[cp_rank * seqlen : (cp_rank + 1) * seqlen]
             cu_ke = cu_ke[cp_rank * seqlen : (cp_rank + 1) * seqlen]
+        batched_indexer_fwd = get_batched_indexer_fwd()
         index_scores = batched_indexer_fwd(q, k, weights.float(), cu_ks, cu_ke)
 
         topk_count = min(self.index_topk, index_scores.size(-1))

@@ -1,73 +1,73 @@
-# RFT Stage A 实验报告 — Diversity-Preserving Rejection Fine-Tuning
+# RFT Stage A Experiment Report — Diversity-Preserving Rejection Fine-Tuning
 
-## v5f RFT (当前，2026-07-06)
+## v5f RFT (Current, 2026-07-06)
 
-### 概述
+### Overview
 
-在 SFT v5f (format-aligned) 基础上执行 Stage A RFT。
-v5f 模型对 122 个 gfx950 spec 大规模生成候选 → FlyDSL-Gym 沙箱验证 → 保留所有编译通过的实现 → 1 epoch 训练。
+Stage A RFT on top of SFT v5f (format-aligned).
+v5f model generates candidates at scale for 122 gfx950 specs → FlyDSL-Gym sandbox verification → retain all compilation-passing implementations → 1 epoch training.
 
 **HuggingFace**: [Zhangdanyang/Qwen2.5-Coder-RFT-v5f](https://huggingface.co/Zhangdanyang/Qwen2.5-Coder-RFT-v5f)
 
-### 模型进化路径
+### Model Evolution Path
 
-| 阶段 | API Score | 沙箱编译率 | L5 Expert |
+| Stage | API Score | Sandbox Compile Rate | L5 Expert |
 |------|-----------|-----------|-----------|
 | SFT v5e | 74% | 22% (12 specs) | 50% |
 | SFT v5f (+format) | 74% | 38% (122 specs) | 50% |
 | **RFT v5f** | **75%** | **53%** (122 specs) | **57%** |
 
-### 三层验证结果
+### Three-Level Verification Results
 
-沙箱验证器现在支持三个层级：编译、运行、正确性。
+Sandbox verifier now supports three levels: compile, run, correctness.
 
-| 层级 | 通过数 / 1952 | 通过率 | 说明 |
+| Level | Passed / 1952 | Pass Rate | Description |
 |------|-------------|--------|------|
-| 静态检查 | 1598 | 82% | Python 语法 + FlyDSL pattern + ≥15 行 |
-| **编译** | 944 | **48%** | FlyDSL JIT import 成功 (无 import/type error) |
-| **运行** | 211 | **11%** | entry point 可调用 (不崩溃/不 OOM/不超时) |
-| **正确性** | 0 | **0%** | 输出与 PyTorch reference 不匹配 |
+| Static check | 1598 | 82% | Python syntax + FlyDSL pattern + ≥15 lines |
+| **Compile** | 944 | **48%** | FlyDSL JIT import success (no import/type error) |
+| **Run** | 211 | **11%** | entry point callable (no crash/OOM/timeout) |
+| **Correctness** | 0 | **0%** | Output does not match PyTorch reference |
 
-运行但不正确的原因分布：
+Run-but-incorrect reason distribution:
 
-| 原因 | 数量 | 说明 |
+| Reason | Count | Description |
 |------|------|------|
-| INCORRECT | 149 | quant kernel 逻辑错误 (max_diff > atol) |
-| Shape mismatch | 52 | topk/rmsnorm 输出维度与 reference 不同 |
-| Returned None | 10 | in-place kernel 但无法匹配结果 |
+| INCORRECT | 149 | quant kernel logic error (max_diff > atol) |
+| Shape mismatch | 52 | topk/rmsnorm output dimensions differ from reference |
+| Returned None | 10 | in-place kernel but result not matchable |
 
-> **关键结论**：模型学会了 FlyDSL API 语法 (48% 编译通过) 和部分 host-side 结构 (11% 运行)，
-> 但 kernel 内部计算逻辑全部是错的 (0% 正确)。这是预期的 — SFT+RFT 只基于编译 pass/fail 训练，
-> 没有 correctness reward。**运行时正确性是 RL Stage B/C 的目标。**
+> **Key conclusion**: The model learned FlyDSL API syntax (48% compile pass) and partial host-side structure (11% run),
+> but all kernel internal compute logic is wrong (0% correct). This is expected — SFT+RFT trained only on compile pass/fail,
+> with no correctness reward. **Runtime correctness is the target of RL Stage B/C.**
 
-### Pipeline 执行
+### Pipeline Execution
 
-#### Step 1: 候选生成 (v5f 模型)
+#### Step 1: Candidate Generation (v5f model)
 
-| 项目 | 配置 |
+| Item | Configuration |
 |------|------|
-| 模型 | Qwen2.5-Coder-SFT-v5f |
-| Spec 来源 | 213 个 gfx950 spec → 采样 122 个（每算子均匀） |
-| 每 spec 候选数 | N=16 |
-| 总候选数 | 1,952 |
-| 生成温度 | temperature=0.8, top_p=0.95 |
-| 提示风格 | 3 种轮换 (precise / natural / optimization) |
-| 耗时 | ~23h (单卡 cuda:0) |
+| Model | Qwen2.5-Coder-SFT-v5f |
+| Spec source | 213 gfx950 specs → sample 122 (uniform per operator) |
+| Candidates per spec | N=16 |
+| Total candidates | 1,952 |
+| Generation temperature | temperature=0.8, top_p=0.95 |
+| Prompt styles | 3 rotated (precise / natural / optimization) |
+| Duration | ~23h (single GPU cuda:0) |
 
-#### Step 2: 沙箱验证 (编译级)
+#### Step 2: Sandbox Verification (compile level)
 
-| 阶段 | 通过数 | 通过率 |
+| Stage | Passed | Pass Rate |
 |------|--------|--------|
-| 总候选 | 1,952 | 100% |
-| 静态检查 | 1,598 | 82% |
-| **FlyDSL-Gym 沙箱编译** | **1,026** | **53%** |
+| Total candidates | 1,952 | 100% |
+| Static check | 1,598 | 82% |
+| **FlyDSL-Gym sandbox compile** | **1,026** | **53%** |
 | Diversity filter | 1,026 | 53% |
 
-编译通过率 vs v5f SFT (pre-RFT)：38% → **53%** (+15pp)
+Compile pass rate vs v5f SFT (pre-RFT): 38% → **53%** (+15pp)
 
-**全部 12 算子沙箱通过率对比**:
+**All 12 operator sandbox pass rate comparison**:
 
-| 算子 | v5e | v5f SFT | **RFT v5f** | Delta (RFT-v5f) |
+| Operator | v5e | v5f SFT | **RFT v5f** | Delta (RFT-v5f) |
 |------|-----|---------|-------------|-----------------|
 | rmsnorm | 2 (17%) | 41 (43%) | **57 (59%)** | +17pp |
 | quant | 1 (8%) | 100 (37%) | **158 (58%)** | +21pp |
@@ -82,31 +82,31 @@ v5f 模型对 122 个 gfx950 spec 大规模生成候选 → FlyDSL-Gym 沙箱验
 | moe | 5 (42%) | 60 (42%) | **69 (48%)** | +6pp |
 | flash_attn | 2 (17%) | 63 (23%) | **125 (46%)** | +23pp |
 
-全部 12 个算子的编译通过率均有提升，flash_attn 提升最大 (+23pp)。
+All 12 operators improved compile pass rate; flash_attn had the largest gain (+23pp).
 
-#### Step 3: RFT 数据集构建
+#### Step 3: RFT Dataset Construction
 
-| 项目 | 数量 |
+| Item | Count |
 |------|------|
-| 沙箱通过候选 | 733 |
-| RFT 对 (×2 重复) | 1,466 |
-| v5f SFT 数据 | 6,809 |
-| **合并后总数** | **8,275** |
-| RFT 数据占比 | 17.7% |
+| Sandbox-passing candidates | 733 |
+| RFT pairs (×2 repeat) | 1,466 |
+| v5f SFT data | 6,809 |
+| **Total after merge** | **8,275** |
+| RFT data share | 17.7% |
 
-#### Step 4: RFT 训练
+#### Step 4: RFT Training
 
-| 项目 | 配置 |
+| Item | Configuration |
 |------|------|
 | Base model | Qwen2.5-Coder-SFT-v5f (merged) |
-| 训练轮数 | 1 epoch |
+| Training epochs | 1 epoch |
 | MAX_STEPS | 1,035 |
 | LR | 5e-6 |
 | LoRA | r=64, alpha=128, dropout=0.05 |
 | seq_length | 16384 |
 | GBS | 8 |
 | val_loss | 0.9615 → 0.9533 |
-| 耗时 | ~2h (8xMI350X) |
+| Duration | ~2h (8xMI350X) |
 
 ### Benchmark (RFT vs v5f vs v5e)
 
@@ -124,43 +124,43 @@ v5f 模型对 122 个 gfx950 spec 大规模生成候选 → FlyDSL-Gym 沙箱验
 | Format compliance | 96% | 96% | >= 90% ✅ |
 | Sandbox compilation | 100% | 100% | >= 80% ✅ |
 
-L5 提升点: blockscale_gemm +25pp, moe_2stage +12pp, preshuffle_gemm +12pp。
+L5 gains: blockscale_gemm +25pp, moe_2stage +12pp, preshuffle_gemm +12pp.
 
-### 产物
+### Artifacts
 
-| 文件 | 位置 |
+| File | Location |
 |------|------|
-| v5f 候选 (122 specs) | `rft-results/candidates_v5f_gfx950.jsonl` |
-| RFT 候选 (122 specs, RFT model) | `rft-results/candidates_rft_v5f_gfx950.jsonl` |
-| 编译级验证 | `rft-results/verify_stats_rft_v5f_gfx950.json` |
-| 三层验证 (含运行+正确性) | `rft-results/verify_stats_rft_v5f_runtime.json` |
-| RFT 训练数据 | `rft-results/rft_v5f_train.jsonl` (8,275 条) |
-| RFT 训练日志 | `rft-results/rft_v5f_train.log` |
+| v5f candidates (122 specs) | `rft-results/candidates_v5f_gfx950.jsonl` |
+| RFT candidates (122 specs, RFT model) | `rft-results/candidates_rft_v5f_gfx950.jsonl` |
+| Compile-level verification | `rft-results/verify_stats_rft_v5f_gfx950.json` |
+| Three-level verification (incl. runtime + correctness) | `rft-results/verify_stats_rft_v5f_runtime.json` |
+| RFT training data | `rft-results/rft_v5f_train.jsonl` (8,275 samples) |
+| RFT training log | `rft-results/rft_v5f_train.log` |
 | Benchmark | `rft-results/benchmark_rft_v5f.json` |
 | HuggingFace | [Zhangdanyang/Qwen2.5-Coder-RFT-v5f](https://huggingface.co/Zhangdanyang/Qwen2.5-Coder-RFT-v5f) |
 
-### 下一步
+### Next Steps
 
-SFT + RFT 阶段完成。验证器已支持三层检查 (编译/运行/正确性)。
-正确性 0% 表明需要 RL 阶段的 correctness reward 来训练计算逻辑：
+SFT + RFT phase complete. Verifier supports three-level checks (compile/run/correctness).
+Correctness 0% indicates RL phase correctness reward is needed to train compute logic:
 
-- **Stage B**: Single-Turn DAPO — 编译 + 正确性 reward，100-200 steps
-- **Stage C**: Multi-Turn DAPO + HRD + PrimeEcho — 3 轮迭代 (生成→修复→优化)
+- **Stage B**: Single-Turn DAPO — compile + correctness reward, 100-200 steps
+- **Stage C**: Multi-Turn DAPO + HRD + PrimeEcho — 3 iteration rounds (generate→fix→optimize)
 
 ---
 
-# RFT v1 (archived, 基于 SFT v5e)
+# RFT v1 (archived, based on SFT v5e)
 
-### 概述
+### Overview
 
-在 SFT v5e 基础上执行的初版 RFT。84 specs, 1344 候选。
+Initial RFT on SFT v5e. 84 specs, 1344 candidates.
 
-**结果：沙箱编译率 21.9% → 30.7%，L4 首次达标 (54%)，12/12 算子全覆盖。**
+**Result: sandbox compile rate 21.9% → 30.7%, L4 first met target (54%), 12/12 operator full coverage.**
 
 **HuggingFace**: [Zhangdanyang/Qwen2.5-Coder-RFT-v1](https://huggingface.co/Zhangdanyang/Qwen2.5-Coder-RFT-v1)
 
-| 指标 | SFT v5e | RFT v1 | Δ |
+| Metric | SFT v5e | RFT v1 | Δ |
 |------|---------|--------|---|
 | Overall | 74.1% | 74.6% | +0.5% |
-| 沙箱编译 | 21.9% | 30.7% | +8.8% |
-| 算子覆盖 | 11/12 | 12/12 | +1 |
+| Sandbox compile | 21.9% | 30.7% | +8.8% |
+| Operator coverage | 11/12 | 12/12 | +1 |

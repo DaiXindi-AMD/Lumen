@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Callable, Optional
 
 import torch
@@ -12,7 +13,18 @@ from megatron.core.tensor_parallel.layers import (
 )
 from megatron.core.transformer.module import MegatronModule
 
-from lumen.modules.parallel_linear import LumenColumnParallelLinear, LumenRowParallelLinear
+from lumen.modules.grouped_linear import (
+    LumenColumnParallelGroupedLinear as _LumenColumnParallelGroupedLinear,
+    LumenRowParallelGroupedLinear as _LumenRowParallelGroupedLinear,
+)
+from lumen.modules.parallel_linear import (
+    LumenColumnParallelLinear as _LumenColumnParallelLinear,
+    LumenRowParallelLinear as _LumenRowParallelLinear,
+)
+
+
+def _dsv4_use_gemm_bf16() -> bool:
+    return os.environ.get("LUMEN_DSV4_GEMM_BF16", "1") != "0"
 
 
 class LumenNorm(torch.nn.Module):
@@ -21,24 +33,53 @@ class LumenNorm(torch.nn.Module):
     def __init__(self, config, hidden_size, eps=1e-6, **kwargs):
         super().__init__()
         del kwargs
+        self.eps = eps
         norm_type = getattr(config, "normalization", "LayerNorm")
-        if norm_type == "RMSNorm":
-            from lumen.ops.normalization import LumenRMSNorm
-
-            self._norm = LumenRMSNorm(hidden_size, eps=eps)
-        else:
-            from lumen.ops.normalization import LumenLayerNorm
-
-            self._norm = LumenLayerNorm(hidden_size, eps=eps)
-        self.weight = self._norm.weight
+        self._norm_type = norm_type
+        # Own weight at ``*.weight`` so torch_dist ckpt keys match mbridge/HF.
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.weight.sequence_parallel = bool(getattr(config, "sequence_parallel", False))
 
     def forward(self, x):
-        return self._norm(x)
+        if self._norm_type == "RMSNorm":
+            from lumen.ops.normalization import rmsnorm
+
+            return rmsnorm(x, self.weight, self.eps)
+        from lumen.ops.normalization import layernorm
+
+        return layernorm(x, self.weight, self.eps)
+
+
+class _Dsv4GemmBf16Mixin:
+    """Enable AITER tuned BF16 GEMM on DSV4 linear subclasses."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_gemm_bf16 = _dsv4_use_gemm_bf16()
+
+
+class LumenColumnParallelLinear(_Dsv4GemmBf16Mixin, _LumenColumnParallelLinear):
+    pass
+
+
+class LumenRowParallelLinear(_Dsv4GemmBf16Mixin, _LumenRowParallelLinear):
+    pass
+
+
+class LumenColumnParallelGroupedLinear(_Dsv4GemmBf16Mixin, _LumenColumnParallelGroupedLinear):
+    pass
+
+
+class LumenRowParallelGroupedLinear(_Dsv4GemmBf16Mixin, _LumenRowParallelGroupedLinear):
+    pass
+
 
 __all__ = [
     "LumenDuplicatedLinear",
     "LumenColumnParallelLinear",
     "LumenRowParallelLinear",
+    "LumenColumnParallelGroupedLinear",
+    "LumenRowParallelGroupedLinear",
     "LumenNorm",
 ]
 
@@ -70,6 +111,7 @@ class LumenDuplicatedLinear(MegatronModule):
         self.input_size = input_size
         self.output_size = output_size
         self.skip_bias_add = skip_bias_add
+        self.use_gemm_bf16 = _dsv4_use_gemm_bf16()
 
         self.scaling_type = "none"
         self.scaling_manager = None
@@ -79,7 +121,9 @@ class LumenDuplicatedLinear(MegatronModule):
         self.block_size = 128
 
         self.weight = nn.Parameter(torch.empty(output_size, input_size, dtype=config.params_dtype))
-        set_tensor_model_parallel_attributes(self.weight, True, 0, 1)
+        # This weight is replicated on every TP rank, so marking it tensor-parallel
+        # would make Megatron's grad-norm count it tp_size times.
+        set_tensor_model_parallel_attributes(self.weight, False, -1, 1)
         if bias:
             self.bias = nn.Parameter(torch.empty(output_size, dtype=config.params_dtype))
         else:
@@ -93,7 +137,7 @@ class LumenDuplicatedLinear(MegatronModule):
 
     def forward(self, x: torch.Tensor):
         bias = None if self.skip_bias_add else self.bias
-        if self.scaling_type != "none":
+        if self.scaling_type != "none" or self.use_gemm_bf16:
             from lumen.ops.quantize.linear import quantized_linear
 
             out = quantized_linear(
