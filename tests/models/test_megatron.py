@@ -40,6 +40,7 @@ from conftest import rmsnorm_ref as _rmsnorm_golden  # noqa: E402
 
 from lumen.models.megatron import (  # noqa: E402
     _FP8_FORMAT_MAP,
+    _ATTN_NORM_ATTRS,
     _NORM_ATTRS,
     _TE_FORCE_OVERRIDES,
     _get_synthetic_batch,
@@ -303,6 +304,28 @@ class TestPatchNormsInSpec:
         _patch_norms_in_spec(spec)
         for attr in _NORM_ATTRS:
             assert getattr(spec, attr) is _MegatronCompatibleTLNorm, f"{attr} not patched"
+
+    def test_patches_qk_layernorm_inside_self_attention(self):
+        class _RMSNorm:
+            __name__ = "RMSNorm"
+
+        attn_subs = _FakeSubmodules(q_layernorm=_RMSNorm, k_layernorm=_RMSNorm)
+        sa_spec = _FakeModuleSpec(submodules=attn_subs)
+        spec = _FakeModuleSpec(submodules=_FakeSubmodules(self_attention=sa_spec))
+        _patch_norms_in_spec(spec)
+        assert attn_subs.q_layernorm is _MegatronCompatibleTLNorm
+        assert attn_subs.k_layernorm is _MegatronCompatibleTLNorm
+
+    def test_skips_l2norm_qk_layernorm(self):
+        class _L2Norm:
+            __name__ = "L2Norm"
+
+        attn_subs = _FakeSubmodules(q_layernorm=_L2Norm, k_layernorm=_L2Norm)
+        sa_spec = _FakeModuleSpec(submodules=attn_subs)
+        spec = _FakeModuleSpec(submodules=_FakeSubmodules(self_attention=sa_spec))
+        _patch_norms_in_spec(spec)
+        assert attn_subs.q_layernorm is _L2Norm
+        assert attn_subs.k_layernorm is _L2Norm
 
 
 # ===================================================================
@@ -706,6 +729,34 @@ class TestOverrideTEArgs:
         assert args.lumen_fp8_attn == "none"
         assert args.lumen_attn_backend == "aiter_triton"
 
+    def test_mxfp4_overrides_cli_default_block_size(self):
+        # --linear-fp8-block-size defaults to 128; MXFP4 must coerce to 32
+        # without crashing (the logger used to be missing after the registry merge).
+        args = SimpleNamespace(
+            fp8=None,
+            linear_fp8_format="mxfp4",
+            linear_fp8_block_size=128,
+            lumen_attn_backend="auto",
+        )
+        _override_te_args_for_lumen(args)
+        assert args.linear_fp8_block_size == 32
+
+    def test_mxfp4_keeps_explicit_block_size_32(self):
+        args = SimpleNamespace(
+            fp8=None,
+            linear_fp8_format="mxfp4",
+            linear_fp8_block_size=32,
+            lumen_attn_backend="auto",
+        )
+        _override_te_args_for_lumen(args)
+        assert args.linear_fp8_block_size == 32
+
+    def test_linear_fp8_format_precedes_mapped_fp8_format(self):
+        from lumen.models.megatron import resolve_quant_format
+
+        args = SimpleNamespace(linear_fp8_format="mxfp4", lumen_fp8_format="fp8_e4m3")
+        assert resolve_quant_format(args) == "mxfp4"
+
 
 # ===================================================================
 # _get_synthetic_batch
@@ -905,6 +956,15 @@ class TestAddCommonMegatronArgs:
         for gq in ["fp8", "mxfp8", "mxfp4"]:
             args = self._parse(["--grad-quant-type", gq])
             assert args.grad_quant_type == gq
+
+    def test_linear_fp8_format_choices_include_mx(self):
+        for fmt in ["fp8_e4m3", "fp8_e5m2", "hybrid", "mxfp8", "mxfp4"]:
+            args = self._parse(["--linear-fp8-format", fmt])
+            assert args.linear_fp8_format == fmt
+
+    def test_linear_fp8_block_size_cli_default_is_fp8_block(self):
+        args = self._parse()
+        assert args.linear_fp8_block_size == 128
 
     def test_lumen_fp8_quant_type_default(self):
         args = self._parse()
@@ -1171,6 +1231,76 @@ class TestEnableFP8ForParallelLinear:
         enable_fp8_for_parallel_linear(model)
         mock_print.assert_not_called()
 
+    @staticmethod
+    def _mock_col():
+        from lumen.modules.parallel_linear import LumenColumnParallelLinear
+
+        class _MockLumenCol(LumenColumnParallelLinear):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self.enable_fp8 = mock.MagicMock()
+
+        return _MockLumenCol()
+
+    @staticmethod
+    def _decoder_stack(n_layers):
+        """Megatron-style ``decoder.layers.<i>`` names, including ``.1`` vs ``.10``."""
+
+        class _Decoder(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.layers = nn.ModuleList(layers)
+
+        class _Model(nn.Module):
+            def __init__(self, layers):
+                super().__init__()
+                self.decoder = _Decoder(layers)
+
+        return _Model([TestEnableFP8ForParallelLinear._mock_col() for _ in range(n_layers)])
+
+    @mock.patch("lumen.models.megatron.print_rank_0")
+    def test_first_last_bf16_skips_layer_1_not_layer_10(self, mock_print):
+        """start=2 must not drag layers.10–19 into BF16 via startswith."""
+        from lumen.quantize.config import QuantConfig
+
+        model = self._decoder_stack(12)
+        quant_config = QuantConfig(
+            first_last_layers_bf16=True,
+            num_layers_at_start_in_bf16=2,
+            num_layers_at_end_in_bf16=1,
+            num_layers=12,
+            block_size=32,
+        )
+        enable_fp8_for_parallel_linear(
+            model,
+            scaling_type="mxfp4",
+            block_size=32,
+            quant_config=quant_config,
+        )
+
+        layer_1 = model.decoder.layers[1]
+        layer_10 = model.decoder.layers[10]
+        layer_1.enable_fp8.assert_not_called()
+        layer_10.enable_fp8.assert_called()
+        assert layer_10.enable_fp8.call_args.kwargs["block_size"] == 32
+        model.decoder.layers[0].enable_fp8.assert_not_called()
+        model.decoder.layers[11].enable_fp8.assert_not_called()
+
+    @mock.patch("lumen.models.megatron.print_rank_0")
+    def test_block_size_taken_from_quant_config_when_unset(self, mock_print):
+        from lumen.quantize.config import QuantConfig
+
+        mock_linear = self._mock_col()
+        model = nn.Sequential(mock_linear)
+        quant_config = QuantConfig(block_size=32)
+        enable_fp8_for_parallel_linear(
+            model,
+            scaling_type="mxfp4",
+            block_size=None,
+            quant_config=quant_config,
+        )
+        assert mock_linear.enable_fp8.call_args.kwargs["block_size"] == 32
+
 
 # ===================================================================
 # model_provider -> parallel linear recipe
@@ -1213,16 +1343,20 @@ class TestModelProviderParallelLinearRecipe:
             side_effect=lambda model, **kw: captured.update(kw),
         ):
             provider()
-        return captured["scaling_type"]
+        return captured
 
     def test_mxfp4_run_configures_linears_for_mxfp4(self):
-        assert self._captured_scaling_type("mxfp4") == "mxfp4"
+        assert self._captured_scaling_type("mxfp4")["scaling_type"] == "mxfp4"
+
+    def test_mxfp4_run_forwards_block_size_32(self):
+        captured = self._captured_scaling_type("mxfp4")
+        assert captured["block_size"] == 32
 
     def test_mxfp8_run_configures_linears_for_mxfp8(self):
-        assert self._captured_scaling_type("mxfp8") == "mxfp8"
+        assert self._captured_scaling_type("mxfp8")["scaling_type"] == "mxfp8"
 
     def test_fp8_run_still_uses_its_scaling_string(self):
-        assert self._captured_scaling_type("fp8_e4m3") == "blockwise"
+        assert self._captured_scaling_type("fp8_e4m3")["scaling_type"] == "blockwise"
 
 
 # ===================================================================
@@ -1240,6 +1374,9 @@ class TestConstants:
             "final_layernorm",
         )
         assert _NORM_ATTRS == expected
+
+    def test_attn_norm_attrs(self):
+        assert _ATTN_NORM_ATTRS == ("q_layernorm", "k_layernorm")
 
     def test_te_force_overrides_contains_expected(self):
         assert _TE_FORCE_OVERRIDES["transformer_impl"] == "local"

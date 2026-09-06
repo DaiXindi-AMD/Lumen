@@ -66,6 +66,19 @@ class TestMegatronImportPatches:
 
         self.moe_fused_router.install_moe_fused_router()
 
+    def test_fused_router_cpu_fallback_runs(self):
+        pytest.importorskip("torch")
+        import torch
+
+        from lumen.ops.moe.fused_router import fused_topk_with_score_function
+
+        logits = torch.randn(8, 4)
+        routing_map, routing_probs = fused_topk_with_score_function(logits, 2, True, None, None, None, "softmax", None)
+        assert routing_map.shape == (8, 4)
+        assert routing_probs.shape == (8, 4)
+        assert routing_map.dtype == torch.bool
+        assert routing_map.sum(dim=-1).eq(2).all()
+
     def test_install_moe_fused_router_skips_without_megatron(self, monkeypatch):
         import builtins
 

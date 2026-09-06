@@ -36,20 +36,17 @@ from megatron.core.utils import StragglerDetector, get_attr_wrapped_model
 from megatron.training import get_args, get_timers, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 
-from lumen.modules.attention_megatron import (
-    LumenDotProductAttention,
-)
-from lumen.modules.attention_mla import LumenDotProductAttentionMLA
-
 stimer = StragglerDetector()
+logger = logging.getLogger(__name__)
 
 
 # Backward-compatible re-exports (implementations live in patch registry).
-from lumen.patches.builders.megatron_model import (  # noqa: E402
+from lumen.patches.builders.megatron_model import (  # noqa: E402, F401
     GPT_LOCAL_MODEL_PATCHES,
     GPT_LOCAL_SPEC_PATCHES,
     GPT_LUMEN_MODEL_PATCHES,
     GPT_LUMEN_SPEC_PATCHES,
+    _ATTN_NORM_ATTRS,
     _NORM_ATTRS,
     _MegatronCompatibleTLLayerNorm,
     _MegatronCompatibleTLNorm,
@@ -453,6 +450,11 @@ def enable_fp8_for_parallel_linear(
 
         fp8_dtype = _get_float8_e4m3()
 
+    # MXFP4 overrides CLI block size to 32 on args; QuantConfig carries that.
+    # Leaving block_size=None would keep LumenColumnParallelLinear.block_size=128.
+    if block_size is None and quant_config is not None:
+        block_size = quant_config.block_size
+
     # Tell the fused SwiGLU quant bridge (LUMEN_FUSED_SWIGLU_QUANT) the global
     # activation scale granularity so its cached scale layout matches the fc2
     # GEMM that consumes it (blockwise2d needs a 2D 1×block scale, not 1D).
@@ -465,6 +467,8 @@ def enable_fp8_for_parallel_linear(
     # own linear types, and --lumen-linear has already swapped those out by the
     # time it runs -- so on this path the flag used to select nothing at all and
     # every layer went to MXFP4 regardless.
+    from lumen.quantize import is_under_bf16_prefix
+
     bf16_prefixes: Set[str] = set()
     if quant_config is not None and quant_config.first_last_layers_bf16:
         from lumen.quantize import _build_bf16_skip_prefixes
@@ -488,7 +492,7 @@ def enable_fp8_for_parallel_linear(
         if isinstance(
             module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
         ):
-            if any(name.startswith(p) for p in bf16_prefixes):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
                 continue
             _mgr = scaling_manager
@@ -786,6 +790,7 @@ def make_lumen_model_provider(
             enable_fp8_for_parallel_linear(
                 model,
                 scaling_type=scaling_type,
+                block_size=cfg.quant_config.block_size,
                 fp8_mha=getattr(args, "lumen_fp8_attn", "none") == "mha",
                 gradient_accumulation_fusion=getattr(args, "lumen_gradient_accumulation_fusion", False),
                 delay_wgrad=getattr(args, "lumen_delay_wgrad", False),
@@ -998,7 +1003,7 @@ def make_forward_step(get_batch_fn: Callable, loss_fn: Callable = loss_func, zer
 
 
 # Backward-compatible re-exports (implementations live in dedicated modules).
-from lumen.models.fp8_param_storage import (  # noqa: E402
+from lumen.models.fp8_param_storage import (  # noqa: E402, F401
     _install_embedding_output_fp8_hooks,
     _patch_float16_module,
     _patch_load_checkpoint_for_fp8,
@@ -1010,7 +1015,9 @@ from lumen.patches.builders.megatron_args import add_common_megatron_args  # noq
 from lumen.patches.training.megatron_hooks import (  # noqa: E402
     install_fp8_param_gather_hook,
     install_fp8_param_storage_hook,
+    install_gc_freeze_hook,
     install_hip_graphs_hook,
+    install_mxfp4_weight_cache_hook,
     install_val_loss_early_stop_hook,
 )
 
@@ -1018,7 +1025,9 @@ __all__ = [
     "add_common_megatron_args",
     "install_fp8_param_gather_hook",
     "install_fp8_param_storage_hook",
+    "install_gc_freeze_hook",
     "install_hip_graphs_hook",
+    "install_mxfp4_weight_cache_hook",
     "install_val_loss_early_stop_hook",
     "register_fp8_param_optimizer_hook",
 ]

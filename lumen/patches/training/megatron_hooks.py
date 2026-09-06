@@ -110,8 +110,8 @@ def install_gc_freeze_hook(warmup_steps: int = 20) -> None:
             gc.collect()
             gc.freeze()
             print_rank_0(
-                f"> GC: froze {gc.get_freeze_count()} objects after "
-                f"{warmup_steps} steps (later collections skip them)"
+                f"> GC: gc.freeze() after {warmup_steps} steps "
+                f"(freeze_count={gc.get_freeze_count()}; later collections skip frozen objects)"
             )
             _mt_training.train_step = current_train_step
         return out
