@@ -94,6 +94,7 @@ class LumenGroupedLinear(nn.Module):
         self.delay_wgrad = False
         self.fp8_activation_store = False
         self._deferred_wgrad = _DeferredWgrad()
+        self.use_gemm_bf16 = False
 
         for gemm_idx in range(num_gemms):
             weight = Parameter(
@@ -134,7 +135,7 @@ class LumenGroupedLinear(nn.Module):
             if self.use_bias and not self.skip_bias_add:
                 bias_i = getattr(self, f"bias{i}")
             weight = getattr(self, f"weight{i}")
-            if self.scaling_type != "none" or self.delay_wgrad:
+            if self.scaling_type != "none" or self.delay_wgrad or self.use_gemm_bf16:
                 from lumen.ops.quantize.linear import quantized_linear
 
                 yi = quantized_linear(

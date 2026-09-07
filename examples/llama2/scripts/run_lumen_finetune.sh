@@ -180,8 +180,11 @@ if [ -z "${MEGATRON_ROOT}" ]; then
 fi
 echo "  MEGATRON_ROOT: ${MEGATRON_ROOT}"
 
-# Fix Megatron bug: FusedLayerNorm does not support RMSNorm
-python "${LUMEN_DIR}/scripts/patch_gpt_layer_specs.py" "${MEGATRON_ROOT}"
+# Fix Megatron bug: FusedLayerNorm does not support RMSNorm (SOURCE registry)
+LUMEN_ROOT="/workspace/Lumen"
+# shellcheck source=examples/llama2/scripts/apply_megatron_source_patches.sh
+source "${LUMEN_ROOT}/examples/llama2/scripts/apply_megatron_source_patches.sh"
+apply_lumen_megatron_source_patches "${MEGATRON_ROOT}" llama
 
 if ls -d "${DATA_ROOT}/megatron_ckpt/iter_"* 1>/dev/null 2>&1 || [ -d "${DATA_ROOT}/megatron_ckpt/release" ]; then
     echo "[Checkpoint] Megatron checkpoint already exists. Skipping."

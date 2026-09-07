@@ -417,6 +417,9 @@ class LumenLayerNorm(nn.Module):
         eps: Epsilon for numerical stability.
         elementwise_affine: Whether to learn scale/bias.
         grad_quant_type: Gradient quantization format.
+        sequence_parallel: Whether the input sequence is split across the tensor
+            parallel group. Each rank then holds a partial weight gradient, which
+            Megatron only all-reduces for parameters tagged with this flag.
     """
 
     def __init__(
@@ -425,6 +428,7 @@ class LumenLayerNorm(nn.Module):
         eps: float = 1e-5,
         elementwise_affine: bool = True,
         grad_quant_type: Optional[str] = None,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         self.eps = eps
@@ -432,6 +436,8 @@ class LumenLayerNorm(nn.Module):
         if elementwise_affine:
             self.weight = nn.Parameter(torch.ones(hidden_size))
             self.bias = nn.Parameter(torch.zeros(hidden_size))
+            self.weight.sequence_parallel = sequence_parallel
+            self.bias.sequence_parallel = sequence_parallel
         else:
             self.register_parameter("weight", None)
             self.register_parameter("bias", None)

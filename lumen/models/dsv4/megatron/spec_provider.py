@@ -5,20 +5,23 @@ from typing import Optional, Tuple
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
 
-from lumen.models.spec_provider import LumenSpecProvider
-from lumen.modules.grouped_linear import (
+from lumen.models.dsv4.megatron.layers import (
     LumenColumnParallelGroupedLinear,
+    LumenColumnParallelLinear,
     LumenRowParallelGroupedLinear,
+    LumenRowParallelLinear,
 )
+from lumen.models.spec_provider import LumenSpecProvider
 
 
 class LumenDSV4SpecProvider(LumenSpecProvider):
-    """Backend for DSV4 MoE/MLP/dense layers — Lumen linear/norm only.
+    """Backend for DSV4 MoE/MLP/dense layers — Lumen linear/norm with tuned BF16 GEMM."""
 
-    ``TEGroupedMLP`` here is Megatron's grouped-expert *container*; fc1/fc2
-    are ``LumenColumnParallelGroupedLinear`` / ``LumenRowParallelGroupedLinear``,
-    not Transformer Engine grouped linear modules.
-    """
+    def column_parallel_linear(self):
+        return LumenColumnParallelLinear
+
+    def row_parallel_linear(self):
+        return LumenRowParallelLinear
 
     def grouped_mlp_modules(
         self,

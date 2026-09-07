@@ -54,6 +54,7 @@ from lumen.models.megatron import (  # noqa: F401
     make_forward_step,
     reset_fp8_state,
 )
+from lumen.patches.builders import apply_args_patches
 
 __all__ = [
     "LLaMA2SFTDataset",
@@ -183,5 +184,5 @@ forward_step = make_forward_step(get_batch, loss_func, zero_last_loss_mask=True)
 
 def add_finetune_args(parser):
     """Add finetune-specific arguments."""
-    add_common_megatron_args(parser)
+    apply_args_patches(parser, names={"common_megatron_args"})
     return parser

@@ -26,6 +26,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=examples/dsv4/dsv4_paths.sh
 source "${SCRIPT_DIR}/dsv4_paths.sh"
+# shellcheck source=examples/dsv4/dsv4_docker_common.sh
+source "${SCRIPT_DIR}/dsv4_docker_common.sh"
 
 IMAGE="${IMAGE:-lumen/dsv4-lumen:mi308x}"
 
@@ -49,7 +51,6 @@ DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES:-180}"
 source "${SCRIPT_DIR}/dsv4_flash_megatron_args.sh"
 
 V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
-MHC_BACKEND="${MHC_BACKEND:-triton}"
 V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
@@ -109,7 +110,7 @@ echo "  Master    : ${MASTER_ADDR}:${MASTER_PORT}"
 echo "  Parallel  : TP4 PP4 EP4 (11+11+11+10)"
 echo "  Rollouts  : ${NUM_ROLLOUT}"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN:-4096}"
-echo "  HC mult   : ${DSV4_HC_MULT} (MHC_BACKEND=${MHC_BACKEND})"
+echo "  HC mult   : ${DSV4_HC_MULT} (AIter)"
 echo "  SparseMLA : ${V4_SPARSE_MLA_BACKEND}"
 echo "  Optimizer : CPU offload fraction=${OPTIMIZER_OFFLOAD_FRACTION}"
 echo "  Ckpt      : ${TORCH_DIST}"
@@ -119,6 +120,7 @@ echo "════════════════════════�
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${AITER_DIR}:/workspace/aiter"
     -v "${MILES_DIR}:/workspace/miles"
     -v "${MODEL_DIR}:/root/models"
     -v "${DATA_DIR}:/root/datasets"
@@ -129,9 +131,6 @@ DOCKER_MOUNTS=(
 if [[ -d "${NFS_ROOT}" ]]; then
     DOCKER_MOUNTS+=(-v "${NFS_ROOT}:${NFS_ROOT}")
 fi
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
-fi
 if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
     DOCKER_MOUNTS+=(-v "${BOOTSTRAP_MOUNT}:/bootstrap:ro")
 fi
@@ -141,6 +140,7 @@ fi
 
 DOCKER_ENV=(
     -e LUMEN_DIR=/workspace/Lumen
+    -e AITER_DIR=/workspace/aiter
     -e MILES_DIR=/workspace/miles
     -e LUMEN_DSV4_NATIVE_FINETUNE=1
     -e LUMEN_DSV4_PRETRAIN=1
@@ -162,7 +162,6 @@ DOCKER_ENV=(
     -e OPTIMIZER_OFFLOAD_FRACTION="${OPTIMIZER_OFFLOAD_FRACTION}"
     -e DISTRIBUTED_TIMEOUT_MINUTES="${DISTRIBUTED_TIMEOUT_MINUTES}"
     -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
     -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
     -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
     -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
@@ -180,9 +179,7 @@ DOCKER_ENV=(
     -e NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
     -e MEGATRON_PATH="${MEGATRON_PATH}"
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
+dsv4_docker_append_gemm_env
 if [[ "${USE_MILES_IMAGE}" -eq 1 ]]; then
     DOCKER_ENV+=(
         -e RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1

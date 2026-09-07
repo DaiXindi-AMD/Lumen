@@ -1,35 +1,26 @@
-"""DeepSeek V4 Hyper-Connection utility — backed by deepseek-ai/TileKernels.
+"""DeepSeek V4 Hyper-Connection utility backed by AIter.
 
 Public API (`HCHeadParams`, `DeepSeekV4HyperConnectionUtil`) preserved so that
 the Megatron-LM patch (radixark/Megatron-LM PR #28) call sites in
 ``transformer_layer.py`` and ``transformer_block.py`` keep working.
 
 Internals route ``hc_pre_raw``/``hc_post_raw``/``hc_head_raw`` through
-``tile_kernels.modeling.mhc.ops``, which dispatches to kernels under
-``tile_kernels/mhc/`` (Triton or TileLang per ``MHC_BACKEND``).
-
-Mount local dev tree via ``TILEKERNELS_DIR`` (see ``bootstrap_env.sh``).
+the fused DSV4 MHC APIs in AIter.
 """
 
 import einops
 import torch
-import torch.nn.functional as F
+from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_post_dsv4, mhc_pre_dsv4
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tile_kernels.modeling.mhc.ops import (
-    mhc_head_compute_mix,
-    mhc_post,
-    mhc_pre_apply_mix,
-    mhc_pre_big_fuse,
-    mhc_pre_norm_fn,
-    mhc_pre_split_mixes_and_sinkhorn,
-)
 from torch import Tensor
 
-# DeepSeek V4 originally used post = 2 * sigmoid(...) for the post-layer mix
-# (see the legacy ``hc_split_sinkhorn`` kernel). TileKernels lets us pass the
-# same factor through ``post_mult_value``.
+# DeepSeek V4 uses post = 2 * sigmoid(...) for the post-layer mix.
 _HC_POST_MULT_VALUE = 2.0
+
+
+def _as_fp32(tensor: Tensor) -> Tensor:
+    return tensor if tensor.dtype == torch.float32 else tensor.float()
 
 
 class HCHeadParams(MegatronModule):
@@ -37,9 +28,9 @@ class HCHeadParams(MegatronModule):
         super().__init__(config)
         hc_mult = config.dsv4_hc_mult
         hc_dim = hc_mult * config.hidden_size
-        self.hc_head_fn = torch.nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32))
-        self.hc_head_base = torch.nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
-        self.hc_head_scale = torch.nn.Parameter(torch.empty(1, dtype=torch.float32))
+        self.hc_head_fn = torch.nn.Parameter(torch.zeros(hc_mult, hc_dim, dtype=torch.float32))
+        self.hc_head_base = torch.nn.Parameter(torch.zeros(hc_mult, dtype=torch.float32))
+        self.hc_head_scale = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
         for p in [self.hc_head_fn, self.hc_head_base, self.hc_head_scale]:
             p._keep_fp32 = True
@@ -49,7 +40,7 @@ class HCHeadParams(MegatronModule):
 
 
 class DeepSeekV4HyperConnectionUtil:
-    """Hyper-Connection helper that delegates to TileKernels MHC kernels."""
+    """Hyper-Connection helper that delegates to AIter DSV4 MHC kernels."""
 
     def __init__(self, config: TransformerConfig):
         self.norm_eps = config.layernorm_epsilon
@@ -66,51 +57,30 @@ class DeepSeekV4HyperConnectionUtil:
     ) -> tuple[Tensor, Tensor, Tensor]:
         """``x`` is ``(B, S, hc_mult, hidden)``. Returns layer input + post/comb mixes.
 
-        TileKernels' ``mhc_pre_norm_fn`` requires ``x`` in bf16 and ``fn`` in fp32
-        (matching the original DeepSeek-V4 weight layout).
+        AIter consumes a flattened ``(B*S, hc_mult, hidden)`` boundary while
+        this public helper preserves the Megatron-facing batch/sequence layout.
         """
         dtype = x.dtype
-        x_bf16 = (x if x.dtype == torch.bfloat16 else x.bfloat16()).contiguous()
-
-        # Inline ``tile_kernels.modeling.mhc.functional.mhc_pre`` so we can
-        # pass ``fuse_grad_acc=False`` to ``mhc_pre_norm_fn``. The default
-        # ``fuse_grad_acc=True`` path requires ``mhc_post`` to have written
-        # ``grad_from_mhc_post`` onto the same residual storage during
-        # backward — but Megatron's call sites use independent ``layer_pre``/
-        # ``layer_post`` rearranges, so the storage objects don't match.
-        if not torch.is_grad_enabled():
-            post, comb, layer_input = mhc_pre_big_fuse(
-                x_bf16,
-                hc_fn,
-                hc_scale,
-                hc_base,
-                rms_eps=self.norm_eps,
-                mhc_pre_eps=self.hc_eps,
-                mhc_sinkhorn_eps=self.hc_eps,
-                mhc_post_mult_value=_HC_POST_MULT_VALUE,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                n_splits=16,
-            )
-        else:
-            mixes = mhc_pre_norm_fn(
-                x_bf16,
-                hc_fn,
-                None,
-                self.norm_eps,
-                fuse_grad_acc=False,
-            )
-            pre_mix, post, comb = mhc_pre_split_mixes_and_sinkhorn(
-                mixes,
-                hc_scale,
-                hc_base,
-                self.hc_mult,
-                _HC_POST_MULT_VALUE,
-                self.hc_eps,
-                sinkhorn_repeat=self.hc_sinkhorn_iters,
-                sinkhorn_eps=self.hc_eps,
-            )
-            layer_input = mhc_pre_apply_mix(x_bf16, pre_mix)
-        return layer_input.to(dtype), post, comb
+        batch, sequence, hc_mult, hidden = x.shape
+        residual = (
+            x if x.dtype == torch.bfloat16 else x.bfloat16()
+        ).contiguous().reshape(batch * sequence, hc_mult, hidden)
+        post, comb, layer_input = mhc_pre_dsv4(
+            residual,
+            _as_fp32(hc_fn).contiguous(),
+            _as_fp32(hc_scale).contiguous(),
+            _as_fp32(hc_base).contiguous(),
+            rms_eps=self.norm_eps,
+            hc_pre_eps=self.hc_eps,
+            hc_sinkhorn_eps=self.hc_eps,
+            hc_post_mult_value=_HC_POST_MULT_VALUE,
+            sinkhorn_repeat=self.hc_sinkhorn_iters,
+        )
+        return (
+            layer_input.reshape(batch, sequence, hidden).to(dtype),
+            post.reshape(batch, sequence, hc_mult, 1),
+            comb.reshape(batch, sequence, hc_mult, hc_mult),
+        )
 
     def hc_post_raw(
         self,
@@ -121,14 +91,26 @@ class DeepSeekV4HyperConnectionUtil:
     ) -> Tensor:
         """``x``: ``(B, S, hidden)``; ``residual``: ``(B, S, hc_mult, hidden)``.
 
-        TileKernels' ``mhc_post_fwd`` expects ``x``/``residual`` in bf16 and
-        ``post``/``comb`` in fp32.
+        AIter receives all leading batch/sequence dimensions flattened to ``M``.
         """
         dtype = x.dtype
-        x_bf16 = (x if x.dtype == torch.bfloat16 else x.bfloat16()).contiguous()
-        res_bf16 = (residual if residual.dtype == torch.bfloat16 else residual.bfloat16()).contiguous()
-        out = mhc_post(x_bf16, res_bf16, post, comb)
-        return out.to(dtype)
+        batch, sequence, hidden = x.shape
+        hc_mult = residual.shape[-2]
+        layer_input = (
+            x if x.dtype == torch.bfloat16 else x.bfloat16()
+        ).contiguous().reshape(batch * sequence, hidden)
+        residual_flat = (
+            residual if residual.dtype == torch.bfloat16 else residual.bfloat16()
+        ).contiguous().reshape(batch * sequence, hc_mult, hidden)
+        out = mhc_post_dsv4(
+            layer_input,
+            residual_flat,
+            _as_fp32(post).contiguous().reshape(batch * sequence, hc_mult, 1),
+            _as_fp32(comb)
+            .contiguous()
+            .reshape(batch * sequence, hc_mult, hc_mult),
+        )
+        return out.reshape(batch, sequence, hc_mult, hidden).to(dtype)
 
     def hc_head_raw(
         self,
@@ -138,35 +120,20 @@ class DeepSeekV4HyperConnectionUtil:
         hc_base: Tensor,
     ) -> Tensor:
         """``x``: ``(B, S, hc_mult, hidden)``. Returns ``(B, S, hidden)``."""
-        assert hc_fn.dtype == torch.float32
-        assert hc_scale.dtype == torch.float32
-        assert hc_base.dtype == torch.float32
-
         dtype = x.dtype
-        x_bf16 = (x if x.dtype == torch.bfloat16 else x.bfloat16()).contiguous()
-
-        # NOTE: TileKernels' ``mhc_head`` ends with ``mixes[..., :mhc_mult]``
-        # which is a non-contiguous view that ``mhc_head_compute_mix_fwd_kernel``
-        # rejects (it asserts ``strides[0] == mhc_mult``). We inline the body
-        # and force a contiguous slice before the kernel call.
-        mhc_mult = self.hc_mult
-        mhc_mult3 = mhc_mult * (2 + mhc_mult)
-        fn_padded = hc_fn
-        if fn_padded.shape[0] < mhc_mult3:
-            fn_padded = F.pad(fn_padded, (0, 0, 0, mhc_mult3 - fn_padded.shape[0]))
-
-        mixes = mhc_pre_norm_fn(
-            x_bf16,
-            fn_padded,
-            None,
-            self.norm_eps,
-            fuse_grad_acc=False,
+        batch, sequence, hc_mult, hidden = x.shape
+        residual = (
+            x if x.dtype == torch.bfloat16 else x.bfloat16()
+        ).contiguous().reshape(batch * sequence, hc_mult, hidden)
+        layer_input = mhc_head_dsv4(
+            residual,
+            _as_fp32(hc_fn).contiguous(),
+            _as_fp32(hc_scale).contiguous(),
+            _as_fp32(hc_base).contiguous(),
+            rms_eps=self.norm_eps,
+            hc_pre_eps=self.hc_eps,
         )
-        mix_in = mixes[..., :mhc_mult].contiguous()
-        scale = hc_scale.reshape(1) if hc_scale.numel() == 1 else hc_scale
-        out_mix = mhc_head_compute_mix(mix_in, scale, hc_base, self.hc_eps)
-        layer_input = mhc_pre_apply_mix(x_bf16, out_mix.unsqueeze(-1))
-        return layer_input.to(dtype)
+        return layer_input.reshape(batch, sequence, hidden).to(dtype)
 
     def layer_pre(
         self,
@@ -175,9 +142,9 @@ class DeepSeekV4HyperConnectionUtil:
         hc_scale: Tensor,
         hc_base: Tensor,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        assert hc_fn.dtype == torch.float32
-        assert hc_scale.dtype == torch.float32
-        assert hc_base.dtype == torch.float32
+        hc_fn = _as_fp32(hc_fn)
+        hc_scale = _as_fp32(hc_scale)
+        hc_base = _as_fp32(hc_base)
 
         x = einops.rearrange(hidden_states, "s b hc d -> b s hc d")
         x, post, comb = self.hc_pre_raw(x=x, hc_fn=hc_fn, hc_scale=hc_scale, hc_base=hc_base)

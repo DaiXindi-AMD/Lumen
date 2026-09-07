@@ -597,6 +597,9 @@ class LumenRMSNorm(nn.Module):
         hidden_size: Last dimension of the input.
         eps: Epsilon for numerical stability.
         grad_quant_type: Gradient quantization format.
+        sequence_parallel: Whether the input sequence is split across the tensor
+            parallel group. Each rank then holds a partial weight gradient, which
+            Megatron only all-reduces for parameters tagged with this flag.
 
     Example::
 
@@ -609,11 +612,13 @@ class LumenRMSNorm(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         grad_quant_type: Optional[str] = None,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.grad_quant_type = grad_quant_type
+        self.weight.sequence_parallel = sequence_parallel
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm(x, self.weight.to(x.dtype), self.eps, self.grad_quant_type)

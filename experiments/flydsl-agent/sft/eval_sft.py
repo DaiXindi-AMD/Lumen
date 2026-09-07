@@ -33,31 +33,31 @@ SYSTEM_PROMPT = (
 
 # 25 test prompts across 5 difficulty levels (plan.md §8.2)
 TEST_PROMPTS = [
-    # Level 1 (入门): vec_add, relu, reduction
+    # Level 1 (beginner): vec_add, relu, reduction
     {"level": 1, "id": "L1_vec_add", "prompt": "Write a FlyDSL kernel that performs element-wise vector addition C = A + B for two float32 vectors of length N. Use @flyc.kernel decorator and fx.gpu thread indexing."},
     {"level": 1, "id": "L1_relu", "prompt": "Write a FlyDSL kernel that applies ReLU activation (max(0, x)) element-wise to a BF16 tensor. Use @flyc.kernel and fx.gpu.thread_idx for parallelization."},
     {"level": 1, "id": "L1_scale", "prompt": "Write a FlyDSL kernel that scales a vector by a scalar constant: Y = alpha * X. Use @flyc.kernel decorator with proper thread indexing."},
     {"level": 1, "id": "L1_copy", "prompt": "Write a FlyDSL kernel that copies data from one buffer to another using buffer_ops.buffer_load and buffer_ops.buffer_store."},
     {"level": 1, "id": "L1_reduce", "prompt": "Write a FlyDSL kernel that computes the sum reduction of a float32 vector using shared memory and fx.syncthreads."},
-    # Level 2 (基础): softmax, RMSNorm, LayerNorm
+    # Level 2 (basic): softmax, RMSNorm, LayerNorm
     {"level": 2, "id": "L2_softmax", "prompt": "Write a FlyDSL kernel implementing row-wise softmax for a 2D BF16 tensor. Handle numerical stability with max subtraction. Use @flyc.kernel and fx.* APIs."},
     {"level": 2, "id": "L2_rmsnorm", "prompt": "Write a FlyDSL kernel implementing RMSNorm normalization for a hidden state tensor. Compute RMS = sqrt(mean(x^2) + eps), then normalize and scale by weight parameter."},
     {"level": 2, "id": "L2_layernorm", "prompt": "Write a FlyDSL kernel implementing LayerNorm with learnable gamma and beta parameters. Use shared memory for mean/variance computation."},
     {"level": 2, "id": "L2_silu", "prompt": "Write a FlyDSL kernel implementing SiLU (Swish) activation: y = x * sigmoid(x) for BF16 tensors. Use @flyc.kernel decorator."},
     {"level": 2, "id": "L2_rope", "prompt": "Write a FlyDSL kernel implementing Rotary Position Embedding (RoPE) for query/key tensors with cos/sin cached frequencies."},
-    # Level 3 (中级): simple GEMM, TopK, fused ops
+    # Level 3 (intermediate): simple GEMM, TopK, fused ops
     {"level": 3, "id": "L3_gemm_naive", "prompt": "Write a FlyDSL GEMM kernel computing C = A @ B for BF16 matrices. Use tiled computation with fx.make_layout, SmemAllocator for shared memory, and MFMA instructions via rocdl.mfma_f32_32x32x16_bf16."},
     {"level": 3, "id": "L3_topk", "prompt": "Write a FlyDSL kernel that finds the top-K elements and their indices from each row of a 2D tensor. Use shared memory for partial sorting."},
     {"level": 3, "id": "L3_fused_bias_relu", "prompt": "Write a FlyDSL kernel that fuses bias addition and ReLU activation: Y = max(0, X + bias). Optimize by avoiding extra memory traffic with kernel fusion."},
     {"level": 3, "id": "L3_gemv", "prompt": "Write a FlyDSL kernel for matrix-vector multiplication Y = A @ x where A is (M,K) BF16 and x is (K,) BF16. Use fx.make_layout for tiling."},
     {"level": 3, "id": "L3_concat", "prompt": "Write a FlyDSL kernel that concatenates two tensors along a given dimension with proper layout handling using fx.make_layout and fx.make_shape."},
-    # Level 4 (高级): FP8 GEMM, FlashAttn, PagedAttn
+    # Level 4 (advanced): FP8 GEMM, FlashAttn, PagedAttn
     {"level": 4, "id": "L4_fp8_gemm", "prompt": "Write a FlyDSL FP8 GEMM kernel for gfx950 with 2-stage pipeline, swizzle_xor16 for LDS bank conflict avoidance, and preshuffle data layout. Use @flyc.kernel with SmemAllocator and lds_stage=2."},
     {"level": 4, "id": "L4_flash_attn", "prompt": "Write a FlyDSL FlashAttention forward kernel for BF16 on gfx950. Implement online softmax with running max/sum, tiled Q@K^T and score@V computation using MFMA instructions and shared memory."},
     {"level": 4, "id": "L4_paged_attn", "prompt": "Write a FlyDSL PagedAttention decode kernel for KV-cache serving with block_table lookup, supporting variable-length sequences and page_size=16."},
     {"level": 4, "id": "L4_gemm_splitk", "prompt": "Write a FlyDSL split-K GEMM kernel that partitions the K dimension across workgroups and uses an atomic reduction to accumulate partial results. Target gfx942 with BF16."},
     {"level": 4, "id": "L4_fused_norm_quant", "prompt": "Write a FlyDSL kernel that fuses RMSNorm + FP8 quantization in a single pass. Compute norm, then quantize the normalized output to fp8_e4m3fnuz with per-tensor scaling."},
-    # Level 5 (专家): Preshuffle GEMM, MoE, MLA
+    # Level 5 (expert): Preshuffle GEMM, MoE, MLA
     {"level": 5, "id": "L5_preshuffle_gemm", "prompt": "Write a FlyDSL preshuffle GEMM kernel for gfx950 FP8 with tile 128x128x256, double-buffered LDS pipeline (lds_stage=2), swizzle_xor16, 4 waves per workgroup, and epilogue fusion for bias+activation. Use SmemAllocator, fx.zipped_divide, fx.composition for layout algebra."},
     {"level": 5, "id": "L5_moe_2stage", "prompt": "Write a FlyDSL 2-stage MoE GEMM kernel supporting top-K expert routing with token permutation. Stage 1 computes gate_proj+up_proj, stage 2 computes down_proj. Use pipeline for LDS double buffering and expert-parallel tiling."},
     {"level": 5, "id": "L5_mla_decode", "prompt": "Write a FlyDSL MLA (Multi-head Latent Attention) decode kernel for inference. Support compressed KV with latent_dim=576, nope/rope split, and head_dim=128. Use MFMA instructions for BF16 matmul."},
@@ -172,7 +172,7 @@ def print_report(base_results, sft_results):
     print("=" * 80)
 
     for level in range(1, 6):
-        level_names = {1: "入门", 2: "基础", 3: "中级", 4: "高级", 5: "专家"}
+        level_names = {1: "beginner", 2: "basic", 3: "intermediate", 4: "advanced", 5: "expert"}
         base_level = [r for r in base_results if r["level"] == level]
         sft_level = [r for r in sft_results if r["level"] == level]
 

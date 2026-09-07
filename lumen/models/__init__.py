@@ -14,7 +14,6 @@ Model-specific implementations live in subpackages (e.g. ``llama2``).
 
 import importlib
 
-from lumen.models import fsdp as fsdp  # noqa: F401
 from lumen.models.utils import (  # noqa: F401
     download_hf_dataset,
     download_hf_model,
@@ -25,6 +24,8 @@ from lumen.models.utils import (  # noqa: F401
 
 
 def __getattr__(name: str):
+    if name == "fsdp":
+        return importlib.import_module("lumen.models.fsdp")
     if name == "megatron":
         return importlib.import_module("lumen.models.megatron")
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
 # Shared helpers for native GRPO finetune inner scripts (source, do not execute).
 
-# Override pretrain smoke defaults (GBS=8, SEQ_LEN=2048) for rollout training.
+# Finetune defaults: GBS=256, seq_len=4096 (Miles GRPO smoke: 32×8 rollout samples).
+# Megatron arg files still use GBS=8 / SEQ_LEN=2048 for pretrain-only paths; this
+# helper overrides those when sourcing finetune inner scripts. Set DSV4_KEEP_GBS=1 or
+# DSV4_KEEP_SEQ_LEN=1 to preserve explicit smoke overrides (e.g. GBS=8, SEQ_LEN=512).
 dsv4_apply_finetune_batch_defaults() {
     GBS="${GBS:-256}"
-    if [[ "${GBS}" == "8" ]]; then
+    if [[ "${GBS}" == "8" && "${DSV4_KEEP_GBS:-0}" != "1" ]]; then
         GBS=256
     fi
     MBS="${MBS:-1}"
     SEQ_LEN="${SEQ_LEN:-4096}"
-    if [[ "${SEQ_LEN}" == "2048" ]]; then
+    if [[ "${SEQ_LEN}" == "2048" && "${DSV4_KEEP_SEQ_LEN:-0}" != "1" ]]; then
         SEQ_LEN=4096
     fi
     export GBS MBS SEQ_LEN
@@ -19,9 +22,10 @@ dsv4_apply_finetune_batch_defaults() {
 dsv4_resolve_finetune_ckpt() {
     local model_name="${1:?model_name}"
     local hc_mult="${2:-4}"
-    CKPT="/root/models/${model_name}_torch_dist"
+    local models_dir="${3:-/root/models}"
+    CKPT="${models_dir}/${model_name}_torch_dist"
     if [[ ! -f "${CKPT}/latest_checkpointed_iteration.txt" ]]; then
-        local fallback="/root/models/${model_name}_torch_dist_hc${hc_mult}"
+        local fallback="${models_dir}/${model_name}_torch_dist_hc${hc_mult}"
         if [[ -f "${fallback}/latest_checkpointed_iteration.txt" ]]; then
             echo "[prepare] using fallback checkpoint ${fallback}"
             CKPT="${fallback}"
@@ -30,13 +34,38 @@ dsv4_resolve_finetune_ckpt() {
     export CKPT
 }
 
+# Host-side ckpt path for run_dsv4.sh banners (before Docker).
+dsv4_host_resolve_finetune_ckpt() {
+    local model_name="${1:?model_name}"
+    local hc_mult="${2:-4}"
+    dsv4_resolve_finetune_ckpt "${model_name}" "${hc_mult}" "${MODEL_DIR}"
+    CKPT_HOST="${CKPT}"
+    export CKPT_HOST
+}
+
+# Multinode: place rollout on shared DATA_ROOT so head/worker with different MODEL_DIR agree.
+dsv4_resolve_fake_rollout_path() {
+    if [[ -n "${FAKE_ROLLOUT_DATA:-}" ]]; then
+        export FAKE_ROLLOUT_DATA
+        return
+    fi
+    if [[ "${NNODES:-1}" -gt 1 && -n "${DATA_ROOT:-}" ]]; then
+        FAKE_ROLLOUT_DATA="${DATA_ROOT}/models/fake_rollout.pt"
+    else
+        FAKE_ROLLOUT_DATA="/root/models/fake_rollout.pt"
+    fi
+    export FAKE_ROLLOUT_DATA
+}
+
 dsv4_prepare_rollout_on_shared_fs() {
-    local rollout_path="${FAKE_ROLLOUT_DATA:-/root/models/fake_rollout.pt}"
-    export FAKE_ROLLOUT_DATA="${rollout_path}"
-    export PYTHONPATH="/workspace/Lumen:/workspace/miles:${PYTHONPATH:-}"
+    dsv4_resolve_fake_rollout_path
+    local rollout_path="${FAKE_ROLLOUT_DATA}"
+    mkdir -p "$(dirname "${rollout_path}")"
+    export PYTHONPATH="/workspace/Lumen:${PYTHONPATH:-}"
 
     if [[ "${NODE_RANK:-0}" == "0" ]]; then
-        python examples/dsv4/prepare_dsv4_fake_rollout.py
+        PYTHONPATH="/workspace/Lumen/examples/dsv4/tools:${PYTHONPATH:-}" \
+            python -c "from gen_fake_rollout_data import prepare; prepare()"
         return
     fi
 
@@ -64,10 +93,10 @@ dsv4_finetune_recompute_args() {
     fi
 }
 
-# Miles-aligned training log hint (rollout / step / perf per GRPO step).
+# GRPO training log hint (rollout / step / perf per GRPO step).
 dsv4_print_finetune_log_hint() {
     local tag="${1:-finetune}"
-    echo "[${tag}] training logs (Miles format):"
+    echo "[${tag}] training logs (GRPO format):"
     echo "[${tag}]   rollout {id}: rollout/num_samples, rollout/advantages, ..."
     echo "[${tag}]   step {id}: train/loss, train/pg_loss, train/grad_norm, train/lr-pg_*"
     echo "[${tag}]   perf {id}: perf/actor_train_time, perf/actor_train_tok_per_s"
@@ -79,6 +108,7 @@ dsv4_print_finetune_launch_info() {
     echo "[${tag}] GRPO steps   : ${NUM_ROLLOUT} (DEBUG_TRAIN_ONLY=${DEBUG_TRAIN_ONLY:-1})"
     echo "[${tag}] hc_mult      : ${DSV4_HC_MULT}"
     echo "[${tag}] batch        : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
+    echo "[${tag}] rollout      : ${FAKE_ROLLOUT_DATA:-(unset)}"
     if [[ -n "${NNODES:-}" && "${NNODES:-1}" != "1" ]]; then
         echo "[${tag}] nodes        : ${NNODES}×${NPROC_PER_NODE:-8} node_rank=${NODE_RANK:-0}"
         echo "[${tag}] parallel     : TP=${TP} PP=${PP} EP=${EP}"

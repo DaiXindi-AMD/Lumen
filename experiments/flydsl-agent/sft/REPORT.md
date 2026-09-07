@@ -1,82 +1,82 @@
-# SFT 实验报告 — v1 → v5e 完整演进
+# SFT Experiment Report — v1 → v5e Full Evolution
 
-## 概述
+## Overview
 
-九轮 SFT 迭代（v1→v5e）。Overall 50% → **74.1%**，沙箱编译率 0% → **21.9% (42/192)**。
-关键转折：v5d 证明负例策略是打地鼠（消灭旧幻觉冒出新幻觉），v5e 转向正例洪水
-（kernel 代码占比 35%→52%），沙箱编译率一举从 9.9% 翻倍到 21.9%。
-SFT 阶段完成，模型已具备转入 RL (RFT → DAPO) 的充足基线能力。
+Nine rounds of SFT iteration (v1→v5e). Overall 50% → **74.1%**, sandbox compile rate 0% → **21.9% (42/192)**.
+Key turning point: v5d proved that negative-example strategy is whack-a-mole (eliminating old hallucinations spawns new ones); v5e pivoted to positive-example flooding
+(kernel code share 35%→52%), and sandbox compile rate doubled in one step from 9.9% to 21.9%.
+SFT phase complete; the model has sufficient baseline capability to transition to RL (RFT → DAPO).
 
 **HuggingFace**: https://huggingface.co/Zhangdanyang/Qwen2.5-Coder-SFT-v5e
 
-## 版本演进总表
+## Version Evolution Summary
 
-| 版本 | 样本数 | Kernel率 | Val Loss | Overall | 沙箱编译 | 核心问题 |
+| Version | Sample Count | Kernel Rate | Val Loss | Overall | Sandbox Compile | Core Issue |
 |------|--------|---------|----------|---------|---------|---------|
-| Base | — | — | — | 50.4% | — | 不懂 FlyDSL |
-| v1 | 2,808 | 18% | 1.030 | 56.3% | — | 82% 非代码数据 |
-| v2 | 2,916 | 59% | 0.985 | 72.4% | 0% | 37.6% 截断 + r=32 |
-| v3 | 3,096 | 60% | 0.974 | 未测 | 0% | 81% import 幻觉 |
-| v4 | 2,344 | 55% | 0.984 | 60.3% | 0.5% | 数据量减少致退化 |
-| v5 | 2,596 | 58% | 待测 | 69.3% | 0% | 二级 API 幻觉 |
-| v5b | 2,792 | 60% | 待测 | 76.5% | 4.7% (9/192) | 新变种幻觉 + 语法残留 |
-| v5c | 2,943 | 62% | 待测 | 73.6% | 10.4% (20/192) | import 写法 + flyc API 幻觉 |
-| v5d | 3,102 | 63% | 待测 | 待测 | 9.9% (19/192) | 打地鼠失败：旧幻觉消灭，新幻觉冒出 |
-| **v5e** | **3,889** | **52%** | **待测** | **74.1%** | **21.9% (42/192)** | **SFT 完成，转入 RL** |
+| Base | — | — | — | 50.4% | — | Doesn't understand FlyDSL |
+| v1 | 2,808 | 18% | 1.030 | 56.3% | — | 82% non-code data |
+| v2 | 2,916 | 59% | 0.985 | 72.4% | 0% | 37.6% truncation + r=32 |
+| v3 | 3,096 | 60% | 0.974 | not tested | 0% | 81% import hallucination |
+| v4 | 2,344 | 55% | 0.984 | 60.3% | 0.5% | degradation due to reduced dataset size |
+| v5 | 2,596 | 58% | pending | 69.3% | 0% | secondary API hallucination |
+| v5b | 2,792 | 60% | pending | 76.5% | 4.7% (9/192) | new variant hallucinations + syntax residue |
+| v5c | 2,943 | 62% | pending | 73.6% | 10.4% (20/192) | import style + flyc API hallucination |
+| v5d | 3,102 | 63% | pending | not tested | 9.9% (19/192) | whack-a-mole failure: old hallucinations eliminated, new ones emerge |
+| **v5e** | **3,889** | **52%** | **pending** | **74.1%** | **21.9% (42/192)** | **SFT complete, transition to RL** |
 
-## v1: 基线 — 82% 非代码数据
+## v1: Baseline — 82% Non-Code Data
 
-### 问题
+### Problem
 
-SFT 训练数据中 82% 不含 FlyDSL kernel 代码：
+82% of SFT training data contains no FlyDSL kernel code:
 
 ```
-@flyc.kernel 出现率:  354/2808 (13%)
+@flyc.kernel occurrence rate:  354/2808 (13%)
 fx.* API:             471/2808 (17%)
-实际 kernel 代码:     500/2808 (18%)
-QA/文档/拒答:        2308/2808 (82%)
+Actual kernel code:     500/2808 (18%)
+QA/docs/refusal:        2308/2808 (82%)
 
-按来源:
-  documentation_qa (669):        8% 含 kernel
-  ai_annotated_instruction (375): 2% 含 kernel
-  refusal_boundary (135):         0% 含 kernel
-  augmentation_tile (105):       75% 含 kernel  ← 高质量但太少
+By source:
+  documentation_qa (669):        8% contain kernel
+  ai_annotated_instruction (375): 2% contain kernel
+  refusal_boundary (135):         0% contain kernel
+  augmentation_tile (105):       75% contain kernel  ← high quality but too few
 ```
 
-### 结果
+### Results
 
-- Overall 56.3% (base 50.4%，仅 +5.9%)
-- `@flyc.kernel` 使用率从 base 96% 降到 40% — 模型学会了写文档回答而不是 kernel
-- L4-L5 几乎没有改善
+- Overall 56.3% (base 50.4%, only +5.9%)
+- `@flyc.kernel` usage dropped from base 96% to 40% — model learned to write documentation answers instead of kernels
+- L4-L5 barely improved
 
-### 脚本
+### Scripts
 
-无特殊脚本，使用原始 `flydsl-agent-dataset`。
+No special scripts; used original `flydsl-agent-dataset`.
 
 ---
 
-## v2: 数据重采样 + kernel 提取 + r=64 + seq=16384
+## v2: Data Resampling + Kernel Extraction + r=64 + seq=16384
 
-### 问题
+### Problem
 
-v1 的两个根因：
-1. **数据比例失衡** — kernel 代码只占 18%
-2. **训练能力受限** — r=32 容量不足，seq=8192 截断了 37.6% 的数据
+Two root causes from v1:
+1. **Data ratio imbalance** — kernel code only 18%
+2. **Training capacity limits** — r=32 insufficient capacity, seq=8192 truncated 37.6% of data
 
-### 解决
+### Solution
 
-1. **从 CPT 数据提取 kernel 代码**：54 个 FlyDSL kernel 文件 → 108 条 SFT 对
-2. **加权重采样**：kernel 高源 5x，QA 0.3x，拒答 0.1x
-3. **LoRA r=32 → r=64**：可训练参数 0.81% → 1.61%
-4. **seq=8192 → 16384**：截断率 37.6% → 19.2%
+1. **Extract kernel code from CPT data**: 54 FlyDSL kernel files → 108 SFT pairs
+2. **Weighted resampling**: kernel-high sources 5x, QA 0.3x, refusal 0.1x
+3. **LoRA r=32 → r=64**: trainable params 0.81% → 1.61%
+4. **seq=8192 → 16384**: truncation rate 37.6% → 19.2%
 
 ```
-脚本: experiments/flydsl-agent/dataprocess/enhance_sft_data.py
+Script: experiments/flydsl-agent/dataprocess/enhance_sft_data.py
 ```
 
-### 结果
+### Results
 
-| 指标 | v1 | v2 | Δ |
+| Metric | v1 | v2 | Δ |
 |------|-----|-----|-----|
 | Overall | 56.3% | **72.4%** | +16.1% |
 | @flyc.kernel | 40% | **92%** | +52% |
@@ -86,20 +86,20 @@ v1 的两个根因：
 | L3 GEMM | 64% | **76%** | +12% |
 | L4 FP8 GEMM | 26% | **49%** | +23% |
 
-### 遗留问题
+### Remaining Issues
 
-RFT Stage 1 用 v2 模型生成 208 候选 → **沙箱编译通过率 0%**。
+RFT Stage 1 used v2 model to generate 208 candidates → **sandbox compile pass rate 0%**.
 
 ---
 
-## v3: Import 幻觉修复
+## v3: Import Hallucination Fix
 
-### 问题
+### Problem
 
-RFT Stage 1 发现 v2 模型生成的代码 **81% import 路径是幻想的**：
+RFT Stage 1 found that v2 model-generated code had **81% hallucinated import paths**:
 
 ```
-v2 模型生成的 import 路径 vs 真实 FlyDSL API:
+v2 model-generated import paths vs real FlyDSL API:
 
   454x  × from flydsl.allocators import SharedAllocator
           → ✓ from flydsl.utils.smem_allocator import SmemAllocator
@@ -116,67 +116,67 @@ v2 模型生成的 import 路径 vs 真实 FlyDSL API:
   99x   × import flydsl as flyc
           → ✓ import flydsl.compiler as flyc
 
-正确 import 比例: 18.6% (995 / 5349)
+Correct import ratio: 18.6% (995 / 5349)
 ```
 
-**矛盾**：SFT 训练数据中 `import flydsl.compiler as flyc` 出现了 1375 次、
-`import flydsl.expr as fx` 出现了 1570 次，但模型仍然生成错误 import。
-原因是这些正确 import 被埋在长 kernel 代码中间，模型没有独立学会它们。
+**Contradiction**: SFT training data had `import flydsl.compiler as flyc` 1375 times and
+`import flydsl.expr as fx` 1570 times, but the model still generated wrong imports.
+Reason: these correct imports were buried in long kernel code; the model did not learn them independently.
 
-### 解决
+### Solution
 
-新增 60 条 import-focused SFT 数据 × 3 重复 = 180 条：
+Added 60 import-focused SFT samples × 3 repeats = 180 samples:
 
-| 类型 | 数量 | 内容 |
+| Type | Count | Content |
 |------|------|------|
-| Import 模板 | 24 | "写 FlyDSL 标准 import" → 正确 import block |
-| Kernel 骨架 | 6 | kernel 框架含正确 import + @flyc.kernel + @flyc.jit |
-| Import 纠错 | 30 | 15 种常见错误 import → 正确 import + 解释 |
+| Import templates | 24 | "Write FlyDSL standard imports" → correct import block |
+| Kernel skeletons | 6 | kernel framework with correct import + @flyc.kernel + @flyc.jit |
+| Import correction | 30 | 15 common wrong imports → correct import + explanation |
 
 ```
-脚本: experiments/flydsl-agent/dataprocess/fix_import_sft.py
+Script: experiments/flydsl-agent/dataprocess/fix_import_sft.py
 ```
 
-### 结果
+### Results
 
-Val loss: 0.985 → 0.974（改善）。Benchmark 和 RFT 因 v4 数据问题发现而未完整测试。
+Val loss: 0.985 → 0.974 (improved). Benchmark and RFT not fully tested due to v4 data issues discovered later.
 
 ---
 
-## v4: Hardware-Feature 错配清洗
+## v4: Hardware-Feature Mismatch Cleaning
 
-### 问题（最严重）
+### Problem (Most Severe)
 
-RFT Stage 1 持续 0% 编译通过率。深入分析发现 **76% 的 gfx950 训练样本**
-在 assistant 代码中使用了 gfx950 硬件上不存在的特性：
-
-```
-2741 个 gfx950 相关样本中, 2071 个 (76%) 有错配:
-  × mxfp4 (FP4):    1051 条 — FP4 是 gfx1250 (MI450) 独有
-  × tdm (TDM ops):   591 条 — TDM 是 gfx1250 独有
-  × wmma (WMMA):     429 条 — gfx950 用 MFMA, 不用 WMMA
-```
-
-### 根因追溯
-
-数据管线 `process_all_v2.py` 的 `augmentation_hardware` 逻辑有 bug：
-把 gfx1250 kernel（含 WMMA/TDM/mxfp4）原封不动改个硬件名适配为 gfx950，
-但没有去掉 gfx1250 独有的特性。
+RFT Stage 1 still had 0% compile pass rate. Deep analysis found **76% of gfx950 training samples**
+used features that don't exist on gfx950 hardware in assistant code:
 
 ```
-来源分析:
-  augmentation_hardware:     415 条错误 ← 最多
-  augmentation_tile:         354 条
-  augmentation_pipeline:     226 条
-  kernel_reverse_annotation: 159 条
-
-实际来源文件:
-  kernels/wmma_gemm_gfx1250.py         → 标记为 gfx950 (错!)
-  kernels/moe_gemm_2stage_wmma_gfx1250.py → 标记为 gfx950 (错!)
-  kernels/gemm_fp8fp4_gfx1250.py       → 标记为 gfx950 (错!)
+Among 2741 gfx950-related samples, 2071 (76%) have mismatches:
+  × mxfp4 (FP4):    1051 — FP4 is gfx1250 (MI450) exclusive
+  × tdm (TDM ops):   591 — TDM is gfx1250 exclusive
+  × wmma (WMMA):     429 — gfx950 uses MFMA, not WMMA
 ```
 
-### Hardware-Feature 兼容性矩阵
+### Root Cause Trace
+
+Data pipeline `process_all_v2.py` `augmentation_hardware` logic had a bug:
+it took gfx1250 kernels (with WMMA/TDM/mxfp4) and only changed the hardware name to adapt for gfx950,
+without removing gfx1250-exclusive features.
+
+```
+Source analysis:
+  augmentation_hardware:     415 errors ← most
+  augmentation_tile:         354
+  augmentation_pipeline:     226
+  kernel_reverse_annotation: 159
+
+Actual source files:
+  kernels/wmma_gemm_gfx1250.py         → labeled as gfx950 (wrong!)
+  kernels/moe_gemm_2stage_wmma_gfx1250.py → labeled as gfx950 (wrong!)
+  kernels/gemm_fp8fp4_gfx1250.py       → labeled as gfx950 (wrong!)
+```
+
+### Hardware-Feature Compatibility Matrix
 
 | Feature | gfx942 (MI300X) | gfx950 (MI350X) | gfx1250 (MI450) |
 |---------|:---:|:---:|:---:|
@@ -190,94 +190,94 @@ RFT Stage 1 持续 0% 编译通过率。深入分析发现 **76% 的 gfx950 训�
 | SmemAllocator | ✅ | ✅ | ✅ |
 | split_k | ✅ | ✅ | ✅ |
 
-### 解决
+### Solution
 
-丢弃所有 assistant 代码含 hardware-feature 错配的 SFT 样本：
+Discarded all SFT samples whose assistant code contained hardware-feature mismatches:
 
 ```
-第一版 regex (过宽):  3096 → 1532 (丢弃 50%) — 误杀 812 条
-  \bfp4\b 匹配了注释中的 "FP4" 文字 (如 "MFMA + FP4/MFMA-scale")
-  \bwmma\b 匹配了 arch dispatch 代码中的 WMMA 分支
+First regex version (too broad):  3096 → 1532 (discarded 50%) — falsely removed 812
+  \bfp4\b matched "FP4" text in comments (e.g. "MFMA + FP4/MFMA-scale")
+  \bwmma\b matched WMMA branches in arch dispatch code
 
-第二版 regex (精准):  3096 → 2344 (丢弃 24%) — 只匹配代码调用
+Second regex version (precise):  3096 → 2344 (discarded 24%) — only matches code calls
   wmma_\w+( / WmmaAtom / from.*wmma import
   tdm_ops. / TdmCopy / tdm_load
   mxfp4_quant / fp4_gemm / wfp4 / afp4
 
-脚本: experiments/flydsl-agent/dataprocess/clean_hw_features.py
+Script: experiments/flydsl-agent/dataprocess/clean_hw_features.py
 ```
 
-### v4 候选错误详细分析
+### v4 Candidate Error Detailed Analysis
 
-RFT Stage 1 用 v4 模型生成 192 候选，错误分布：
+RFT Stage 1 used v4 model to generate 192 candidates; error distribution:
 
-| 错误类型 | 数量 | 占比 | 说明 |
+| Error Type | Count | Share | Notes |
 |---------|------|------|------|
-| **语法错误** | 174 | 90.6% | |
-| └ markdown 未清理 | 98 | 51% | 代码包裹在 ``` 中 |
-| └ invalid syntax | 110 | 57% | 含注释中的非法字符 |
+| **Syntax errors** | 174 | 90.6% | |
+| └ markdown not cleaned | 98 | 51% | code wrapped in ``` |
+| └ invalid syntax | 110 | 57% | includes illegal characters in comments |
 | └ unterminated string | 18 | 9% | |
-| **无 @flyc 装饰器** | 7 | 3.6% | 有 import 但没写 kernel |
-| **正确结构但 API 错** | 6 | 3.1% | 见下方案例 |
-| **import 仍然错误** | 3 | 1.6% | v3 修复大部分,仍有残余 |
-| **部分正确** | 2 | 1.0% | |
-| **✅ 编译通过** | **1** | **0.5%** | paged_attn/gfx950 |
+| **Missing @flyc decorator** | 7 | 3.6% | has import but no kernel |
+| **Correct structure but wrong API** | 6 | 3.1% | see cases below |
+| **Imports still wrong** | 3 | 1.6% | v3 fix mostly worked, some residue |
+| **Partially correct** | 2 | 1.0% | |
+| **✅ Compile passed** | **1** | **0.5%** | paged_attn/gfx950 |
 
-#### 语法错误详解 (174 个, 90.6%)
+#### Syntax Error Details (174, 90.6%)
 
-最大问题是**模型输出包含 markdown code block**（104/192 = 54%）:
+Biggest issue: **model output contains markdown code blocks** (104/192 = 54%):
 ```
-模型输出:
+Model output:
   ```python
   import flydsl.compiler as flyc
   ...
   ```
 
-verify.py 收到的:
-  ```python           ← 这行导致 SyntaxError
+What verify.py received:
+  ```python           ← this line causes SyntaxError
   import flydsl.compiler as flyc
 ```
 
-verify 脚本已有 strip markdown 逻辑（v2 修复），但匹配不到所有格式。
-部分候选的 markdown 嵌套在输出中间而不是开头。
+verify script already had strip markdown logic (v2 fix), but couldn't match all formats.
+Some candidates had markdown nested in the middle of output rather than at the start.
 
-#### 正确结构但 API 错误 (6 个, 3.1%)
+#### Correct Structure but Wrong API (6, 3.1%)
 
-案例 1 — 幻想的 API:
+Case 1 — hallucinated API:
 ```python
-import flydsl.compiler as flyc  # ✓ 正确
-import flydsl.expr as fx        # ✓ 正确
-from flydsl.allocators import SmemAllocator  # × 不存在
+import flydsl.compiler as flyc  # ✓ correct
+import flydsl.expr as fx        # ✓ correct
+from flydsl.allocators import SmemAllocator  # × does not exist
 
 @flyc.kernel(
-    grid_dim=(fx.ceil_div(fx.Arg("B"), 8), ...),  # × fx.Arg 不存在
-    smem_bytes=fx.Arg("T") * 4 * 32,              # × fx.Arg 不存在
+    grid_dim=(fx.ceil_div(fx.Arg("B"), 8), ...),  # × fx.Arg does not exist
+    smem_bytes=fx.Arg("T") * 4 * 32,              # × fx.Arg does not exist
 )
 def rmsnorm(
-    x: fx.DeviceArray(3, dtype=torch.float32),    # × fx.DeviceArray 不存在
+    x: fx.DeviceArray(3, dtype=torch.float32),    # × fx.DeviceArray does not exist
 ```
-正确 API: `fx.Tensor`, `fx.Constexpr[int]`, `from flydsl.utils.smem_allocator import SmemAllocator`
+Correct API: `fx.Tensor`, `fx.Constexpr[int]`, `from flydsl.utils.smem_allocator import SmemAllocator`
 
-案例 2 — 混入 JAX:
+Case 2 — mixed with JAX:
 ```python
 import flydsl.compiler as flyc  # ✓
 import flydsl.expr as fx        # ✓
-import jax                      # × FlyDSL 不用 JAX
-import jax.numpy as jnp         # × 幻觉
+import jax                      # × FlyDSL doesn't use JAX
+import jax.numpy as jnp         # × hallucination
 ```
 
-案例 3 — 幻想的类型系统:
+Case 3 — hallucinated type system:
 ```python
 import flydsl.compiler as flyc  # ✓
 import flydsl.expr as fx        # ✓
-import flydsl.types as ft       # × flydsl.types 不存在
+import flydsl.types as ft       # × flydsl.types does not exist
 
 @flyc.kernel
-def softmax_fma(x: ft.Tensor, y: ft.Tensor):  # × ft.Tensor 不存在
+def softmax_fma(x: ft.Tensor, y: ft.Tensor):  # × ft.Tensor does not exist
 ```
-正确: `x: fx.Tensor`
+Correct: `x: fx.Tensor`
 
-#### 通过编译的唯一候选
+#### The Only Candidate That Passed Compile
 
 ```python
 import flydsl.compiler as flyc
@@ -296,39 +296,39 @@ def paged_attn_fwd(
     num_seqs = q.layout[0]
     ...
 ```
-正确使用了 `import flydsl.compiler as flyc`, `import flydsl.expr as fx`, `@flyc.kernel`, `fx.Tensor`。
+Correctly used `import flydsl.compiler as flyc`, `import flydsl.expr as fx`, `@flyc.kernel`, `fx.Tensor`.
 
-### v4 结果
+### v4 Results
 
-| 指标 | v2 | v4 | Δ | 原因 |
+| Metric | v2 | v4 | Δ | Reason |
 |------|-----|-----|-----|------|
-| Overall | 72.4% | 60.3% | -12.1% | 数据量减少 |
+| Overall | 72.4% | 60.3% | -12.1% | reduced dataset size |
 | L1 | 100% | 100% | = | |
-| L2 | 100% | 80% | -20% | layernorm/rope 退化 |
+| L2 | 100% | 80% | -20% | layernorm/rope regression |
 | L3 | 76% | 76% | = | |
-| L4 | 49% | 26% | -23% | FP8 GEMM 从 49%→14% |
-| L5 | 38% | 20% | -18% | preshuffle 退化 |
-| @flyc.kernel | 92% | 64% | -28% | 复杂 kernel 样本减少 |
-| Pipeline | 12% | 0% | -12% | pipeline 样本被清洗掉 |
-| Swizzle | 4% | 0% | -4% | swizzle 样本被清洗掉 |
-| **沙箱编译** | **0%** | **0.5%** | **+0.5%** | **首次突破！** |
+| L4 | 49% | 26% | -23% | FP8 GEMM 49%→14% |
+| L5 | 38% | 20% | -18% | preshuffle regression |
+| @flyc.kernel | 92% | 64% | -28% | fewer complex kernel samples |
+| Pipeline | 12% | 0% | -12% | pipeline samples cleaned out |
+| Swizzle | 4% | 0% | -4% | swizzle samples cleaned out |
+| **Sandbox compile** | **0%** | **0.5%** | **+0.5%** | **first breakthrough!** |
 
 ---
 
 ---
 
-## v5: 补充 gfx950 kernel + Gluon 教程 + 二级幻觉发现
+## v5: Add gfx950 Kernels + Gluon Tutorials + Secondary Hallucination Discovery
 
-### 改进
+### Improvements
 
-1. **+156 条真实 gfx950 kernel 代码** — 从 FlyDSL 仓库 27 个 gfx950 兼容 kernel 生成 52 对 ×3
-2. **+18 条 no-markdown 模板** — 强调 "output raw Python, no markdown"
-3. **+18 条 API 类型纠错** — `fx.DeviceArray`→`fx.Tensor` 等 9 种纠错 ×2
-4. **+60 条 Gluon GEMM 优化教程** — v0→v9 渐进式优化 (520→1489 TFLOPS)
+1. **+156 real gfx950 kernel code samples** — 52 pairs ×3 from 27 gfx950-compatible kernels in FlyDSL repo
+2. **+18 no-markdown templates** — emphasize "output raw Python, no markdown"
+3. **+18 API type corrections** — `fx.DeviceArray`→`fx.Tensor` and 9 other corrections ×2
+4. **+60 Gluon GEMM optimization tutorials** — v0→v9 progressive optimization (520→1489 TFLOPS)
 
-### Benchmark 结果
+### Benchmark Results
 
-| 指标 | v4 | **v5** | Δ |
+| Metric | v4 | **v5** | Δ |
 |------|-----|--------|-----|
 | L1 | 100% | **100%** | = |
 | L2 | 80% | **100%** | +20% |
@@ -337,91 +337,91 @@ def paged_attn_fwd(
 | L5 | 20% | **38%** | +18% |
 | **Overall** | **60%** | **69%** | **+9%** |
 
-v5 整体大幅改善：L2 恢复到 100%，L4 +11%，L5 +18%。
+v5 improved substantially overall: L2 back to 100%, L4 +11%, L5 +18%.
 
-### 沙箱编译 0% — 双重根因分析
+### Sandbox Compile 0% — Dual Root Cause Analysis
 
-**原始分析 (clean_code 修复前)**：192 候选中仅 18 个通过静态检查，其余因语法错误失败。
+**Original analysis (before clean_code fix)**: only 18 of 192 candidates passed static checks; rest failed on syntax errors.
 
-**clean_code 修复后重新分析**：
-
-```
-语法错误根因拆解 (192 候选):
-  Special token 泄漏:     126 (66%) ← <|fim_middle|>, <|file_sep|> 未被 strip
-  Markdown 包裹:           54 (28%) ← ``` 包裹
-  代码截断:                19 (10%) ← max_new_tokens=4096 不够，括号未闭合
-  System prompt 泄漏:       5 (3%)  ← 模型把 system prompt 当代码输出
-
-修复 clean_code() 后:
-  增强正则: strip <|fim_*|>, <|file_sep|>, <|endoftext|>, <|im_start/end|>
-  增强 markdown: strip 中间位置的 ```
-  截断处理: 遇到残余 <| 时截断到该位置
-
-效果:
-  语法通过: 18/192 (9%) → 64/192 (33%)  ← +46 候选
-  沙箱通过: 0/18 → 0/64               ← 全部因 ImportError 失败
-```
-
-**关键发现：语法问题可以在代码层面解决，不需要重新训练。**
-
-沙箱编译失败的真正瓶颈是**二级 API 幻觉** — 64 个语法正确的候选全部在 `from flydsl.expr import Expr` 等不存在的 import 上失败：
+**Re-analysis after clean_code fix**:
 
 ```
-模型生成的代码（顶层 import 正确，二级 import 幻觉）:
+Syntax error root cause breakdown (192 candidates):
+  Special token leakage:     126 (66%) ← <|fim_middle|>, <|file_sep|> not stripped
+  Markdown wrapping:           54 (28%) ← ``` wrapping
+  Code truncation:                19 (10%) ← max_new_tokens=4096 insufficient, unclosed brackets
+  System prompt leakage:       5 (3%)  ← model output system prompt as code
 
-  import flydsl.compiler as flyc    # ✓ 正确 
-  import flydsl.expr as fx          # ✓ 正确
-  from flydsl.expr import Expr      # × 不存在！应用 fx.Tensor
-  from flydsl.expr import ArithOp   # × 不存在！应用 from flydsl.expr import arith
-  from flydsl.expr import dtypes    # × 不存在！类型是 fx.Float32 等直接属性
-  from flydsl.utils import Layout   # × Layout 在 fx.Layout，不在 utils
+After clean_code() fix:
+  Enhanced regex: strip <|fim_*|>, <|file_sep|>, <|endoftext|>, <|im_start/end|>
+  Enhanced markdown: strip ``` in middle positions
+  Truncation handling: truncate at position when residual <| remains
 
-根因: 模型不知道 FlyDSL 的模块结构树:
+Effect:
+  Syntax pass: 18/192 (9%) → 64/192 (33%)  ← +46 candidates
+  Sandbox pass: 0/18 → 0/64               ← all failed on ImportError
+```
+
+**Key finding: syntax issues can be solved at the code level without retraining.**
+
+The real bottleneck for sandbox compile failure is **secondary API hallucination** — all 64 syntax-correct candidates failed on nonexistent imports like `from flydsl.expr import Expr`:
+
+```
+Model-generated code (top-level imports correct, secondary imports hallucinated):
+
+  import flydsl.compiler as flyc    # ✓ correct 
+  import flydsl.expr as fx          # ✓ correct
+  from flydsl.expr import Expr      # × does not exist! should use fx.Tensor
+  from flydsl.expr import ArithOp   # × does not exist! should use from flydsl.expr import arith
+  from flydsl.expr import dtypes    # × does not exist! types are fx.Float32 etc. direct attributes
+  from flydsl.utils import Layout   # × Layout is in fx.Layout, not utils
+
+Root cause: model doesn't know FlyDSL module structure tree:
   flydsl/
   ├── compiler (flyc) — @flyc.kernel, @flyc.jit
-  ├── expr (fx) — 222 个公开名 (类型/函数/布局代数)
-  │   ├── arith — 算术运算 (addf, mulf...)
-  │   ├── buffer_ops — 缓冲区操作
-  │   ├── rocdl — ROCDL/MFMA 指令
+  ├── expr (fx) — 222 public names (types/functions/layout algebra)
+  │   ├── arith — arithmetic ops (addf, mulf...)
+  │   ├── buffer_ops — buffer operations
+  │   ├── rocdl — ROCDL/MFMA instructions
   │   └── typing — T, Vector
   ├── utils.smem_allocator — SmemAllocator, SmemPtr
   └── runtime.device — get_rocm_arch
 
-模型知道要从 flydsl.expr 导入东西，但不知道哪些名字存在、哪些不存在。
-需要教会模型整棵 import 链条树——"需要 X → 在哪个模块 → 怎么导入"。
+Model knows to import from flydsl.expr but not which names exist vs don't.
+Need to teach the full import chain tree — "need X → which module → how to import".
 ```
 
-**代码修复** (已完成，不需重训):
-- `verify_candidates.py::clean_code()` — 增强 special token / markdown / 截断处理
+**Code fixes** (done, no retrain needed):
+- `verify_candidates.py::clean_code()` — enhanced special token / markdown / truncation handling
 - `generate_candidates.py` — `max_new_tokens` 4096 → 6144
 
-脚本: `experiments/flydsl-agent/rft-stage1/verify_candidates.py`
+Script: `experiments/flydsl-agent/rft-stage1/verify_candidates.py`
 
-### 解决方案（v5b 方向）
+### Solution (v5b direction)
 
-已生成 import 链条导航数据（25 对 ×4 = 100 条），教模型三种推理：
-1. **正向导航**: "我需要 SmemAllocator" → flydsl → utils → smem_allocator → SmemAllocator
-2. **模块参考卡**: "flydsl.expr 有什么？" → 完整列表 (222 个名字)
-3. **反向否定**: "flydsl.expr.Expr 不存在" → 应该用 fx.Tensor
+Generated import chain navigation data (25 pairs ×4 = 100 samples), teaching three reasoning modes:
+1. **Forward navigation**: "I need SmemAllocator" → flydsl → utils → smem_allocator → SmemAllocator
+2. **Module reference card**: "What's in flydsl.expr?" → full list (222 names)
+3. **Reverse negation**: "flydsl.expr.Expr does not exist" → should use fx.Tensor
 
-脚本: `experiments/flydsl-agent/dataprocess/fix_import_chain.py`
-
----
+Script: `experiments/flydsl-agent/dataprocess/fix_import_chain.py`
 
 ---
 
-## v5b: Import 链条导航 + API 参考 — 沙箱编译突破
+---
 
-### 改进
+## v5b: Import Chain Navigation + API Reference — Sandbox Compile Breakthrough
 
-1. **+100 条 import 链条导航** — "需要 X → 哪个模块 → 怎么 import"（25 对 ×4）
-2. **+96 条 API 参考 + 幻觉纠错** — 模块完整 API 列表 + 17 种错误 import 纠正（32 对 ×3）
-3. **clean_code() 代码修复** — 增强 special token / markdown strip（不需重训）
-4. **max_new_tokens 4096→6144** — 避免长 kernel 截断
+### Improvements
 
-### Benchmark 结果
+1. **+100 import chain navigation samples** — "need X → which module → how to import" (25 pairs ×4)
+2. **+96 API reference + hallucination correction** — full module API lists + 17 wrong import corrections (32 pairs ×3)
+3. **clean_code() code fix** — enhanced special token / markdown strip (no retrain needed)
+4. **max_new_tokens 4096→6144** — avoid long kernel truncation
 
-| 指标 | v5 | **v5b** | Δ | Target |
+### Benchmark Results
+
+| Metric | v5 | **v5b** | Δ | Target |
 |------|-----|---------|------|--------|
 | L1 | 100% | **100%** | = | 90% ✅ |
 | L2 | 100% | **100%** | = | 85% ✅ |
@@ -430,13 +430,13 @@ v5 整体大幅改善：L2 恢复到 100%，L4 +11%，L5 +18%。
 | L5 | 38% | **55%** | +17% | 20% ✅ |
 | **Overall** | **69%** | **76.5%** | **+7.5%** | **60% ✅** |
 
-**全 5 级首次全部达标。** L4 从 37%→51% 首次超过 50% 目标。
+**All 5 levels met targets for the first time.** L4 37%→51% exceeded 50% target for the first time.
 
-### 沙箱编译: 0% → 4.7% (9/192)
+### Sandbox Compile: 0% → 4.7% (9/192)
 
-9 个 kernel 通过 FlyDSL 真实编译，覆盖 9/12 算子：
+9 kernels passed real FlyDSL compile, covering 9/12 operators:
 
-| 算子 | 通过数 | 代码行数 | import 模式 |
+| Operator | Pass Count | Lines of Code | Import Pattern |
 |------|--------|---------|------------|
 | layernorm | 1 | 53 | flyc + fx + arith,buffer_ops + SmemAllocator |
 | gemm | 1 | 97 | flyc + fx + flyrt |
@@ -447,64 +447,64 @@ v5 整体大幅改善：L2 恢复到 100%，L4 +11%，L5 +18%。
 | custom | 1 | 75 | flyc + fx + typing.Tensor |
 | paged_attn | 1 | 118 | flyc + fx + arith,buffer_ops,rocdl |
 
-未通过的算子: moe (0), rmsnorm (0), quant (0), rope (0)
+Operators not passing: moe (0), rmsnorm (0), quant (0), rope (0)
 
-### 剩余错误分析
+### Remaining Error Analysis
 
 ```
-192 候选错误分布 (v5b):
-  语法错误 (clean_code 后仍有):  98 (51%)  ← 需要改进生成阶段
-  静态通过但沙箱 ImportError:    85 (44%)  ← 新变种幻觉
-  沙箱编译通过:                   9 (4.7%) ← 突破!
+192 candidate error distribution (v5b):
+  Syntax errors (still after clean_code):  98 (51%)  ← need generation-stage fix
+  Static pass but sandbox ImportError:    85 (44%)  ← new variant hallucinations
+  Sandbox compile passed:                   9 (4.7%) ← breakthrough!
 
-新变种幻觉 (85 个候选):
-  5x  from flydsl.expr import fx              → 应该用 import flydsl.expr as fx
-  5x  import flydsl.expr.ops as ops           → flydsl.expr.ops 不存在
-  6x  from flydsl.expr.types import F16/BF16  → flydsl.expr.types 不存在, 用 fx.Float16
-  2x  from flydsl.expr import dtypes          → 老问题残留
-  2x  from flydsl.runtime import rocdl        → rocdl 在 flydsl.expr.rocdl
-  2x  from flydsl.utils import div_up         → div_up 不在 utils
+New variant hallucinations (85 candidates):
+  5x  from flydsl.expr import fx              → should use import flydsl.expr as fx
+  5x  import flydsl.expr.ops as ops           → flydsl.expr.ops does not exist
+  6x  from flydsl.expr.types import F16/BF16  → flydsl.expr.types does not exist, use fx.Float16
+  2x  from flydsl.expr import dtypes          → old issue residue
+  2x  from flydsl.runtime import rocdl        → rocdl is in flydsl.expr.rocdl
+  2x  from flydsl.utils import div_up         → div_up not in utils
 ```
 
-### v5c 方向
+### v5c Direction
 
-1. **生成阶段修复**: 加 stop tokens 避免 special token 泄漏, 减少 51% 语法错误
-2. **新变种纠错数据**: 针对 `flydsl.expr.types`, `flydsl.expr.ops`, `from flydsl.expr import fx` 加纠错
-3. **增大候选数 N=32**: 提高每 spec 的编译通过概率
+1. **Generation-stage fix**: add stop tokens to avoid special token leakage, reduce 51% syntax errors
+2. **New variant correction data**: target `flydsl.expr.types`, `flydsl.expr.ops`, `from flydsl.expr import fx`
+3. **Increase candidate count N=32**: improve per-spec compile pass probability
 
 ---
 
-## 各版本关键教训
+## Key Lessons by Version
 
-| 版本 | 教训 |
+| Version | Lesson |
 |------|------|
-| v1 | 训练数据的内容比例直接决定模型能力方向 |
-| v2 | LoRA rank 和 seq_length 是硬约束，不够就是不够 |
-| v3 | 模型能学会概念但不一定学会正确的调用路径 — 需要专门的纠错数据 |
-| v4 | 错误数据比没有数据更有害 — 76% 错配数据教会了模型不可能的代码模式 |
-| v4 | 清洗后数据量减半导致高级能力退化 — 需要用正确数据补回 |
-| v5 | 幻觉分层次：v3 修了一级 import 路径，v5 发现还有二级 API 名幻觉 |
-| v5 | 模块结构知识无法从代码示例中隐式学会——需要显式的链条导航教学 |
-| v5b | Import 链条导航数据直接有效——沙箱通过率 0%→4.7%，证明显式教模块结构可行 |
-| v5b | 幻觉是长尾问题——修一批旧的（Expr/dtypes）会冒出新的（expr.types/expr.ops） |
-| v5b | 语法错误中 66% 是后处理问题，可以在代码层面修复不需要重训 |
+| v1 | Training data content ratio directly determines model capability direction |
+| v2 | LoRA rank and seq_length are hard constraints — insufficient means insufficient |
+| v3 | Model can learn concepts but not necessarily correct call paths — need dedicated correction data |
+| v4 | Wrong data is more harmful than no data — 76% mismatch data taught impossible code patterns |
+| v4 | After cleaning, dataset halved causing advanced capability regression — need to replenish with correct data |
+| v5 | Hallucinations are layered: v3 fixed level-1 import paths, v5 found level-2 API name hallucinations |
+| v5 | Module structure knowledge can't be learned implicitly from code examples — need explicit chain navigation teaching |
+| v5b | Import chain navigation data directly effective — sandbox pass rate 0%→4.7%, proves explicit module structure teaching works |
+| v5b | Hallucinations are a long-tail problem — fixing old ones (Expr/dtypes) spawns new ones (expr.types/expr.ops) |
+| v5b | 66% of syntax errors are post-processing issues, fixable at code level without retrain |
 
 ---
 
-## v5c: 完整模块结构摘要 (30 模块) — 沙箱编译再次突破
+## v5c: Full Module Structure Digest (30 Modules) — Sandbox Compile Breakthrough Again
 
-### 改进
+### Improvements
 
-1. **+111 条完整模块结构摘要** — 覆盖全部 30 个 FlyDSL 模块（compiler/*, expr/*, runtime/*, utils/*）
-   - 12 条 kernel 生成（system prompt 嵌入完整模块树）×3 重复
-   - 5 条模块 QA 参考（per-module API 列表）×3 重复
-   - 20 条负例（高频幻觉路径显式否定）×3 重复
-2. **MODULE_DIGEST 扩展** — 从 flydsl.expr 扩展到 compiler/expr/runtime/utils 全部子模块
-3. **"DOES NOT EXIST" 列表扩展** — 20 条高频幻觉路径（含 `from flydsl.expr import fx`, `flydsl.expr.types` 等）
+1. **+111 full module structure digest samples** — covers all 30 FlyDSL modules (compiler/*, expr/*, runtime/*, utils/*)
+   - 12 kernel generation (system prompt embeds full module tree) ×3 repeat
+   - 5 module QA reference (per-module API lists) ×3 repeat
+   - 20 negative examples (explicit negation of high-frequency hallucination paths) ×3 repeat
+2. **MODULE_DIGEST expansion** — from flydsl.expr to all compiler/expr/runtime/utils submodules
+3. **"DOES NOT EXIST" list expansion** — 20 high-frequency hallucination paths (including `from flydsl.expr import fx`, `flydsl.expr.types`, etc.)
 
-### Benchmark 结果
+### Benchmark Results
 
-| 指标 | v5b | **v5c** | Δ | Target |
+| Metric | v5b | **v5c** | Δ | Target |
 |------|------|---------|------|--------|
 | L1 | 100% | **100%** | = | 90% ✅ |
 | L2 | 100% | **100%** | = | 85% ✅ |
@@ -513,13 +513,13 @@ v5 整体大幅改善：L2 恢复到 100%，L4 +11%，L5 +18%。
 | L5 | 55% | **45%** | -10% | 20% ✅ |
 | **Overall** | **76.5%** | **73.6%** | **-2.9%** | **60% ✅** |
 
-L3 提升至 80%，但 L4/L5 退化。模块摘要数据可能稀释了高级 kernel 样本的权重。
+L3 improved to 80%, but L4/L5 regressed. Module digest data may have diluted advanced kernel sample weight.
 
-### 沙箱编译: 4.7% → 10.4% (20/192)
+### Sandbox Compile: 4.7% → 10.4% (20/192)
 
-**沙箱编译通过率翻倍！** 20 个 kernel 通过编译，覆盖 9/12 算子：
+**Sandbox compile pass rate doubled!** 20 kernels passed compile, covering 9/12 operators:
 
-| 算子 | v5b | **v5c** | Δ |
+| Operator | v5b | **v5c** | Δ |
 |------|-----|---------|---|
 | gemm | 1 | **3** | +2 |
 | layernorm | 1 | **3** | +2 |
@@ -534,85 +534,85 @@ L3 提升至 80%，但 L4/L5 退化。模块摘要数据可能稀释了高级 ke
 | quant | 0 | **0** | = |
 | rope | 0 | **0** | = |
 
-### 剩余错误分析 (172 失败候选)
+### Remaining Error Analysis (172 failed candidates)
 
-#### 静态失败 (53/192, 27.6%)
+#### Static Failures (53/192, 27.6%)
 
-| 原因 | 数量 |
+| Reason | Count |
 |------|------|
-| 语法错误 | 50 |
-| 代码过短 (<15 行) | 3 |
+| Syntax errors | 50 |
+| Code too short (<15 lines) | 3 |
 
-#### 沙箱失败 — 详细分类 (119/192, 62%)
+#### Sandbox Failures — Detailed Classification (119/192, 62%)
 
-**类别 1: Import 写法错误 (42 处)**
+**Category 1: Import Style Errors (42 occurrences)**
 
-| 错误模式 | 次数 | 正确写法 |
+| Error Pattern | Count | Correct Usage |
 |---------|------|---------|
 | `from flydsl.expr import fx` | 17 | `import flydsl.expr as fx` |
 | `from flydsl.compiler import flyc` | 7 | `import flydsl.compiler as flyc` |
-| `flydsl.expr.func` (不存在) | 6 | 无此模块 |
+| `flydsl.expr.func` (does not exist) | 6 | no such module |
 | `from flydsl import X` | 4 | `import flydsl.compiler as flyc` |
-| `flydsl.expr._expr` (不存在) | 3 | 无此模块 |
-| `flydsl.expr.ops` (不存在) | 3 | `from flydsl.expr import arith` |
-| `flydsl.runtime.rocm` (不存在) | 1 | `from flydsl.expr import rocdl` |
-| `flydsl.utils.gemm_test_utils` (不存在) | 1 | 无此模块 |
+| `flydsl.expr._expr` (does not exist) | 3 | no such module |
+| `flydsl.expr.ops` (does not exist) | 3 | `from flydsl.expr import arith` |
+| `flydsl.runtime.rocm` (does not exist) | 1 | `from flydsl.expr import rocdl` |
+| `flydsl.utils.gemm_test_utils` (does not exist) | 1 | no such module |
 
-**类别 2: API 名称幻觉 (97 处，最严重)**
+**Category 2: API Name Hallucinations (97 occurrences, most severe)**
 
-| 错误模式 | 次数 | 正确用法 |
+| Error Pattern | Count | Correct Usage |
 |---------|------|---------|
-| `flyc.kernel_context` | 13 | flyc 只有 `.kernel/.jit/.compile` |
-| `from flydsl.expr import types` | 6 | 类型是 fx.* 直接属性 |
-| `from flydsl.expr import expr` | 4 | 不存在 |
-| `from flydsl.expr import utils` | 4 | 不存在 |
-| `from flydsl.expr import dtypes` | 4 | 用 fx.Float32 等 |
-| `from flydsl.expr import memory` | 3 | 不存在 |
-| `from flydsl.expr import atomics` | 3 | 不存在 |
-| `from flydsl.expr import type_traits` | 3 | 不存在 |
+| `flyc.kernel_context` | 13 | flyc only has `.kernel/.jit/.compile` |
+| `from flydsl.expr import types` | 6 | types are fx.* direct attributes |
+| `from flydsl.expr import expr` | 4 | does not exist |
+| `from flydsl.expr import utils` | 4 | does not exist |
+| `from flydsl.expr import dtypes` | 4 | use fx.Float32 etc. |
+| `from flydsl.expr import memory` | 3 | does not exist |
+| `from flydsl.expr import atomics` | 3 | does not exist |
+| `from flydsl.expr import type_traits` | 3 | does not exist |
 | `flyc.SmemAllocator` | 3 | `from flydsl.utils.smem_allocator import SmemAllocator` |
-| `flyc.get_shared_memory` | 2 | 不存在 |
-| `flyc.launch` | 2 | 不存在 |
-| 其他 (`enums`, `ir`, `f32`, `smem`) | 各2 | 不存在 |
+| `flyc.get_shared_memory` | 2 | does not exist |
+| `flyc.launch` | 2 | does not exist |
+| Others (`enums`, `ir`, `f32`, `smem`) | 2 each | does not exist |
 
-**类别 3: 外部依赖/其他 (10 处)**
+**Category 3: External Dependencies / Other (10 occurrences)**
 
-| 错误模式 | 次数 |
+| Error Pattern | Count |
 |---------|------|
-| 使用 flyc.* 但未 import | 6 |
+| Uses flyc.* but no import | 6 |
 | `import jax` | 3 |
 | `import triton` | 1 |
 
-### 核心结论
+### Core Conclusions
 
-1. **模块摘要有效** — 沙箱编译率 4.7%→10.4%（翻倍），证明教模型模块结构可行
-2. **新幻觉不断涌现** — 修一批旧幻觉（types/ops），冒出新幻觉（atomics/enums/type_traits/kernel_context）
-3. **两大核心错误模式未解决**:
-   - `from flydsl.expr import fx` (17次) — 应为 `import flydsl.expr as fx`
-   - `from flydsl.compiler import flyc` (7次) — 应为 `import flydsl.compiler as flyc`
-4. **flyc API 幻觉** — 模型认为 flyc 有 `kernel_context`/`SmemAllocator`/`launch` 等属性
+1. **Module digest effective** — sandbox compile rate 4.7%→10.4% (doubled), proves teaching module structure works
+2. **New hallucinations keep emerging** — fixing old ones (types/ops) spawns new ones (atomics/enums/type_traits/kernel_context)
+3. **Two core error patterns unresolved**:
+   - `from flydsl.expr import fx` (17×) — should be `import flydsl.expr as fx`
+   - `from flydsl.compiler import flyc` (7×) — should be `import flydsl.compiler as flyc`
+4. **flyc API hallucinations** — model thinks flyc has `kernel_context`/`SmemAllocator`/`launch` etc.
 
-### v5d 方向
+### v5d Direction
 
-1. **扩展 DOES NOT EXIST 列表** — 加入 v5c 新发现的所有幻觉名称
-2. **增加正例重复** — 更多 `import flydsl.expr as fx` / `import flydsl.compiler as flyc` 的正确用法
-3. **flyc API 纠错** — 明确教 flyc 只有 `.kernel/.jit/.compile` 三个属性
-4. **Import 写法纠错** — 专门针对 `from X import Y` vs `import X as Y` 的模式
+1. **Expand DOES NOT EXIST list** — add all hallucination names discovered in v5c
+2. **Increase positive-example repetition** — more correct usage of `import flydsl.expr as fx` / `import flydsl.compiler as flyc`
+3. **flyc API correction** — explicitly teach flyc only has `.kernel/.jit/.compile` three attributes
+4. **Import style correction** — specifically target `from X import Y` vs `import X as Y` patterns
 
 ---
 
-## v5d: 扩展负例 + 纠错 — 打地鼠失败
+## v5d: Expanded Negative Examples + Correction — Whack-a-Mole Failure
 
-### 改进
+### Improvements
 
-1. **负例扩展 20→58 条** — 新增 atomics/enums/type_traits/func/ir/kernel_context/rocm 等
-2. **Import 纠错 +7 对** — `from flydsl.expr import fx` → `import flydsl.expr as fx` 等
-3. **flyc API 边界 +QA** — 明确 flyc 只有 kernel/jit/compile
-4. **正确 kernel 骨架 +6** — gemm/softmax/rmsnorm/rope/flash_attn/topk 完整代码
+1. **Negative examples expanded 20→58** — added atomics/enums/type_traits/func/ir/kernel_context/rocm etc.
+2. **Import correction +7 pairs** — `from flydsl.expr import fx` → `import flydsl.expr as fx` etc.
+3. **flyc API boundary + QA** — explicitly flyc only has kernel/jit/compile
+4. **Correct kernel skeletons +6** — gemm/softmax/rmsnorm/rope/flash_attn/topk full code
 
-### 沙箱结果: 19/192 (9.9%)
+### Sandbox Results: 19/192 (9.9%)
 
-| 算子 | v5c | v5d | Δ |
+| Operator | v5c | v5d | Δ |
 |------|-----|-----|---|
 | rmsnorm | 0 | **4** | +4 ✅ |
 | rope | 0 | **2** | +2 ✅ |
@@ -623,88 +623,88 @@ L3 提升至 80%，但 L4/L5 退化。模块摘要数据可能稀释了高级 ke
 | layernorm | 3 | 1 | -2 |
 | flash_attn | 3 | 1 | -2 |
 
-三个之前完全不通过的算子（rmsnorm/rope/quant）首次通过，但其他算子退化。
+Three previously zero-pass operators (rmsnorm/rope/quant) passed for the first time, but other operators regressed.
 
-### 关键发现 — 打地鼠效应
+### Key Finding — Whack-a-Mole Effect
 
-| 幻觉模式 | v5c | v5d | 说明 |
+| Hallucination Pattern | v5c | v5d | Notes |
 |---------|-----|-----|------|
-| `flyc.kernel_context` | 13 | **0** | 消灭 ✅ |
-| `flyc.load` | 0 | **16** | 新冒出 ❌ |
-| `flyc.barrier` | 0 | **3** | 新冒出 ❌ |
-| `from flydsl.expr import kernel` | 0 | **5** | 新冒出 ❌ |
-| `from flydsl.expr import fx` | 17 | **17** | 顽固不变 ❌ |
+| `flyc.kernel_context` | 13 | **0** | eliminated ✅ |
+| `flyc.load` | 0 | **16** | newly emerged ❌ |
+| `flyc.barrier` | 0 | **3** | newly emerged ❌ |
+| `from flydsl.expr import kernel` | 0 | **5** | newly emerged ❌ |
+| `from flydsl.expr import fx` | 17 | **17** | stubbornly unchanged ❌ |
 
-**结论：负例策略本质是打地鼠——消灭一个已知幻觉，模型就发明一个新的。**
-`from flydsl.expr import fx` (17次) 完全不受纠错数据影响，说明模型偏好
-`from X import Y` 这个通用 Python 模式，数据量不够无法翻转。
+**Conclusion: negative-example strategy is essentially whack-a-mole — eliminate one known hallucination, model invents a new one.**
+`from flydsl.expr import fx` (17×) completely unaffected by correction data, showing model preference for
+the generic Python pattern `from X import Y`; insufficient data volume to flip the preference.
 
-### 策略转向 (v5e)
+### Strategy Pivot (v5e)
 
-不再增加负例（无底洞），改为大幅提升正确 kernel 代码的占比：
-- 提取 247 个去重正确 kernel，各 3 种 prompt 变体 → +741 条
-- 8 个 mini-kernel 模板 ×5 → +40 条（短而精准，聚焦正确 import）
-- flyc 边界 QA ×3 → +6 条
-- 正确 kernel 比例：35% → **52%**
+Stop adding negative examples (bottomless pit); instead greatly increase correct kernel code share:
+- Extract 247 deduplicated correct kernels, 3 prompt variants each → +741 samples
+- 8 mini-kernel templates ×5 → +40 samples (short and precise, focused on correct imports)
+- flyc boundary QA ×3 → +6 samples
+- Correct kernel ratio: 35% → **52%**
 
-脚本: `experiments/flydsl-agent/dataprocess/boost_correct_kernels.py`
+Script: `experiments/flydsl-agent/dataprocess/boost_correct_kernels.py`
 
 ---
 
-## 各版本关键教训
+## Key Lessons by Version
 
-| 版本 | 教训 |
+| Version | Lesson |
 |------|------|
-| v1 | 训练数据的内容比例直接决定模型能力方向 |
-| v2 | LoRA rank 和 seq_length 是硬约束，不够就是不够 |
-| v3 | 模型能学会概念但不一定学会正确的调用路径 — 需要专门的纠错数据 |
-| v4 | 错误数据比没有数据更有害 — 76% 错配数据教会了模型不可能的代码模式 |
-| v4 | 清洗后数据量减半导致高级能力退化 — 需要用正确数据补回 |
-| v5 | 幻觉分层次：v3 修了一级 import 路径，v5 发现还有二级 API 名幻觉 |
-| v5 | 模块结构知识无法从代码示例中隐式学会——需要显式的链条导航教学 |
-| v5b | Import 链条导航数据直接有效——沙箱通过率 0%→4.7%，证明显式教模块结构可行 |
-| v5b | 幻觉是长尾问题——修一批旧的（Expr/dtypes）会冒出新的（expr.types/expr.ops） |
-| v5b | 语法错误中 66% 是后处理问题，可以在代码层面修复不需要重训 |
-| v5c | 模块结构摘要让沙箱编译率翻倍 (4.7%→10.4%)，但幻觉是无底洞 |
-| v5c | 核心 import 模式 (`import X as Y` vs `from X import Y`) 需要大量重复正例来覆盖 |
-| v5d | 负例策略是打地鼠——消灭旧幻觉(kernel_context)，冒出新幻觉(flyc.load/barrier) |
-| v5d | `from flydsl.expr import fx` 顽固不变——模型偏好通用 Python 模式，需用正例洪水翻转 |
-| **v5e** | **正例洪水有效——kernel 比例 35%→52% 让沙箱编译率从 9.9% 翻倍到 21.9%** |
-| **v5e** | **`from flydsl.expr import fx` 仍顽固 (17次)，但已证明这些候选即使修了 import 也全因其他幻觉失败——SFT 到此天花板** |
-| **v5e** | **21.9% 沙箱通过率为 RFT 提供充足正向信号，SFT 阶段完成** |
+| v1 | Training data content ratio directly determines model capability direction |
+| v2 | LoRA rank and seq_length are hard constraints — insufficient means insufficient |
+| v3 | Model can learn concepts but not necessarily correct call paths — need dedicated correction data |
+| v4 | Wrong data is more harmful than no data — 76% mismatch data taught impossible code patterns |
+| v4 | After cleaning, dataset halved causing advanced capability regression — need to replenish with correct data |
+| v5 | Hallucinations are layered: v3 fixed level-1 import paths, v5 found level-2 API name hallucinations |
+| v5 | Module structure knowledge can't be learned implicitly from code examples — need explicit chain navigation teaching |
+| v5b | Import chain navigation data directly effective — sandbox pass rate 0%→4.7%, proves explicit module structure teaching works |
+| v5b | Hallucinations are a long-tail problem — fixing old ones (Expr/dtypes) spawns new ones (expr.types/expr.ops) |
+| v5b | 66% of syntax errors are post-processing issues, fixable at code level without retrain |
+| v5c | Module structure digest doubled sandbox compile rate (4.7%→10.4%), but hallucinations are bottomless |
+| v5c | Core import pattern (`import X as Y` vs `from X import Y`) needs heavy positive-example repetition to override |
+| v5d | Negative-example strategy is whack-a-mole — eliminate old hallucinations (kernel_context), new ones emerge (flyc.load/barrier) |
+| v5d | `from flydsl.expr import fx` stubbornly unchanged — model prefers generic Python pattern, need positive-example flooding to flip |
+| **v5e** | **Positive-example flooding works — kernel ratio 35%→52% doubled sandbox compile rate from 9.9% to 21.9%** |
+| **v5e** | **`from flydsl.expr import fx` still stubborn (17×), but verified: even if import fixed, all fail on other hallucinations — SFT ceiling reached** |
+| **v5e** | **21.9% sandbox pass rate provides sufficient positive signal for RFT; SFT phase complete** |
 
 ---
 
-## v5e: 正例洪水策略 — SFT 阶段最终版
+## v5e: Positive-Example Flooding Strategy — Final SFT Version
 
-### 改进
+### Improvements
 
-策略转变：从穷举负例（打地鼠）转为大幅增加正确 kernel 代码占比。
+Strategy shift: from exhaustive negative examples (whack-a-mole) to greatly increasing correct kernel code share.
 
-1. **+741 条 boosted kernel** — 247 个去重正确 kernel ×3 种 prompt 变体
-2. **+40 条 mini-kernel** — 8 个精简模板 ×5 重复（聚焦正确 import block）
-3. **+6 条 flyc 边界 QA** — 明确 flyc 只有 kernel/jit/compile
-4. **+270 条模块摘要** — 沿用 v5d 的完整负例列表 + QA
+1. **+741 boosted kernels** — 247 deduplicated correct kernels ×3 prompt variants
+2. **+40 mini-kernels** — 8 compact templates ×5 repeats (focused on correct import block)
+3. **+6 flyc boundary QA** — explicitly flyc only has kernel/jit/compile
+4. **+270 module digest** — reuse v5d full negative list + QA
 
-数据集：2832 (v5b base) + 787 (boost) + 270 (module digest) = **3889 条**
-正确 kernel 比例：35% → **52%**
+Dataset: 2832 (v5b base) + 787 (boost) + 270 (module digest) = **3889 samples**
+Correct kernel ratio: 35% → **52%**
 
-### Benchmark 结果
+### Benchmark Results
 
-| 指标 | v5b | v5c | v5d | **v5e** | Target |
+| Metric | v5b | v5c | v5d | **v5e** | Target |
 |------|------|------|------|---------|--------|
 | L1 | 100% | 100% | — | **100%** | 90% ✅ |
 | L2 | 100% | 100% | — | **100%** | 85% ✅ |
 | L3 | 76% | 80% | — | **72%** | 70% ✅ |
-| L4 | 51% | 43% | — | **49%** | 50% ❌ (差1%) |
+| L4 | 51% | 43% | — | **49%** | 50% ❌ (1% short) |
 | L5 | 55% | 45% | — | **50%** | 20% ✅ |
 | **Overall** | **76.5%** | **73.6%** | — | **74.1%** | **60% ✅** |
 
-### 沙箱编译: 9.9% → 21.9% (42/192)
+### Sandbox Compile: 9.9% → 21.9% (42/192)
 
-**沙箱编译率翻倍再翻倍！** 覆盖 **11/12 算子**：
+**Sandbox compile rate doubled again!** Covers **11/12 operators**:
 
-| 算子 | v5c | v5d | **v5e** |
+| Operator | v5c | v5d | **v5e** |
 |------|-----|-----|---------|
 | mla | 2 | 1 | **6** |
 | moe | 2 | 1 | **5** |
@@ -718,61 +718,61 @@ L3 提升至 80%，但 L4/L5 退化。模块摘要数据可能稀释了高级 ke
 | flash_attn | 3 | 1 | **2** |
 | quant | 0 | 1 | **1** |
 | paged_attn | 3 | 2 | **0** |
-| **总计** | **20** | **19** | **42** |
+| **Total** | **20** | **19** | **42** |
 
-### 剩余错误分析
+### Remaining Error Analysis
 
 ```
-192 候选分布:
-  静态通过:    134 (69.8%)  ← 比 v5d (124) 改善
-  沙箱通过:     42 (21.9%)  ← v5d (19) 的 2.2 倍
-  沙箱失败:     92 (47.9%)
+192 candidate distribution:
+  Static pass:    134 (69.8%)  ← improved vs v5d (124)
+  Sandbox pass:     42 (21.9%)  ← 2.2× v5d (19)
+  Sandbox fail:     92 (47.9%)
 
-顽固 import 模式 (v5c/v5d/v5e 均为 17 次):
-  from flydsl.expr import fx: 17 次
-  → 已验证: 即使修了这行，这 17 个候选全部因后续幻觉 (import rocdl / import arith 等) 失败
-  → 结论: 不值得继续在 SFT 层面修复
+Stubborn import pattern (17× in v5c/v5d/v5e):
+  from flydsl.expr import fx: 17×
+  → Verified: even if this line is fixed, all 17 candidates fail on subsequent hallucinations (import rocdl / import arith etc.)
+  → Conclusion: not worth continuing to fix at SFT level
 
-flyc 属性幻觉 (新一批):
+flyc attribute hallucinations (new batch):
   flyc.Stage: 13, flyc.SmemAllocator: 12, flyc.stage: 7
   flyc.if_: 6, flyc.build: 5, flyc.launch: 3
-  → 打地鼠效应继续：旧的 (kernel_context/load) 消灭，新的 (Stage/if_) 冒出
+  → Whack-a-mole continues: old ones (kernel_context/load) eliminated, new ones (Stage/if_) emerge
 ```
 
-### SFT 阶段结论
+### SFT Phase Conclusion
 
-**SFT 阶段到此完成**。关键数据点：
-- Overall 74.1%（稳定在 73-76% 区间，继续 SFT 迭代收益递减）
-- 沙箱编译 21.9%（超过 10% 目标的 2 倍，为 RFT 提供充足正向信号）
-- 11/12 算子覆盖
-- 幻觉问题已触及 SFT 天花板——需要 RL（编译反馈）来进一步突破
+**SFT phase complete here.** Key data points:
+- Overall 74.1% (stable in 73-76% range; diminishing returns from further SFT iteration)
+- Sandbox compile 21.9% (2× the 10% target, sufficient positive signal for RFT)
+- 11/12 operator coverage
+- Hallucination problem hit SFT ceiling — need RL (compile feedback) to break through further
 
-**下一步**: 转入 RL 阶段 (RFT → DAPO)
-- Stage A: 用 v5e 模型生成 N=16 候选 → 沙箱验证 → diversity-preserving RFT
-- Stage B: Single-Turn DAPO (编译/正确性 reward)
-- Stage C: Multi-Turn DAPO + PrimeEcho (性能优化)
+**Next step**: transition to RL phase (RFT → DAPO)
+- Stage A: use v5e model to generate N=16 candidates → sandbox verify → diversity-preserving RFT
+- Stage B: Single-Turn DAPO (compile/correctness reward)
+- Stage C: Multi-Turn DAPO + PrimeEcho (performance optimization)
 
-脚本: `experiments/flydsl-agent/dataprocess/boost_correct_kernels.py`
+Script: `experiments/flydsl-agent/dataprocess/boost_correct_kernels.py`
 
-## 文件清单
+## File Inventory
 
-| 文件 | 说明 |
+| File | Description |
 |------|------|
-| `sft/eval_sft.py` | 25 题 5 级 benchmark |
-| `sft/train_sft.py` | FSDP2 SFT 训练器 |
-| `sft/dataset.py` | SFT 数据集 + answer-only loss masking |
-| `sft/config_sft.sh` | 训练超参配置 |
-| `sft/run_sft.sh` | Docker 训练启动脚本 |
-| `cpt/export_hf.py` | DCP→HF 格式导出 |
-| `dataprocess/enhance_sft_data.py` | v2: kernel 提取 + 重采样 |
-| `dataprocess/fix_import_sft.py` | v3: import 纠错数据 |
-| `dataprocess/clean_hw_features.py` | v4: hw-feature 错配清洗 |
-| `dataprocess/enhance_sft_v5.py` | v5: gfx950 kernel + no-markdown + API 纠正 |
-| `dataprocess/add_gluon_tutorials.py` | v5: Gluon GEMM 教程 |
-| `dataprocess/fix_import_chain.py` | v5b: import 链条导航 |
-| `dataprocess/fix_api_hallucination.py` | v5b: API 参考 + 幻觉纠错 |
-| `dataprocess/add_module_digest.py` | v5c/v5d: 完整模块结构摘要 (30 模块) |
-| `dataprocess/boost_correct_kernels.py` | v5e: 正例洪水 (247 kernel ×3 + 8 mini ×5) |
-| `rft-stage1/generate_candidates.py` | RFT 候选生成器 |
-| `rft-stage1/verify_candidates.py` | 沙箱验证器 |
-| `sandbox/Dockerfile` | FlyDSL-Gym 沙箱 |
+| `sft/eval_sft.py` | 25-question 5-level benchmark |
+| `sft/train_sft.py` | FSDP2 SFT trainer |
+| `sft/dataset.py` | SFT dataset + answer-only loss masking |
+| `sft/config_sft.sh` | training hyperparameter config |
+| `sft/run_sft.sh` | Docker training launch script |
+| `cpt/export_hf.py` | DCP→HF format export |
+| `dataprocess/enhance_sft_data.py` | v2: kernel extraction + resampling |
+| `dataprocess/fix_import_sft.py` | v3: import correction data |
+| `dataprocess/clean_hw_features.py` | v4: hw-feature mismatch cleaning |
+| `dataprocess/enhance_sft_v5.py` | v5: gfx950 kernel + no-markdown + API correction |
+| `dataprocess/add_gluon_tutorials.py` | v5: Gluon GEMM tutorials |
+| `dataprocess/fix_import_chain.py` | v5b: import chain navigation |
+| `dataprocess/fix_api_hallucination.py` | v5b: API reference + hallucination correction |
+| `dataprocess/add_module_digest.py` | v5c/v5d: full module structure digest (30 modules) |
+| `dataprocess/boost_correct_kernels.py` | v5e: positive-example flooding (247 kernel ×3 + 8 mini ×5) |
+| `rft-stage1/generate_candidates.py` | RFT candidate generator |
+| `rft-stage1/verify_candidates.py` | sandbox verifier |
+| `sandbox/Dockerfile` | FlyDSL-Gym sandbox |

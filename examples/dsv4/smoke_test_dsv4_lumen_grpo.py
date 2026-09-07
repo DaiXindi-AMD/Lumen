@@ -96,11 +96,6 @@ def _runtime_env_json() -> str:
         "HIP_VISIBLE_DEVICES": os.environ.get("HIP_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7"),
         "RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES": "1",
         "LUMEN_DIR": str(LUMEN_DIR),
-        "V4_SPARSE_MLA_BACKEND": os.environ.get("V4_SPARSE_MLA_BACKEND", "triton"),
-        "MHC_BACKEND": os.environ.get("MHC_BACKEND", "triton"),
-        "V4_INDEXER_IMPL": os.environ.get("V4_INDEXER_IMPL", "tilelang"),
-        "V4_INDEXER_BLOCK_N": os.environ.get("V4_INDEXER_BLOCK_N", "64"),
-        "V4_INDEXER_NUM_STAGES": os.environ.get("V4_INDEXER_NUM_STAGES", "1"),
     }
     return json.dumps(payload)
 

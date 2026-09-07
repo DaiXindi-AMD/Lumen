@@ -3,29 +3,24 @@
 set -euo pipefail
 
 BOOTSTRAP_DIR="${BOOTSTRAP_DIR:-/bootstrap}"
-MILES_DIR="${MILES_DIR:-/workspace/miles}"
 LUMEN_DIR="${LUMEN_DIR:-/workspace/Lumen}"
-AITER_ROOT="${AITER_ROOT:-${LUMEN_DIR}/third_party/aiter}"
-TILEKERNELS_DIR="${TILEKERNELS_DIR:-}"
+AITER_DIR="${AITER_DIR:-/workspace/aiter}"
 WRITABLE_ROOT="${WRITABLE_ROOT:-/tmp/lumen-dsv4-runtime}"
-LUMEN_DSV4_PRETRAIN="${LUMEN_DSV4_PRETRAIN:-0}"
 LUMEN_DSV4_NATIVE_FINETUNE="${LUMEN_DSV4_NATIVE_FINETUNE:-0}"
+LUMEN_DSV4_PRETRAIN="${LUMEN_DSV4_PRETRAIN:-0}"
+MILES_DIR="${MILES_DIR:-/workspace/miles}"
 
-# Native Megatron pretrain or torchrun GRPO finetune — no Ray / SGLang / Miles requirements.txt.
 _dsv4_megatron_only=0
-if [[ "${LUMEN_DSV4_PRETRAIN}" == "1" || "${LUMEN_DSV4_NATIVE_FINETUNE}" == "1" ]]; then
+if [[ "${LUMEN_DSV4_NATIVE_FINETUNE}" == "1" || "${LUMEN_DSV4_PRETRAIN}" == "1" ]]; then
     _dsv4_megatron_only=1
 fi
 
 export MEGATRON_PATH="${MEGATRON_PATH:-${BOOTSTRAP_DIR}/Megatron-LM}"
-export MILES_SCRIPT_MEGATRON_PATH="${MEGATRON_PATH}"
 
 mkdir -p "${WRITABLE_ROOT}"
 
-# Writable copy of bootstrap site-packages (bootstrap mount is read-only).
-# Skip when image pre-staged at ${WRITABLE_ROOT}/site-packages (lumen/dsv4-lumen:mi308x).
 SITE_PKGS="${SITE_PKGS:-${WRITABLE_ROOT}/site-packages}"
-if [[ ! -d "${SITE_PKGS}/tile_kernels" ]]; then
+if [[ ! -d "${SITE_PKGS}" ]]; then
     echo "[bootstrap_env] copying site-packages -> ${SITE_PKGS} (no TE)"
     rm -rf "${SITE_PKGS}"
     mkdir -p "${SITE_PKGS}"
@@ -44,37 +39,17 @@ if [[ ! -d "${SITE_PKGS}/tile_kernels" ]]; then
 fi
 export SITE_PKGS
 
-# Disable Megatron torch.compile before fusion modules import (Lumen triton != Miles).
 if [[ ! -f "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" ]]; then
     cat > "${SITE_PKGS}/lumen_dsv4_bootstrap.pth" <<'PY'
+import os
+
 import megatron.core.jit as _jit
 _jit.disable_jit_fuser()
 PY
 fi
 
-# tilelang + sglang: use PYTHONPATH only (avoid editable pip build on ro mount).
-TILELANG_ROOT="${TILELANG_ROOT:-${WRITABLE_ROOT}/tilelang}"
-if [[ ! -f "${TILELANG_ROOT}/tilelang/__init__.py" ]]; then
-    echo "[bootstrap_env] copying tilelang -> ${TILELANG_ROOT}"
-    rm -rf "${TILELANG_ROOT}"
-    cp -a "${BOOTSTRAP_DIR}/tilelang" "${TILELANG_ROOT}"
-    # Dev layout: built libs under ${TILELANG_ROOT}/build/lib. Nested 3rdparty under
-    # tilelang/tilelang/ makes env.py pick the wrong (empty) lib path.
-    if [[ -d "${TILELANG_ROOT}/build/lib" && -d "${TILELANG_ROOT}/tilelang/3rdparty" ]]; then
-        rm -rf "${TILELANG_ROOT}/tilelang/3rdparty"
-    fi
-fi
-
-SGLANG_ROOT="${SGLANG_ROOT:-${WRITABLE_ROOT}/sglang-python}"
-if [[ "${_dsv4_megatron_only}" != "1" ]]; then
-    if [[ ! -f "${SGLANG_ROOT}/sglang/__init__.py" ]]; then
-        echo "[bootstrap_env] copying sglang -> ${SGLANG_ROOT}"
-        rm -rf "${SGLANG_ROOT}"
-        cp -a "${BOOTSTRAP_DIR}/sglang-python" "${SGLANG_ROOT}"
-    fi
-fi
-
 if [[ "${_dsv4_megatron_only}" == "1" ]]; then
+    echo "[bootstrap_env] megatron-only path (native GRPO finetune)"
     if [[ -d "${MILES_DIR}" ]] && ! python -c "import miles" 2>/dev/null; then
         echo "[bootstrap_env] installing miles (no-deps, for Megatron router hook) ..."
         pip install -e "${MILES_DIR}" --no-deps -q
@@ -83,9 +58,44 @@ if [[ "${_dsv4_megatron_only}" == "1" ]]; then
         echo "[bootstrap_env] installing backports.strenum for Miles convert helper ..."
         pip install backports.strenum -q
     fi
-    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}:${MEGATRON_PATH}:${SITE_PKGS}:${TILELANG_ROOT}:${PYTHONPATH:-}"
 else
-    export PYTHONPATH="${MILES_DIR}:${LUMEN_DIR}:${AITER_ROOT}:${MEGATRON_PATH}:${SITE_PKGS}:${SGLANG_ROOT}:${TILELANG_ROOT}:${PYTHONPATH:-}"
+    echo "[bootstrap_env] WARN: set LUMEN_DSV4_NATIVE_FINETUNE=1"
+fi
+
+_dsv4_prepend_pythonpath() {
+    local dir="$1"
+    if [[ -n "${dir}" && -d "${dir}" ]]; then
+        export PYTHONPATH="${dir}:${PYTHONPATH:-}"
+    fi
+}
+
+# FP8 QAT uses tile_kernels.quant (TileLang JIT) from the runtime environment.
+_dsv4_resolve_tilelang_dir() {
+    if [[ -n "${TILELANG_DIR:-}" && -d "${TILELANG_DIR}/tilelang" ]]; then
+        return
+    fi
+    for candidate in \
+        "${TILELANG_DIR:-}" \
+        "${DATA_ROOT:-}/tilelang" \
+        "${BOOTSTRAP_DIR}/tilelang" \
+        "${WRITABLE_ROOT}/tilelang" \
+        "/opt/dsv4-runtime/tilelang" \
+        "/opt/dsv4-bootstrap/tilelang"; do
+        if [[ -n "${candidate}" && -d "${candidate}/tilelang" ]]; then
+            TILELANG_DIR="${candidate}"
+            export TILELANG_DIR
+            echo "[bootstrap_env] TILELANG_DIR=${TILELANG_DIR}"
+            return
+        fi
+    done
+}
+_dsv4_resolve_tilelang_dir
+_dsv4_prepend_pythonpath "${PYTHON_EXTRAS_DIR:-}"
+_dsv4_prepend_pythonpath "${TILELANG_DIR:-}"
+
+export PYTHONPATH="${LUMEN_DIR}:${AITER_DIR}:${MEGATRON_PATH}:${SITE_PKGS}:${PYTHONPATH:-}"
+if [[ "${_dsv4_megatron_only}" == "1" && -d "${MILES_DIR}" ]]; then
+    export PYTHONPATH="${MILES_DIR}:${PYTHONPATH}"
 fi
 
 NATIVE_LIBS="${BOOTSTRAP_DIR}/native-libs"
@@ -93,34 +103,14 @@ if [[ -d "${NATIVE_LIBS}" ]]; then
     export LD_LIBRARY_PATH="${NATIVE_LIBS}:${LD_LIBRARY_PATH:-}"
 fi
 
-# mooncake engine.so needs libglog (present in Miles image, not always in lumen/tests:latest).
 if ! ldconfig -p 2>/dev/null | grep -q 'libglog.so.0'; then
-    echo "[bootstrap_env] installing libgoogle-glog0v5 for mooncake..."
+    echo "[bootstrap_env] installing libgoogle-glog0v5 (Megatron fused CE)..."
     apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq libgoogle-glog0v5 >/dev/null
 fi
 
-echo "[bootstrap_env] MEGATRON_PATH=${MEGATRON_PATH}"
+echo "[bootstrap_env] MEGATRON_PATH=${MEGATRON_PATH} (ROCm rocm_dev @ ${MEGATRON_ROCM_REF:-see dsv4_paths.sh})"
 
-# Miles + SGLang stack (Ray train.py / live rollout). Skip on megatron-only paths.
-if [[ "${_dsv4_megatron_only}" != "1" ]]; then
-    if ! python -c "import ray" 2>/dev/null; then
-        echo "[bootstrap_env] installing miles python deps..."
-        grep -vE 'nvidia-resiliency-ext|torchft-nightly' "${MILES_DIR}/requirements.txt" \
-            | pip install -r /dev/stdin -q
-    fi
-
-    if ! python -c "import miles" 2>/dev/null; then
-        pip install -e "${MILES_DIR}" --no-deps -q
-    fi
-
-    echo "[bootstrap_env] installing bootstrap runtime deps..."
-    pip install -r "${LUMEN_DIR}/examples/dsv4/requirements-bootstrap.txt" -q
-else
-    echo "[bootstrap_env] skip miles python deps (megatron-only: pretrain or native finetune)"
-fi
-
-# MORI EP: host mount replaces image-built libmori_pybinds.so — restore or rebuild.
 if [[ "${LUMEN_DSV4_MOE_MORI:-0}" == "1" ]]; then
     MORI_PKG="${LUMEN_DIR}/third_party/mori/python/mori"
     MORI_CACHE=""
@@ -146,30 +136,37 @@ if [[ "${LUMEN_DSV4_MOE_MORI:-0}" == "1" ]]; then
     fi
 fi
 
-# Local TileKernels mHC: rsync onto bootstrap site-packages. Do NOT put the dev tree on
-# PYTHONPATH — dev tile_kernels/__init__.py eagerly imports engram kernels that require
-# a newer tilelang PassConfigKey than the bootstrap image provides.
-if [[ -n "${TILEKERNELS_DIR:-}" && -d "${TILEKERNELS_DIR}/tile_kernels/mhc" && -n "${SITE_PKGS:-}" ]]; then
-    _tk_dest="${SITE_PKGS}/tile_kernels"
-    echo "[bootstrap_env] overlay local mHC: ${TILEKERNELS_DIR}/tile_kernels -> ${_tk_dest}"
-    mkdir -p "${_tk_dest}/mhc" "${_tk_dest}/modeling/mhc"
-    rsync -a "${TILEKERNELS_DIR}/tile_kernels/mhc/" "${_tk_dest}/mhc/"
-    rsync -a "${TILEKERNELS_DIR}/tile_kernels/modeling/mhc/" "${_tk_dest}/modeling/mhc/"
-fi
-
 python - <<'PY'
 import importlib
 import os
 
-required = ["tile_kernels", "megatron.core", "tilelang"]
-optional = ["transformer_engine", "fast_hadamard_transform"]
-_megatron_only = os.environ.get("LUMEN_DSV4_PRETRAIN", "0") == "1" or os.environ.get(
-    "LUMEN_DSV4_NATIVE_FINETUNE", "0"
-) == "1"
-if _megatron_only:
-    required = ["miles", *required]
+required = ["megatron.core"]
+if os.environ.get("LUMEN_DSV4_LINEAR_FP8", "0") == "1":
+    required.append("tile_kernels")  # QAT-only dependency; MHC uses AIter.
+if os.environ.get("LUMEN_DSV4_NATIVE_FINETUNE", "0") == "1" or os.environ.get("LUMEN_DSV4_PRETRAIN", "0") == "1":
+    if os.path.isdir(os.environ.get("MILES_DIR", "/workspace/miles")):
+        required.append("miles")
+_indexer_impl = os.environ.get("V4_INDEXER_IMPL", "aiter").lower()
+if _indexer_impl == "aiter":
+    try:
+        import aiter.ops.triton.attention.dsv4_indexer  # noqa: F401
+
+        print("[bootstrap_env] OK aiter dsv4_indexer (V4_INDEXER_IMPL=aiter)")
+    except Exception as e:
+        print(f"[bootstrap_env] FAIL aiter dsv4_indexer: {e}")
+        raise SystemExit(1)
+elif _indexer_impl == "tilelang":
+    try:
+        import tilelang  # noqa: F401
+
+        print("[bootstrap_env] OK tilelang (V4_INDEXER_IMPL=tilelang)")
+    except Exception as e:
+        print(f"[bootstrap_env] FAIL tilelang: {e}")
+        raise SystemExit(1)
 else:
-    required = ["ray", "miles", "sglang", *required]
+    print(f"[bootstrap_env] FAIL V4_INDEXER_IMPL={_indexer_impl} (use aiter or tilelang)")
+    raise SystemExit(1)
+optional = ["transformer_engine", "fast_hadamard_transform"]
 if os.environ.get("LUMEN_DSV4_MOE_MORI", "0") == "1":
     required.append("mori")
 
@@ -191,22 +188,25 @@ for m in optional:
 if os.environ.get("V4_SPARSE_MLA_BACKEND", "triton").lower() == "triton":
     try:
         from aiter.ops.triton.attention.sparse_mla_dsv4_train import sparse_mla_dsv4_train
-        from lumen.models.dsv4.ops.kernel.triton_sparse_mla import sparse_attn_triton
+        from lumen.kernels.dsv4.sparse_mla.triton_sparse_mla import sparse_attn_triton
 
         print(f"[bootstrap_env] OK sparse MLA triton: {sparse_mla_dsv4_train.__name__} -> {sparse_attn_triton.__name__}")
     except Exception as e:
         print(f"[bootstrap_env] FAIL sparse MLA triton: {e}")
         raise SystemExit(1)
 
-_mhc_backend = os.environ.get("MHC_BACKEND", "triton").lower()
 try:
-    import tile_kernels
+    from aiter.ops.triton.fusions.mhc import mhc_head_dsv4, mhc_post_dsv4, mhc_pre_dsv4
 
-    print(f"[bootstrap_env] tile_kernels: {tile_kernels.__file__}")
-    from lumen.models.dsv4.ops.mhc_backend import log_mhc_backend
-
-    print(f"[bootstrap_env] OK MHC backend={log_mhc_backend()} (MHC_BACKEND={_mhc_backend})")
+    print(
+        "[bootstrap_env] OK AIter DSV4 MHC: "
+        f"{mhc_pre_dsv4.__name__}, {mhc_post_dsv4.__name__}, {mhc_head_dsv4.__name__}"
+    )
 except Exception as e:
-    print(f"[bootstrap_env] FAIL MHC/tile_kernels: {e}")
+    print(f"[bootstrap_env] FAIL AIter DSV4 MHC: {e}")
     raise SystemExit(1)
+
+_gemm_bf16 = os.environ.get("LUMEN_DSV4_GEMM_BF16", "1")
+_gemm_csv = os.environ.get("AITER_CONFIG_GEMM_BF16", "")
+print(f"[bootstrap_env] GEMM BF16: LUMEN_DSV4_GEMM_BF16={_gemm_bf16} AITER_CONFIG_GEMM_BF16={_gemm_csv}")
 PY

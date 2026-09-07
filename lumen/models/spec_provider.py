@@ -33,14 +33,15 @@ class _LumenNorm:
 
     def __new__(cls, config, hidden_size, eps=1e-6, **kwargs):
         norm_type = getattr(config, "normalization", "LayerNorm")
+        sequence_parallel = bool(getattr(config, "sequence_parallel", False))
         if norm_type == "RMSNorm":
             from lumen.ops.normalization import LumenRMSNorm
 
-            return LumenRMSNorm(hidden_size, eps=eps)
+            return LumenRMSNorm(hidden_size, eps=eps, sequence_parallel=sequence_parallel)
         else:
             from lumen.ops.normalization import LumenLayerNorm
 
-            return LumenLayerNorm(hidden_size, eps=eps)
+            return LumenLayerNorm(hidden_size, eps=eps, sequence_parallel=sequence_parallel)
 
 
 class LumenSpecProvider(BackendSpecProvider):

@@ -1,242 +1,247 @@
-# DSV4 Flash 全模型 Runbook（p14 + p38，MI308X）
+# DSV4 Flash Full-Model Runbook (2-node MI308X)
 
-操作手册：在 **p14（head）+ p38（worker）** 双节点 16 GPU 上跑 Lumen native GRPO full finetune（43 层）。详细脚本说明见 [README.md](./README.md)。
-
----
-
-## 1. 集群与环境
-
-| 节点 | Hostname | IP | 角色 |
-|------|----------|-----|------|
-| p14 | `banff-ccs-aus-p20-14` | `10.194.132.29` | head（`NODE_RANK=0`） |
-| p38 | `banff-ccs-aus-p20-38` | `10.194.132.28` | worker（`NODE_RANK=1`） |
-
-| 项目 | 值 |
-|------|-----|
-| Docker 镜像 | `lumen/dsv4-lumen:mi308x` |
-| SSH key | `~/.ssh/id_ed25519_conductor` |
-| 并行 | TP=4, PP=4, EP=4（11+11+11+10 层） |
-| 网络 | `NCCL_SOCKET_IFNAME=ens14np0`, `GLOO_SOCKET_IFNAME=ens14np0` |
-
-**p38 上还需**：`~/Lumen`、`~/miles`、`~/TileKernels`（与 p14 同步）。
+Operations guide for Lumen native GRPO full finetune (43 layers) on a **head + worker** dual-node 16-GPU cluster. Script details: [README.md](./README.md).
 
 ---
 
-## 2. 路径（NFS）
+## 1. Cluster and environment
 
-默认由 `dsv4_paths.sh` 解析（`DATA_ROOT=/nfs/data/leiwu`）：
+| Item | Description |
+|------|-------------|
+| Head | `NODE_RANK=0`, IP = `${MASTER_ADDR}` |
+| Worker | `NODE_RANK=1`, SSH = `${WORKER_SSH}` |
+| Docker image | `lumen/dsv4-lumen:mi308x` |
+| Parallelism | TP=4, PP=4, EP=4 (11+11+11+10 layers) |
+| Network | Set `NCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` per cluster (MI308X Banff often uses `ens14np0`) |
+| NCCL workaround | `NCCL_IB_GDR_LEVEL=0`, `NCCL_NET_GDR_LEVEL=LOC`, `MEGATRON_NO_BATCH_P2P_COMM=1` |
 
-| 用途 | 宿主机路径 | 容器内路径 |
-|------|-----------|-----------|
-| 模型目录 | `/nfs/data/leiwu/models` | `/root/models` |
-| 日志目录 | `/nfs/data/leiwu/logs` | — |
-| Lumen 代码 | `~/Lumen` | `/workspace/Lumen` |
+**On worker:** AIter under `${LUMEN_DIR}` and `/workspace/aiter` must match head.
 
-### 2.1 预训练 checkpoint（finetune **加载**）
+### 1.1 Local checkpoints (recommended; default launch example)
 
-| 路径 | 说明 |
-|------|------|
-| `/nfs/data/leiwu/models/DeepSeek-V4-Flash-FP8_torch_dist` | 主 checkpoint（torch_dist） |
-| `/nfs/data/leiwu/models/DeepSeek-V4-Flash-FP8_torch_dist_hc4` | fallback（主路径不存在时） |
+Head/worker use checkpoints on local NVMe (**do not** load the 532GB dist ckpt from NFS — init will be extremely slow):
 
-容器内等价：`/root/models/DeepSeek-V4-Flash-FP8_torch_dist`  
-校验：`latest_checkpointed_iteration.txt` 存在即可。
+| Node | Launch variable | Example |
+|------|-----------------|---------|
+| head | `MODEL_DIR` | `/data1/${USER}/models` |
+| worker | `WORKER_MODEL_DIR` | `/mnt/nvme0n1/${USER}/models` |
 
-### 2.2 GRPO rollout 数据
+Both map inside the container to `/root/models/${MODEL_NAME}_torch_dist`.
 
-| 路径 | 说明 |
-|------|------|
-| `/nfs/data/leiwu/models/fake_rollout.pt` | debug-train-only 假 rollout（256 样本，GBS=256） |
+---
 
-rank0 首次运行可自动生成；已存在则跳过。
+## 2. Paths (NFS + local)
 
-### 2.3 Finetune **输出** checkpoint
+Defaults from `dsv4_paths.sh` (`DATA_ROOT` auto-detects `/nfs/data/${USER}`, etc.):
 
-**默认不保存**。脚本未传 `--save`，`--save-interval 1000000` 等价于关闭。  
-本次 smoke 仅 `--load` 预训练权重并做 GRPO 更新，不会写回 NFS。
+| Purpose | Host path | Container path |
+|---------|-----------|----------------|
+| Model dir (**local NVMe recommended**) | head: `/data1/${USER}/models`<br>worker: `/mnt/nvme0n1/${USER}/models` | `/root/models` |
+| Dataset | `${DATA_DIR}` | `/root/datasets` |
+| Logs | `${LOG_DIR}` | — |
+| Lumen code | `${LUMEN_DIR}` | `/workspace/Lumen` |
+| **Shared rollout (dual-node, NFS)** | `${DATA_ROOT}/models/fake_rollout.pt` | Same path (`DATA_ROOT` bind-mount) |
 
-如需保存 finetune 权重，在 `dsv4_finetune_common.sh` 的 `DSV4_FINETUNE_TORCHRUN_ARGS` 中增加例如：
+If `MODEL_DIR` is unset, `dsv4_paths.sh` falls back to `${DATA_ROOT}/models` (NFS) — fine for small models or existing ckpts; **for 43L flash finetune always set local `MODEL_DIR` / `WORKER_MODEL_DIR`**.
+
+### 2.1 Pretrained checkpoint (finetune **load**)
+
+| Path | Description |
+|------|-------------|
+| `${MODEL_DIR}/${MODEL_NAME}_torch_dist` | Primary checkpoint (torch_dist) |
+| `${MODEL_DIR}/${MODEL_NAME}_torch_dist_hc${DSV4_HC_MULT}` | fallback |
+
+Verify: `latest_checkpointed_iteration.txt` exists.
+
+### 2.2 GRPO rollout data
+
+| Path | Description |
+|------|-------------|
+| `${DATA_ROOT}/models/fake_rollout.pt` | debug-train-only fake rollout (shared dual-node) |
+
+Dual-node: rank0 generates/reuses on **NFS `${DATA_ROOT}/models/`**; worker reads the same NFS rollout even if ckpt is on local NVMe. Skipped if already present.
+
+Single-node default: `/root/models/fake_rollout.pt`.
+
+### 2.3 Finetune **output** checkpoint
+
+**Not saved by default.** Scripts omit `--save`; `--save-interval 1000000` effectively disables saving.
+
+To save finetune weights, add to `DSV4_FINETUNE_TORCHRUN_ARGS` in `dsv4_finetune_common.sh`, e.g.:
 
 ```bash
 --save /root/models/DeepSeek-V4-Flash-FP8-finetune_torch_dist
 --save-interval 1
 ```
 
-（宿主机可见路径：`/nfs/data/leiwu/models/DeepSeek-V4-Flash-FP8-finetune_torch_dist`）
-
 ---
 
-## 3. 启动前检查
+## 3. Pre-launch checks
 
-### 3.1 同步代码到 p38
+### 3.1 Sync code to worker
 
-在 **p14** 执行：
+On **head**:
 
 ```bash
 rsync -az --delete \
   --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' \
   --exclude 'third_party/aiter/**/build' --exclude '.nfs*' \
-  ~/Lumen/ leiwu@10.194.132.28:~/Lumen/ \
-  -e "ssh -o BatchMode=yes -i ~/.ssh/id_ed25519_conductor -o IdentitiesOnly=yes"
+  "${LUMEN_DIR}/" "${WORKER_SSH}:${LUMEN_DIR}/" \
+  -e "ssh ${SSH_KEY:+-i ${SSH_KEY} -o IdentitiesOnly=yes} -o BatchMode=yes"
 ```
 
-### 3.2 确认 p38 8 卡空闲
+### 3.2 Confirm worker 8 GPUs are idle
 
 ```bash
-ssh -o BatchMode=yes -i ~/.ssh/id_ed25519_conductor -o IdentitiesOnly=yes \
-  leiwu@10.194.132.28 \
+ssh ${SSH_KEY:+-i ${SSH_KEY} -o IdentitiesOnly=yes} -o BatchMode=yes "${WORKER_SSH}" \
   'for i in 0 1 2 3 4 5 6 7; do echo -n "GPU$i: "; \
    rocm-smi -d $i --showmeminfo vram 2>/dev/null | grep Used; done'
 ```
 
-每张卡 Used 应约 **~300MB** 量级。若有大占用（如 VLLM ~70GB+），需先释放再跑。
-
-### 3.3 清理旧容器
+### 3.3 Clean old containers
 
 ```bash
 docker rm -f lumen-dsv4-flash-finetune-node0 lumen-dsv4-flash-finetune-node1 2>/dev/null || true
-ssh -o BatchMode=yes -i ~/.ssh/id_ed25519_conductor -o IdentitiesOnly=yes leiwu@10.194.132.28 \
+ssh ${SSH_KEY:+-i ${SSH_KEY} -o IdentitiesOnly=yes} -o BatchMode=yes "${WORKER_SSH}" \
   'docker rm -f lumen-dsv4-flash-finetune-node0 lumen-dsv4-flash-finetune-node1 2>/dev/null || true'
 ```
 
 ---
 
-## 4. 启动：DSV4 43 层 GRPO full finetune
+## 4. Launch: DSV4 43-layer GRPO full finetune
 
-在 **p14** 执行（推荐一键双节点）：
+On **head** (recommended one-shot dual-node):
 
 ```bash
-cd ~/Lumen
+cd "${LUMEN_DIR}"
 
-MASTER_ADDR=10.194.132.29 WORKER_SSH=leiwu@10.194.132.28 \
-SKIP_PREPARE=1 LOAD_CKPT=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
-V4_SPARSE_MLA_BACKEND=tilelang MHC_BACKEND=triton \
+MASTER_ADDR=<head-ip> WORKER_SSH=${USER}@<worker-ip> \
+MODEL_DIR=/data1/${USER}/models \
+WORKER_MODEL_DIR=/mnt/nvme0n1/${USER}/models \
+DATA_ROOT=/nfs/data/${USER} \
+SKIP_PREPARE=1 DSV4_HC_MULT=4 \
+V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
+NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
 HSA_OVERRIDE_GFX_VERSION=9.4.2 NCCL_SOCKET_IFNAME=ens14np0 GLOO_SOCKET_IFNAME=ens14np0 \
 IMAGE=lumen/dsv4-lumen:mi308x \
-bash examples/dsv4/launch_dsv4_flash_finetune_2node.sh
+bash examples/dsv4/launch_dsv4_2node.sh
 ```
 
-### 4.1 关键参数
+Default finetune batch: **`GBS=256`**, **`SEQ_LEN=4096`**, **`NUM_ROLLOUT=10`** (`launch_dsv4_2node.sh` / `dsv4_finetune_common.sh`).
 
-| 变量 | 默认/推荐 | 说明 |
-|------|----------|------|
-| `GBS` | `256` | 必须等于 rollout 样本数 |
+**Optional bisect smoke** (connectivity / PP debug; not default production config):
+
+```bash
+GBS=8 DSV4_KEEP_GBS=1 SEQ_LEN=512 DSV4_KEEP_SEQ_LEN=1 NUM_ROLLOUT=2 \
+ROLLOUT_N_PROMPTS=1 ROLLOUT_N_PER_PROMPT=8 SMOKE_LEGACY_FAKE_ROLLOUT=1 \
+# …same remaining env as above (MODEL_DIR / WORKER_MODEL_DIR)…
+bash examples/dsv4/launch_dsv4_2node.sh
+```
+
+### 4.1 Key parameters
+
+| Variable | Default / recommended | Description |
+|----------|----------------------|-------------|
+| `GBS` | **`256`** | Must equal rollout sample count (32×8) |
+| `SEQ_LEN` | **`4096`** | Megatron training sequence length |
+| `MBS` | `1` | micro-batch |
 | `NUM_ROLLOUT` | `10` | GRPO rollout / train iters |
-| `DSV4_HC_MULT` | `4` | MHC 乘数 |
-| `SKIP_PREPARE=1` | — | 跳过 HF→torch_dist 转换（ckpt 已在 NFS） |
-| `LOAD_CKPT=1` | — | preflight manifest 标记（finetune 必 load） |
-| `V4_SPARSE_MLA_BACKEND` | `tilelang` | 与 pretrain 成功配置一致 |
-| `MHC_BACKEND` | `triton` | 需挂载 TileKernels |
+| `DSV4_HC_MULT` | `4` | MHC multiplier |
+| `SKIP_PREPARE` | `1` (launch) | Skip HF→torch_dist conversion |
+| `MODEL_DIR` | **`/data1/${USER}/models` (head)** | Local NVMe ckpt; do not load full model from NFS |
+| `WORKER_MODEL_DIR` | **`/mnt/nvme0n1/${USER}/models`** | Worker local ckpt |
+| `DATA_ROOT` | `/nfs/data/${USER}` | Shared rollout path |
+| `V4_INDEXER_IMPL` | `aiter` | DSA indexer (aiter triton kernel) |
+| `V4_SPARSE_MLA_BACKEND` | `triton` | sparse MLA |
+| MHC | AIter | Uses AIter DSV4 fused API directly |
+| `MEGATRON_NO_BATCH_P2P_COMM` | `1` | Avoid PP P2P hang |
+| `NCCL_IB_GDR_LEVEL` | `0` | IB GDR workaround |
+| `NCCL_NET_GDR_LEVEL` | `LOC` | Works with above |
 | `OPTIMIZER_OFFLOAD_FRACTION` | `0.75` | CPU Adam offload |
+| `SSH_KEY` | — | Worker SSH private key (optional; default ssh-agent key if unset) |
 
-### 4.2 单节点手动启动（备用）
+### 4.2 Manual single-node launch (fallback)
 
-Head（p14）：
+Head:
 
 ```bash
-cd ~/Lumen
-NODE_RANK=0 MASTER_ADDR=10.194.132.29 \
-SKIP_PREPARE=1 LOAD_CKPT=1 GBS=256 NUM_ROLLOUT=10 DSV4_HC_MULT=4 \
-V4_SPARSE_MLA_BACKEND=tilelang MHC_BACKEND=triton \
+cd "${LUMEN_DIR}"
+NODE_RANK=0 MASTER_ADDR=<head-ip> \
+MODEL_DIR=/data1/${USER}/models \
+SKIP_PREPARE=1 DSV4_HC_MULT=4 \
+V4_INDEXER_IMPL=aiter V4_SPARSE_MLA_BACKEND=triton \
 OPTIMIZER_OFFLOAD_FRACTION=0.75 \
+NCCL_IB_GDR_LEVEL=0 NCCL_NET_GDR_LEVEL=LOC MEGATRON_NO_BATCH_P2P_COMM=1 \
 HSA_OVERRIDE_GFX_VERSION=9.4.2 NCCL_SOCKET_IFNAME=ens14np0 GLOO_SOCKET_IFNAME=ens14np0 \
 IMAGE=lumen/dsv4-lumen:mi308x \
-bash examples/dsv4/run_dsv4_flash_finetune.sh
+DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
 ```
 
-Worker（p38）：
+Worker:
 
 ```bash
-cd ~/Lumen
-NODE_RANK=1 MASTER_ADDR=10.194.132.29 \
-# 其余 env 与 head 相同
-bash examples/dsv4/run_dsv4_flash_finetune.sh
+cd "${LUMEN_DIR}"
+NODE_RANK=1 MASTER_ADDR=<head-ip> \
+MODEL_DIR=/mnt/nvme0n1/${USER}/models \
+# same remaining env as head (GBS/SEQ/NCCL/…)
+DSV4_PROFILE=flash bash examples/dsv4/run_dsv4.sh
 ```
 
 ---
 
-## 5. 参考：全模型 pretrain smoke（mock LM loss）
+## 5. Logs and monitoring
 
-与 finetune 不同路径，用于 kernel / 多节点连通性验证：
-
-```bash
-cd ~/Lumen
-MASTER_ADDR=10.194.132.29 WORKER_SSH=leiwu@10.194.132.28 \
-SKIP_PREPARE=1 LOAD_CKPT=1 GBS=8 TRAIN_ITERS=10 DSV4_HC_MULT=4 \
-V4_SPARSE_MLA_BACKEND=tilelang MHC_BACKEND=triton \
-OPTIMIZER_OFFLOAD_FRACTION=0.75 \
-HSA_OVERRIDE_GFX_VERSION=9.4.2 NCCL_SOCKET_IFNAME=ens14np0 GLOO_SOCKET_IFNAME=ens14np0 \
-IMAGE=lumen/dsv4-lumen:mi308x \
-bash examples/dsv4/launch_dsv4_flash_pretrain_2node.sh
-```
-
----
-
-## 6. 日志与监控
-
-| 日志 | 路径 |
-|------|------|
-| Head 训练 | `/nfs/data/leiwu/logs/lumen_dsv4_flash_finetune_node0_*.log` |
-| Worker 训练 | `/nfs/data/leiwu/logs/lumen_dsv4_flash_finetune_node1_*.log` |
-| Launch head | `/nfs/data/leiwu/logs/lumen_dsv4_flash_finetune_launch_head_*.log` |
-| Launch worker | `/nfs/data/leiwu/logs/lumen_dsv4_flash_finetune_launch_worker_*.log` |
-| Preflight | `/nfs/data/leiwu/logs/.dsv4_preflight/runs/<PREFLIGHT_ID>/` |
+| Log | Path |
+|-----|------|
+| Head training | `${LOG_DIR}/lumen_dsv4_flash_finetune_node0_*.log` |
+| Worker training | `${LOG_DIR}/lumen_dsv4_flash_finetune_node1_*.log` |
+| Launch head | `${LOG_DIR}/lumen_dsv4_flash_finetune_launch_head_*.log` |
+| Launch worker | `${LOG_DIR}/lumen_dsv4_flash_finetune_launch_worker_*.log` |
+| Preflight | `${LOG_DIR}/.dsv4_preflight/runs/<PREFLIGHT_ID>/` |
 
 ```bash
-# 实时跟踪 head
-tail -f /nfs/data/leiwu/logs/lumen_dsv4_flash_finetune_node0_*.log
-
-# 容器状态
+tail -f "${LOG_DIR}"/lumen_dsv4_flash_finetune_node0_*.log
 docker ps --filter name=lumen-dsv4-flash-finetune
-ssh ... leiwu@10.194.132.28 'docker ps --filter name=lumen-dsv4-flash-finetune'
 ```
 
-### 6.1 训练成功标志
+### 5.1 Training success indicators
 
-日志中出现 Miles 格式指标，例如：
+- `rollout/num_samples`, `train/loss`, `perf/actor_train_time`
+- Completion: `=== [done] Lumen DSV4 flash native GRPO finetune completed ===`
 
-- `rollout/num_samples`, `rollout/advantages`
-- `train/loss`, `train/pg_loss`, `train/grad_norm`
-- `perf/actor_train_time`
+### 5.2 Normal but slow phases
 
-结束时：
-
-```text
-=== [done] Lumen DSV4 Flash full-model native GRPO finetune completed ===
-```
-
-### 6.2 正常但耗时的阶段
-
-- **Checkpoint 加载**：大量 `q_norm/kv_norm ... will skip`（ckpt 无这些权重，正常）
-- **Optimizer CPU offload 初始化**：GPU 利用率接近 0，host 内存高，日志可能 **数十分钟无新行**（`DISTRIBUTED_TIMEOUT_MINUTES=180`）
+- Checkpoint load: `q_norm/kv_norm ... will skip` (requires `LUMEN_DSV4_SKIP_OPTIONAL_NORMS=1`, on by default)
+- Optimizer CPU offload init: high host memory; may see no new log lines for tens of minutes
 
 ---
 
-## 7. 故障排查
+## 6. Troubleshooting
 
-| 现象 | 原因 / 处理 |
-|------|------------|
-| `LOAD_CKPT: unbound variable` / `TRAIN_ITERS: unbound variable` | 使用最新 `preflight_dsv4_flash_multinode.sh`；launch 时设 `LOAD_CKPT=1` |
-| `ModuleNotFoundError: sglang.srt`（rollout 生成） | `prepare_dsv4_fake_rollout.py` 会 fallback；或直接使用已有 `fake_rollout.pt` |
-| p38 rank OOM（模型 init） | p38 GPU 被 VLLM 等占用；`rocm-smi --showpids` 确认并释放 |
-| NCCL hang / 配置不一致 | 两节点必须通过同一 `launch_*_2node.sh` 启动；检查 preflight manifest |
-| `NET/IB : Unable to open device mlx5_*` | 容器内 IB 不可用时的 WARN，pretrain/finetune 曾可 fallback 到 socket |
-| Worker  unreachable | Conductor SSH：p38 需在 reservation / 安全组内 |
+| Symptom | Cause / fix |
+|---------|-------------|
+| Checkpoint load extremely slow | Confirm `MODEL_DIR` / `WORKER_MODEL_DIR` point to local NVMe, not `${DATA_ROOT}/models` (NFS) |
+| `TRAIN_ITERS: unbound variable` | Use latest `preflight_dsv4_flash_multinode.sh` |
+| Missing rollout data | Confirm dual-node `FAKE_ROLLOUT_DATA=${DATA_ROOT}/models/fake_rollout.pt`; or `SMOKE_LEGACY_FAKE_ROLLOUT=1` |
+| Worker rank OOM | Worker GPUs occupied by other processes; check `rocm-smi --showpids` and free them |
+| NCCL hang / config mismatch | Launch both nodes from same `launch_dsv4_2node.sh`; preflight validates GBS/TP/NCCL |
+| `NET/IB : Unable to open device mlx5_*` | WARN when IB unavailable; may fall back to socket |
+| Worker unreachable | Check SSH key, `WORKER_SSH`, reservation / security group |
 
 ---
 
-## 8. 相关脚本
+## 7. Related scripts
 
 ```text
 examples/dsv4/
-├── runbook.md                              # 本文档
-├── launch_dsv4_flash_finetune_2node.sh     # 双节点 finetune 一键启动（推荐）
-├── run_dsv4_flash_finetune.sh              # 单节点 launcher
-├── run_dsv4_flash_finetune_inner.sh        # 容器内 torchrun GRPO
-├── finetune_dsv4_megatron.py               # Python 入口
+├── runbook.md                              # This document
+├── launch_dsv4_2node.sh                    # Dual-node finetune one-shot launch (recommended)
+├── run_dsv4.sh                             # Single-rank launcher
+├── run_dsv4_inner.sh                       # In-container torchrun GRPO
+├── finetune_dsv4_megatron.py               # Python entry point
 ├── dsv4_finetune_common.sh                 # batch / ckpt / rollout helpers
-├── prepare_dsv4_fake_rollout.py          # fake_rollout.pt
-├── preflight_dsv4_flash_multinode.sh       # 双节点配置校验
-└── dsv4_paths.sh                           # MODEL_DIR / LOG_DIR 等
+├── tools/gen_fake_rollout_data.py          # fake_rollout.pt
+├── preflight_dsv4_flash_multinode.sh       # Dual-node config validation
+└── dsv4_paths.sh                           # MODEL_DIR / LOG_DIR / etc.
 ```

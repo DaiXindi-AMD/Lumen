@@ -242,25 +242,23 @@ def _run_megatron():
         lumen_gpt_builder,
         train_valid_test_datasets_provider,
     )
-    from lumen.models.megatron import (
-        install_fp8_param_gather_hook,
-        install_fp8_param_storage_hook,
-        install_hip_graphs_hook,
-        install_mxfp4_weight_cache_hook,
-        install_val_loss_early_stop_hook,
-        make_lumen_model_provider,
-    )
+    from lumen.models.megatron import make_lumen_model_provider
+    from lumen.patches import apply_training_patches
 
     model_provider = make_lumen_model_provider(
         lumen_gpt_builder,
         lora_applier=apply_lora,
         fp8_applier=apply_fp8_training,
     )
-    install_fp8_param_gather_hook()
-    install_mxfp4_weight_cache_hook()
-    install_fp8_param_storage_hook()
-    install_hip_graphs_hook()
-    install_val_loss_early_stop_hook()
+    apply_training_patches(
+        names={
+            "fp8_param_gather_hook",
+            "mxfp4_weight_cache_hook",
+            "fp8_param_storage_hook",
+            "hip_graphs_hook",
+            "val_loss_early_stop_hook",
+        }
+    )
     _maybe_install_profiler()
     _maybe_install_amax_trace()
 

@@ -1341,20 +1341,25 @@ class TestLossFuncEarlyStop:
 
 class TestPatchCrossEntropy:
     def test_patches_idempotently(self):
+        # megatron._patch_cross_entropy is a backward-compatible alias now; the
+        # guard flag it used to own lives with install_cross_entropy in the
+        # patch registry, and megatron's copy is never written. Assert on the
+        # registry's flag so this still tests the alias rather than a leftover.
         import lumen.models.megatron as meg_mod
+        import lumen.patches.runtime.megatron_import as import_patches
 
-        orig = meg_mod._cross_entropy_patched
-        meg_mod._cross_entropy_patched = False
+        orig = import_patches._cross_entropy_patched
+        import_patches._cross_entropy_patched = False
 
         try:
-            with mock.patch("lumen.models.megatron.print_rank_0"):
+            with mock.patch("megatron.training.print_rank_0"):
                 meg_mod._patch_cross_entropy()
-                assert meg_mod._cross_entropy_patched is True
+                assert import_patches._cross_entropy_patched is True
 
                 meg_mod._patch_cross_entropy()
-                assert meg_mod._cross_entropy_patched is True
+                assert import_patches._cross_entropy_patched is True
         finally:
-            meg_mod._cross_entropy_patched = orig
+            import_patches._cross_entropy_patched = orig
 
 
 # ===================================================================

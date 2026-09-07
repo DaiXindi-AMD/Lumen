@@ -68,6 +68,12 @@ run_megatron() {
         exit 1
     }
 
+    MEGATRON_ROOT="${MEGATRON_ROOT:-${MEGATRON_PATH:-/workspace/megatron_lm}}"
+    PATCH_SCRIPT="${REPO_ROOT}/examples/dsv4/patch_megatron_source.py"
+    if [[ -f "${PATCH_SCRIPT}" && -d "${MEGATRON_ROOT}" ]]; then
+        PYTHONPATH="${REPO_ROOT}" python3 "${PATCH_SCRIPT}" "${MEGATRON_ROOT}" --tag llama
+    fi
+
     LUMEN_ATTN_BACKEND=${LUMEN_ATTN_BACKEND:-"aiter_csrc"}
     LUMEN_FP8_QUANT=${LUMEN_FP8_QUANT:-"blockwise"}
 

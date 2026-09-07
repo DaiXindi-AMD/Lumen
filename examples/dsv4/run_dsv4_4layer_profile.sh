@@ -38,8 +38,7 @@ LUMEN_RUNTIME_DIR="${LUMEN_RUNTIME_DIR:-${LOG_DIR}/lumen-dsv4-runtime}"
 CONTAINER_TMPDIR="${CONTAINER_TMPDIR:-/dev/shm/lumen-dsv4-tmp}"
 mkdir -p "${LUMEN_RUNTIME_DIR}"
 
-V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-tilelang}"
-MHC_BACKEND="${MHC_BACKEND:-tilelang}"
+V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND:-triton}"
 V4_INDEXER_IMPL="${V4_INDEXER_IMPL:-tilelang}"
 V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N:-64}"
 V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES:-1}"
@@ -83,13 +82,14 @@ echo "  DSV4 4-layer Megatron profiler"
 echo "  Image     : ${IMAGE}"
 echo "  Profile   : steps ${LUMEN_PROF_START}-${LUMEN_PROF_END} (stop after ${LUMEN_PROF_STOP_AFTER})"
 echo "  Batch     : GBS=${GBS} MBS=${MBS} seq_len=${SEQ_LEN}"
-echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=${MHC_BACKEND}"
+echo "  Kernels   : MLA=${V4_SPARSE_MLA_BACKEND} MHC=aiter"
 echo "  Results   : ${RESULTS_DIR}"
 echo "  Log       : ${LOGFILE}"
 echo "════════════════════════════════════════════════"
 
 DOCKER_MOUNTS=(
     -v "${LUMEN_DIR}:/workspace/Lumen"
+    -v "${AITER_DIR}:/workspace/aiter"
     -v "${MODEL_DIR}:/root/models"
     -v "${MODEL_DIR}/miopen-cache:/root/.config/miopen"
     -v "${TVM_CACHE_DIR}:/root/.cache/tvm-ffi"
@@ -102,15 +102,13 @@ fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_MOUNTS+=(-v "${MILES_DIR}:/workspace/miles")
 fi
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_MOUNTS+=(-v "${TILEKERNELS_DIR}:/workspace/TileKernels")
-fi
 if [[ "${USE_BOOTSTRAP}" -eq 1 && -n "${BOOTSTRAP_MOUNT}" ]]; then
     DOCKER_MOUNTS+=(-v "${BOOTSTRAP_MOUNT}:/bootstrap:ro")
 fi
 
 DOCKER_ENV=(
     -e LUMEN_DIR=/workspace/Lumen
+    -e AITER_DIR=/workspace/aiter
     -e LUMEN_DSV4_PRETRAIN=1
     -e MODEL_DIR=/root/models
     -e MODEL_NAME="${MODEL_NAME}"
@@ -123,7 +121,6 @@ DOCKER_ENV=(
     -e EVAL_ITERS=0
     -e DSV4_HC_MULT="${DSV4_HC_MULT}"
     -e V4_SPARSE_MLA_BACKEND="${V4_SPARSE_MLA_BACKEND}"
-    -e MHC_BACKEND="${MHC_BACKEND}"
     -e V4_INDEXER_IMPL="${V4_INDEXER_IMPL}"
     -e V4_INDEXER_BLOCK_N="${V4_INDEXER_BLOCK_N}"
     -e V4_INDEXER_NUM_STAGES="${V4_INDEXER_NUM_STAGES}"
@@ -137,9 +134,6 @@ DOCKER_ENV=(
     -e LUMEN_PROF_TRACE="${LUMEN_PROF_TRACE:-}"
     -e RESULTS_DIR=/workspace/Lumen/examples/dsv4/results
 )
-if [[ -d "${TILEKERNELS_DIR}" ]]; then
-    DOCKER_ENV+=(-e TILEKERNELS_DIR=/workspace/TileKernels)
-fi
 if [[ -d "${MILES_DIR}" ]]; then
     DOCKER_ENV+=(-e MILES_DIR=/workspace/miles)
 fi

@@ -1,45 +1,45 @@
-# SFT 训练过程记录
+# SFT Training Process Record
 
-## 训练决策
+## Training Decision
 
-基于 CPT 阶段的实验结论（见 `../cpt/REPORT.md`），Qwen2.5-Coder-32B 在 FlyDSL 代码上的 base PPL 已经很低 (3.5)，CPT 反而导致灾难性遗忘。因此 **跳过 CPT，直接在 base model 上做 SFT**。
+Based on the experimental conclusions from the CPT phase (see `../cpt/REPORT.md`), Qwen2.5-Coder-32B already has a very low base PPL (3.5) on FlyDSL code, and CPT instead caused catastrophic forgetting. Therefore **skip CPT and run SFT directly on the base model**.
 
-## 环境
+## Environment
 
-| 项目 | 配置 |
+| Item | Configuration |
 |------|------|
 | GPU | 8× AMD Instinct MI350X (gfx950) |
 | Base model | Qwen/Qwen2.5-Coder-32B (61GB, BF16) |
-| 框架 | PyTorch FSDP2 (`fully_shard`) + Lumen (`LumenConfig.enable()`) |
+| Framework | PyTorch FSDP2 (`fully_shard`) + Lumen (`LumenConfig.enable()`) |
 | LoRA | HuggingFace PEFT, r=32, alpha=64, dropout=0.1 |
 | Checkpoint | `torch.distributed.checkpoint` (DCP) |
-| Docker | `lumen/flydsl-cpt:latest` (复用 CPT 镜像) |
+| Docker | `lumen/flydsl-cpt:latest` (reusing CPT image) |
 
-## 数据集
+## Dataset
 
-| Split | 样本数 | 格式 |
+| Split | Samples | Format |
 |-------|--------|------|
 | Train | 2,808 | ChatML (`system` + `user` + `assistant`) |
-| Validation | 264 | 同上 |
+| Validation | 264 | Same as above |
 
-SFT 数据来源分布：
+SFT data source distribution:
 
-| 来源 | 数量 | 说明 |
+| Source | Count | Description |
 |------|------|------|
-| augmentation_hardware | 766 | 硬件适配 (gfx942↔gfx950↔gfx1250) |
-| documentation_qa | 669 | 文档问答 |
-| kernel_reverse_annotation | 388 | 代码→指令反标注 (3种风格) |
-| ai_annotated_instruction | 375 | 5模型共识标注 |
-| refusal_boundary | 135 | 拒绝边界训练 |
-| augmentation_tile | 105 | Tile配置变体 |
-| test_parameterization | 89 | 测试参数化 |
-| git_history | 88 | Git commit分析 |
-| augmentation_pipeline | 73 | Pipeline深度变体 |
-| 其他 | 120 | 性能改进、技能QA等 |
+| augmentation_hardware | 766 | Hardware adaptation (gfx942↔gfx950↔gfx1250) |
+| documentation_qa | 669 | Documentation Q&A |
+| kernel_reverse_annotation | 388 | Code→instruction reverse annotation (3 styles) |
+| ai_annotated_instruction | 375 | 5-model consensus annotation |
+| refusal_boundary | 135 | Refusal boundary training |
+| augmentation_tile | 105 | Tile configuration variants |
+| test_parameterization | 89 | Test parameterization |
+| git_history | 88 | Git commit analysis |
+| augmentation_pipeline | 73 | Pipeline depth variants |
+| Other | 120 | Performance improvements, skill Q&A, etc. |
 
-## 训练配置
+## Training Configuration
 
-| 参数 | 值 | 来源 |
+| Parameter | Value | Source |
 |------|------|------|
 | Max steps | 527 | 2808 / GBS=16 × 3 epochs |
 | GBS | 16 | MBS=1 × GPU=8 × grad_accum=2 |
@@ -47,55 +47,55 @@ SFT 数据来源分布：
 | LR | 1e-5 | plan.md §7.3 |
 | LR schedule | Cosine, warmup=26 steps (5%) | |
 | Weight decay | 0.01 | |
-| LoRA rank | 32 | plan.md §3 (SFT任务更聚焦) |
+| LoRA rank | 32 | plan.md §3 (SFT tasks are more focused) |
 | LoRA alpha | 64 | alpha = 2 × rank |
-| LoRA dropout | 0.1 | 小数据集正则化 |
-| LoRA targets | q/k/v/o/gate/up/down_proj | 全部attention+MLP |
-| Loss masking | answer-only | 仅assistant token参与loss |
+| LoRA dropout | 0.1 | Regularization for small dataset |
+| LoRA targets | q/k/v/o/gate/up/down_proj | All attention + MLP |
+| Loss masking | answer-only | Only assistant tokens contribute to loss |
 | Eval interval | 50 steps | |
 
-可训练参数：268,435,456 / 33,032,311,808 (0.81%)
+Trainable parameters: 268,435,456 / 33,032,311,808 (0.81%)
 
 ## Smoke Test
 
-5步测试验证通过：
-- 2808 train + 264 val 全部加载 (0 skipped)
-- step 5 loss=0.83 — 合理范围
-- DCP checkpoint 保存成功
+5-step test passed validation:
+- 2808 train + 264 val all loaded (0 skipped)
+- step 5 loss=0.83 — reasonable range
+- DCP checkpoint saved successfully
 
-## 训练过程
+## Training Process
 
-### Loss 曲线
+### Loss Curves
 
 ![SFT Loss Curves](sft_loss_curves.png)
 
-训练耗时约 57 分钟 (07:46 ~ 08:44)，每步约 6.5 秒。
+Training took about 57 minutes (07:46 ~ 08:44), ~6.5 seconds per step.
 
-**Train loss** 特征：
-- 波动很大 (min=0.21, max=3.67, std=0.77)
-- 原因：SFT 数据多样性高 (13种来源)，简单文档QA loss~0.2，复杂kernel代码 loss~3.6
-- 整体趋势下降：前半均值 1.32 → 后半均值 1.22
+**Train loss** characteristics:
+- High variance (min=0.21, max=3.67, std=0.77)
+- Reason: high SFT data diversity (13 sources), simple doc Q&A loss~0.2, complex kernel code loss~3.6
+- Overall downward trend: first half mean 1.32 → second half mean 1.22
 
-**Validation loss** 走势：
+**Validation loss** trend:
 
-| Step | Val Loss | 阶段 |
+| Step | Val Loss | Phase |
 |------|----------|------|
-| 50 | 1.1512 | 快速下降 |
+| 50 | 1.1512 | Rapid decline |
 | 100 | 1.1018 | |
 | 150 | 1.0721 | |
 | 200 | 1.0532 | |
-| 250 | 1.0411 | 收敛中 |
+| 250 | 1.0411 | Converging |
 | 300 | 1.0344 | |
-| 350 | 1.0315 | 接近平台 |
-| **400** | **1.0302** | **最低点** |
-| 450 | 1.0303 | 持平 |
-| 500 | 1.0304 | 微升 → 过拟合临界 |
+| 350 | 1.0315 | Approaching plateau |
+| **400** | **1.0302** | **Lowest point** |
+| 450 | 1.0303 | Flat |
+| 500 | 1.0304 | Slight rise → overfitting threshold |
 
-### 收敛分析
+### Convergence Analysis
 
-Val loss 改善率逐步递减：
+Val loss improvement rate gradually decreasing:
 
-| 区间 | Δ Val Loss | 改善率 |
+| Interval | Δ Val Loss | Improvement Rate |
 |------|-----------|--------|
 | 50→100 | -0.0494 | 4.3% |
 | 100→150 | -0.0297 | 2.7% |
@@ -107,40 +107,40 @@ Val loss 改善率逐步递减：
 | 400→450 | +0.0001 | -0.01% |
 | 450→500 | +0.0001 | -0.01% |
 
-**结论：3 epochs 是最优选择。** Val loss 在 epoch 2~3 间完全平台化 (1.030)，step 450 后开始微升，再多训练只会过拟合。
+**Conclusion: 3 epochs is the optimal choice.** Val loss fully plateaus between epochs 2~3 (1.030); slight rise after step 450, further training would only overfit.
 
-## 模型导出
+## Model Export
 
-DCP checkpoint → HuggingFace 格式：
+DCP checkpoint → HuggingFace format:
 
 ```
 dcp_to_torch_save() → load_state_dict() → merge_and_unload() → save_pretrained()
 ```
 
-- 输入：`/home/danyzhan/sft-results/final/final/` (DCP, 8 shards)
-- 输出：`/home/danyzhan/sft-results/Qwen2.5-Coder-SFT/` (14 safetensors, 61GB)
-- Key 匹配：1667/1667，LoRA_A non-zero：224/224
+- Input: `/home/danyzhan/sft-results/final/final/` (DCP, 8 shards)
+- Output: `/home/danyzhan/sft-results/Qwen2.5-Coder-SFT/` (14 safetensors, 61GB)
+- Key match: 1667/1667, LoRA_A non-zero: 224/224
 
-## 文件清单
+## File Inventory
 
 ```
 sft/
-├── TRAINING.md          # 本文档
-├── REPORT.md            # Benchmark 分析报告
-├── train_sft.py         # FSDP2 SFT 训练脚本
-├── dataset.py           # ChatML 数据集 + answer-only loss mask
-├── eval_sft.py          # 5级难度 benchmark 脚本
-├── config_sft.sh        # 训练超参配置
-└── run_sft.sh           # Docker 启动脚本
+├── TRAINING.md          # This document
+├── REPORT.md            # Benchmark analysis report
+├── train_sft.py         # FSDP2 SFT training script
+├── dataset.py           # ChatML dataset + answer-only loss mask
+├── eval_sft.py          # 5-level difficulty benchmark script
+├── config_sft.sh        # Training hyperparameter config
+└── run_sft.sh           # Docker launch script
 ```
 
-## 产物位置
+## Artifact Locations
 
-| 产物 | 路径 |
+| Artifact | Path |
 |------|------|
-| 训练日志 | `/home/danyzhan/sft-results/train.log` |
-| Loss 曲线图 | `sft_loss_curves.png` |
+| Training log | `/home/danyzhan/sft-results/train.log` |
+| Loss curve plot | `sft_loss_curves.png` |
 | DCP checkpoint | `/home/danyzhan/sft-results/final/final/` |
-| HF 模型 | `/home/danyzhan/sft-results/Qwen2.5-Coder-SFT/` |
-| Benchmark 图 | `sft_benchmark.png` |
+| HF model | `/home/danyzhan/sft-results/Qwen2.5-Coder-SFT/` |
+| Benchmark plot | `sft_benchmark.png` |
 | Benchmark JSON | `/home/danyzhan/sft-results/benchmark.json` |

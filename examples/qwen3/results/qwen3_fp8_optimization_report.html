@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Qwen3-8B FSDP FP8 blockwise2d 优化报告</title>
+<title>Qwen3-8B FSDP FP8 blockwise2d optimization report</title>
 <style>
   :root{--bg:#0f1419;--card:#1a2029;--fg:#e8ebee;--muted:#93a1ad;--accent:#4fc3f7;
     --good:#5fd38a;--warn:#ffb74d;--bad:#ef6b6b;--border:#2a333d;
@@ -48,136 +48,136 @@
 <body>
 <div class="wrap">
 
-  <h1>Qwen3-8B FSDP / FSDP2 FP8 blockwise2d 优化报告</h1>
-  <p class="sub">8×AMD MI308X (gfx942) · seq 2048 · global batch 8 · LoRA · 优化①-⑩ val_loss 逐位一致；RMSNorm 反向 kernel 为数值等价（dX/dW SNR 95dB+）</p>
+  <h1>Qwen3-8B FSDP / FSDP2 FP8 blockwise2d optimization report</h1>
+  <p class="sub">8×AMD MI308X (gfx942) · seq 2048 · global batch 8 · LoRA · Optimizations ①–⑩ val_loss bit-identical; RMSNorm backward kernel numerically equivalent (dX/dW SNR 95dB+)</p>
 
   <!-- KPI -->
   <div class="kpi">
-    <div class="b"><div class="muted">step time（FSDP1）</div><div class="big">2784 → <span class="good">960</span> <small style="font-size:14px">ms</small></div><div class="good">−66%</div></div>
-    <div class="b"><div class="muted">step time（FSDP2 + 融合 + kernel）</div><div class="big">→ <span class="good">568</span> <small style="font-size:14px">ms</small></div><div class="good">再 −26%</div></div>
-    <div class="b"><div class="muted">vs BF16 (1730ms)</div><div class="big good">快 67%</div><div class="muted">数值等价</div></div>
+    <div class="b"><div class="muted">step time (FSDP1)</div><div class="big">2784 → <span class="good">960</span> <small style="font-size:14px">ms</small></div><div class="good">−66%</div></div>
+    <div class="b"><div class="muted">step time (FSDP2 + fusion + kernels)</div><div class="big">→ <span class="good">568</span> <small style="font-size:14px">ms</small></div><div class="good">another −26%</div></div>
+    <div class="b"><div class="muted">vs BF16 (1730ms)</div><div class="big good">67% faster</div><div class="muted">Numerically equivalent</div></div>
   </div>
 
-  <!-- 优化历程瀑布 -->
-  <h2>① 优化历程（step time 逐步下降）</h2>
+  <!-- Optimization waterfall -->
+  <h2>① Optimization history (step time decrease)</h2>
   <div class="card">
-    <div class="row"><div class="lab">FP8 baseline</div><div class="track"><div class="fill" style="width:100%;background:var(--c5)">2784 ms</div></div><div class="delta muted">起点</div></div>
-    <div class="row"><div class="lab">+ 缓存冻结权重量化 <small>(fwd)</small></div><div class="track"><div class="fill" style="width:95%;background:var(--c3)">2645</div></div><div class="delta good">−5%</div></div>
-    <div class="row"><div class="lab">+ 缓存 DGrad 转置权重</div><div class="track"><div class="fill" style="width:86%;background:var(--c3)">2390</div></div><div class="delta good">−14%</div></div>
-    <div class="row"><div class="lab">+ 跳过冻结权重 WGrad</div><div class="track"><div class="fill" style="width:69%;background:var(--c1)">1912</div></div><div class="delta good">−31%</div></div>
-    <div class="row"><div class="lab">+ 关 gradient checkpointing</div><div class="track"><div class="fill" style="width:58%;background:var(--c1)">1610</div></div><div class="delta good">−42%</div></div>
+    <div class="row"><div class="lab">FP8 baseline</div><div class="track"><div class="fill" style="width:100%;background:var(--c5)">2784 ms</div></div><div class="delta muted">Start</div></div>
+    <div class="row"><div class="lab">+ Cache frozen weight quantization <small>(fwd)</small></div><div class="track"><div class="fill" style="width:95%;background:var(--c3)">2645</div></div><div class="delta good">−5%</div></div>
+    <div class="row"><div class="lab">+ Cache DGrad transposed weights</div><div class="track"><div class="fill" style="width:86%;background:var(--c3)">2390</div></div><div class="delta good">−14%</div></div>
+    <div class="row"><div class="lab">+ Skip frozen weight WGrad</div><div class="track"><div class="fill" style="width:69%;background:var(--c1)">1912</div></div><div class="delta good">−31%</div></div>
+    <div class="row"><div class="lab">+ Disable gradient checkpointing</div><div class="track"><div class="fill" style="width:58%;background:var(--c1)">1610</div></div><div class="delta good">−42%</div></div>
     <div class="row"><div class="lab">+ SHARD_GRAD_OP <small>(ZeRO-2)</small></div><div class="track"><div class="fill" style="width:55%;background:var(--c2)">1542</div></div><div class="delta good">−45%</div></div>
-    <div class="row"><div class="lab">+ bpreshuffle GEMM <small>(FSDP1 最优)</small></div><div class="track"><div class="fill" style="width:34%;background:var(--c2)">960</div></div><div class="delta good">−66%</div></div>
-    <div class="row"><div class="lab">FSDP2 同配置基线</div><div class="track"><div class="fill" style="width:27.5%;background:var(--c6)">767</div></div><div class="delta good">−72%</div></div>
+    <div class="row"><div class="lab">+ bpreshuffle GEMM <small>(FSDP1 best)</small></div><div class="track"><div class="fill" style="width:34%;background:var(--c2)">960</div></div><div class="delta good">−66%</div></div>
+    <div class="row"><div class="lab">FSDP2 same-config baseline</div><div class="track"><div class="fill" style="width:27.5%;background:var(--c6)">767</div></div><div class="delta good">−72%</div></div>
     <div class="row"><div class="lab">+ AITER CK FMHA v3 attn</div><div class="track"><div class="fill" style="width:24.5%;background:var(--c6)">681</div></div><div class="delta good">−76%</div></div>
-    <div class="row"><div class="lab">+ 融合 RMSNorm</div><div class="track"><div class="fill" style="width:23.2%;background:var(--c2)">647</div></div><div class="delta good">−77%</div></div>
-    <div class="row"><div class="lab">+ 融合 RoPE</div><div class="track"><div class="fill" style="width:22.8%;background:var(--c2)">634</div></div><div class="delta good">−77%</div></div>
-    <div class="row"><div class="lab">+ RMSNorm 反向 kernel</div><div class="track"><div class="fill" style="width:21.7%;background:var(--c2)">603</div></div><div class="delta good">−78%</div></div>
+    <div class="row"><div class="lab">+ Fused RMSNorm</div><div class="track"><div class="fill" style="width:23.2%;background:var(--c2)">647</div></div><div class="delta good">−77%</div></div>
+    <div class="row"><div class="lab">+ Fused RoPE</div><div class="track"><div class="fill" style="width:22.8%;background:var(--c2)">634</div></div><div class="delta good">−77%</div></div>
+    <div class="row"><div class="lab">+ RMSNorm backward kernel</div><div class="track"><div class="fill" style="width:21.7%;background:var(--c2)">603</div></div><div class="delta good">−78%</div></div>
     <div class="row"><div class="lab">+ FP8 GEMM gfx942 tune</div><div class="track"><div class="fill" style="width:20.8%;background:var(--c2)">578</div></div><div class="delta good">−79%</div></div>
-    <div class="row"><div class="lab">+ zero-copy RoPE <small>(最优)</small></div><div class="track"><div class="fill" style="width:20.4%;background:var(--c2)">568</div></div><div class="delta good">−80%</div></div>
-    <div class="row"><div class="lab muted">BF16 参考线</div><div class="track"><div class="fill" style="width:62%;background:#3a4654;color:var(--fg)">1730</div></div><div class="delta muted">基准</div></div>
-    <p class="sub" style="margin-top:10px">库层无损/数值等价优化（默认可开）：冻结权重缓存、跳过 WGrad、bpreshuffle GEMM、AITER attention、融合 RMSNorm/RoPE、RMSNorm 反向 kernel、FP8 GEMM gfx942 tune、zero-copy RoPE。显存换速度（默认关，8B 可开 / 70B 不可）：关 grad-ckpt、SHARD_GRAD_OP。最后六步（attn/norm/rope/RMSNorm-bwd/GEMM-tune/zero-copy-rope）为模型/kernel 级优化，对 FSDP1/FSDP2 通用。</p>
+    <div class="row"><div class="lab">+ zero-copy RoPE <small>(best)</small></div><div class="track"><div class="fill" style="width:20.4%;background:var(--c2)">568</div></div><div class="delta good">−80%</div></div>
+    <div class="row"><div class="lab muted">BF16 reference line</div><div class="track"><div class="fill" style="width:62%;background:#3a4654;color:var(--fg)">1730</div></div><div class="delta muted">Baseline</div></div>
+    <p class="sub" style="margin-top:10px">Library-level lossless/numerically-equivalent optimizations (on by default): frozen weight cache, skip WGrad, bpreshuffle GEMM, AITER attention, fused RMSNorm/RoPE, RMSNorm backward kernel, FP8 GEMM gfx942 tune, zero-copy RoPE. Memory-for-speed (off by default; OK for 8B / not for 70B): disable grad-ckpt, SHARD_GRAD_OP. Last six steps (attn/norm/rope/RMSNorm-bwd/GEMM-tune/zero-copy-rope) are model/kernel-level optimizations, applicable to both FSDP1/FSDP2.</p>
   </div>
 
-  <!-- 每步做了什么 -->
-  <h2>② 每一步做了什么、为什么</h2>
+  <!-- What each step did -->
+  <h2>② What each step did and why</h2>
   <div class="card">
     <table>
-      <tr><th>#</th><th>优化</th><th>一句话原理</th><th class="n">step</th><th>类型</th></tr>
-      <tr><td>1</td><td>缓存冻结权重的 FP8 量化</td><td>LoRA base 冻结，量化结果不变，却每次 forward 重算 → 只算一次并复用</td><td class="n">2645</td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>2</td><td>缓存 DGrad 的转置权重</td><td>反向 DGrad 每步对冻结权重做转置拷贝 → 转置结果也缓存</td><td class="n">2390</td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>3</td><td>跳过冻结权重的 WGrad</td><td>冻结权重的梯度本就丢弃，FSDP 却仍整条算 → 直接不算</td><td class="n">1912</td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>4</td><td>关 gradient checkpointing</td><td>反向不再重算 forward（GEMM 758→506/step），消除重算气泡</td><td class="n">1610</td><td><span class="pill ps">换显存</span></td></tr>
-      <tr><td>5</td><td>SHARD_GRAD_OP + overlap</td><td>参数常驻，反向不再 all-gather（73→37 次/step），消除通信气泡</td><td class="n">1542</td><td><span class="pill ps">换显存</span></td></tr>
-      <tr><td>6</td><td>bpreshuffle GEMM</td><td>预重排冻结权重布局，blockscale GEMM 提速 ~2.6x（FP8 GEMM 1028→396ms），bit-identical</td><td class="n">960</td><td><span class="pill pd">无损</span></td></tr>
+      <tr><th>#</th><th>Optimization</th><th>One-line rationale</th><th class="n">step</th><th>Type</th></tr>
+      <tr><td>1</td><td>Cache FP8 quantization of frozen weights</td><td>LoRA base frozen — quantization result unchanged, yet recomputed every forward → compute once and reuse</td><td class="n">2645</td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>2</td><td>Cache transposed weights for DGrad</td><td>Backward DGrad transposes frozen weights every step → cache transpose result too</td><td class="n">2390</td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>3</td><td>Skip WGrad on frozen weights</td><td>Gradients on frozen weights are discarded anyway, but FSDP still computes the full path → skip entirely</td><td class="n">1912</td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>4</td><td>Disable gradient checkpointing</td><td>Backward no longer recomputes forward (GEMM 758→506/step), eliminating recompute bubbles</td><td class="n">1610</td><td><span class="pill ps">Memory tradeoff</span></td></tr>
+      <tr><td>5</td><td>SHARD_GRAD_OP + overlap</td><td>Params resident, backward no longer all-gathers (73→37 times/step), eliminating comm bubbles</td><td class="n">1542</td><td><span class="pill ps">Memory tradeoff</span></td></tr>
+      <tr><td>6</td><td>bpreshuffle GEMM</td><td>Pre-shuffle frozen weight layout, blockscale GEMM ~2.6× faster (FP8 GEMM 1028→396ms), bit-identical</td><td class="n">960</td><td><span class="pill pd">Lossless</span></td></tr>
     </table>
   </div>
 
-  <!-- 瓶颈构成变化 -->
-  <h2>③ 瓶颈构成的变化</h2>
+  <!-- Bottleneck composition change -->
+  <h2>③ Bottleneck composition changes</h2>
   <div class="card">
-    <p class="sub">优化前 GPU 时间被拷贝/重算/通信占去近一半；优化后这些基本消失，剩下的几乎都是不可省的 GEMM 计算。</p>
-    <div style="margin:14px 0 4px;font-size:13px">优化前（FP8 baseline）</div>
+    <p class="sub">Before optimization, nearly half of GPU time went to copy/recompute/comm; after optimization these largely disappear — what remains is almost all unavoidable GEMM compute.</p>
+    <div style="margin:14px 0 4px;font-size:13px">Before optimization (FP8 baseline)</div>
     <div class="stack">
       <span style="width:37%;background:var(--c1)">GEMM 37%</span>
       <span style="width:23%;background:var(--c5)">copy 23%</span>
       <span style="width:15%;background:var(--c3)">elem 15%</span>
-      <span style="width:13%;background:var(--c4)">通信 13%</span>
+      <span style="width:13%;background:var(--c4)">comm 13%</span>
       <span style="width:12%;background:var(--c6)">attn</span>
     </div>
-    <div style="margin:16px 0 4px;font-size:13px">优化后（最优配置，568ms）</div>
+    <div style="margin:16px 0 4px;font-size:13px">After optimization (best config, 568ms)</div>
     <div class="stack">
       <span style="width:60%;background:var(--c1)">GEMM ~60%</span>
       <span style="width:14%;background:var(--c6)">attn 14%</span>
-      <span style="width:14%;background:var(--c4)">通信 14%</span>
+      <span style="width:14%;background:var(--c4)">comm 14%</span>
       <span style="width:8%;background:var(--c5)">copy 8%</span>
       <span style="width:4%;background:var(--c3)">elem 4%</span>
     </div>
     <div class="legend">
       <span><i style="background:var(--c1)"></i>FP8 GEMM</span>
-      <span><i style="background:var(--c5)"></i>拷贝 copy_</span>
-      <span><i style="background:var(--c3)"></i>elementwise 量化</span>
-      <span><i style="background:var(--c4)"></i>FSDP 通信</span>
+      <span><i style="background:var(--c5)"></i>copy copy_</span>
+      <span><i style="background:var(--c3)"></i>elementwise quantization</span>
+      <span><i style="background:var(--c4)"></i>FSDP communication</span>
       <span><i style="background:var(--c6)"></i>attention</span>
     </div>
   </div>
 
-  <!-- 关键指标 -->
-  <h2>④ 关键指标变化</h2>
+  <!-- Key metrics -->
+  <h2>④ Key metric changes</h2>
   <div class="card">
     <table>
-      <tr><th>指标</th><th class="n">优化前</th><th class="n">优化后（最优配置）</th><th class="n">变化</th></tr>
-      <tr><td>step time（稳态）</td><td class="n">2784 ms</td><td class="n good">568 ms</td><td class="n good">−80%</td></tr>
-      <tr><td>aten::copy_（GPU 时间）</td><td class="n">2.93 s</td><td class="n good">0.34 s</td><td class="n good">−89%</td></tr>
-      <tr><td>GEMM 调用 / step</td><td class="n">758</td><td class="n good">506</td><td class="n good">−33%</td></tr>
-      <tr><td>all-gather 次数 / step</td><td class="n">73</td><td class="n good">37</td><td class="n good">−49%</td></tr>
-      <tr><td>val_loss</td><td class="n">1.5968</td><td class="n good">1.5968</td><td class="n good">逐位一致</td></tr>
-      <tr><td>vs BF16 (1730ms)</td><td class="n bad">+61%</td><td class="n good">−67%</td><td class="n good">反超（快 67%）</td></tr>
+      <tr><th>Metric</th><th class="n">Before</th><th class="n">After (best config)</th><th class="n">Change</th></tr>
+      <tr><td>step time (steady state)</td><td class="n">2784 ms</td><td class="n good">568 ms</td><td class="n good">−80%</td></tr>
+      <tr><td>aten::copy_ (GPU time)</td><td class="n">2.93 s</td><td class="n good">0.34 s</td><td class="n good">−89%</td></tr>
+      <tr><td>GEMM calls / step</td><td class="n">758</td><td class="n good">506</td><td class="n good">−33%</td></tr>
+      <tr><td>all-gather count / step</td><td class="n">73</td><td class="n good">37</td><td class="n good">−49%</td></tr>
+      <tr><td>val_loss</td><td class="n">1.5968</td><td class="n good">1.5968</td><td class="n good">Bit-identical</td></tr>
+      <tr><td>vs BF16 (1730ms)</td><td class="n bad">+61%</td><td class="n good">−67%</td><td class="n good">Ahead (67% faster)</td></tr>
     </table>
   </div>
 
-  <!-- 试过没用 -->
-  <h2>⑤ 试过但没采用</h2>
+  <!-- Tried but not adopted -->
+  <h2>⑤ Tried but not adopted</h2>
   <div class="card">
     <table>
-      <tr><th>尝试</th><th>结果</th></tr>
-      <tr><td>GEMM tuned config (gfx942)</td><td>仅 ~3%，默认 kernel 已近最优；可选开关 <code>USE_TUNED_GEMM</code></td></tr>
-      <tr><td>加速 WGrad 的 requant</td><td>零收益（冻结权重 WGrad 本就被丢弃）→ 改为直接跳过（步骤 3）</td></tr>
-      <tr><td>SHARD_GRAD_OP（grad-ckpt 开着时）</td><td>反而更慢；只有关掉 grad-ckpt 才有效（步骤 5）</td></tr>
-      <tr><td>NO_SHARD</td><td>已废弃，本配置报错，不可用</td></tr>
-      <tr><td>lm_head 大 GEMM tune</td><td>tune 成本极高（&gt;40min 未完成），且仅占 ~1%，放弃</td></tr>
+      <tr><th>Attempt</th><th>Result</th></tr>
+      <tr><td>GEMM tuned config (gfx942)</td><td>Only ~3%; default kernel already near-optimal; optional flag <code>USE_TUNED_GEMM</code></td></tr>
+      <tr><td>Accelerate WGrad requant</td><td>Zero benefit (frozen weight WGrad already discarded) → replaced by direct skip (step 3)</td></tr>
+      <tr><td>SHARD_GRAD_OP (with grad-ckpt on)</td><td>Actually slower; only effective after disabling grad-ckpt (step 5)</td></tr>
+      <tr><td>NO_SHARD</td><td>Deprecated; errors under this config, unusable</td></tr>
+      <tr><td>lm_head large GEMM tune</td><td>Tune cost extremely high (&gt;40min incomplete), and only ~1% of time — abandoned</td></tr>
     </table>
   </div>
 
   <!-- FSDP2 -->
-  <h2>⑥ FSDP2：FP8 param-storage + 模型/kernel 级优化</h2>
+  <h2>⑥ FSDP2: FP8 param-storage + model/kernel-level optimizations</h2>
   <div class="card">
-    <p class="sub">前 6 步是 FSDP1。FSDP2（<code>fully_shard</code>，逐参数分片）再叠加：① FP8 param-storage（大模型防 OOM）；② AITER attn + 融合 RMSNorm/RoPE + RMSNorm 反向 kernel + gfx942 GEMM tune + zero-copy RoPE（无损/数值等价，FSDP1/2 通用）。</p>
+    <p class="sub">First 6 steps are FSDP1. FSDP2 (<code>fully_shard</code>, per-parameter sharding) adds: ① FP8 param-storage (OOM prevention for large models); ② AITER attn + fused RMSNorm/RoPE + RMSNorm backward kernel + gfx942 GEMM tune + zero-copy RoPE (lossless/numerically equivalent, FSDP1/2 universal).</p>
     <table>
-      <tr><th>优化</th><th>一句话原理</th><th class="n">step</th><th>开关</th><th>类型</th></tr>
-      <tr><td>AITER CK FMHA v3 attention</td><td>用 AITER CK FMHA v3 替换 PyTorch AOTriton SDPA；AOTriton 的反向最慢（attn 186→59ms）</td><td class="n">681</td><td><code>AITER_ATTN=1</code></td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>融合 RMSNorm</td><td>Qwen3RMSNorm 走 LumenRMSNorm 融合核（reduce+mul+rsqrt 合一）</td><td class="n">647</td><td><code>LUMEN_NORM=1</code></td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>融合 RoPE</td><td>HF apply_rotary_pos_emb → AITER rope_cached（带 autograd 反向，fwd 56dB/dX 53dB）</td><td class="n">634</td><td><code>FUSE_ROPE=1</code></td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>RMSNorm 反向 kernel（large-M-small-N）</td><td>q/k per-head norm(M大N=128) 反向原 kernel grid 封顶 80、行串行；新增行并行特化，反向 37→9ms（dX/dW SNR 95dB+）</td><td class="n">603</td><td>AITER（随镜像）</td><td><span class="pill pd">数值等价</span></td></tr>
-      <tr><td>FP8 GEMM gfx942 tune</td><td>镜像 tuned CSV 只有 gfx950，MI308X 走默认；补 gfx942 bpreshuffle 配置，FP8 GEMM 295→277ms</td><td class="n">578</td><td>AITER（随镜像）</td><td><span class="pill pd">无损</span></td></tr>
-      <tr><td>zero-copy RoPE 布局</td><td>fused RoPE 原来 permute().contiguous() 来回倒(~2.3GB/step)；改喂 stride view、kernel 直写连续 BHSD，零拷贝（fwd/dQ/dK 精确）</td><td class="n">568</td><td>Lumen（默认）</td><td><span class="pill pd">无损</span></td></tr>
+      <tr><th>Optimization</th><th>One-line rationale</th><th class="n">step</th><th>Flag</th><th>Type</th></tr>
+      <tr><td>AITER CK FMHA v3 attention</td><td>Replace PyTorch AOTriton SDPA with AITER CK FMHA v3; AOTriton backward slowest (attn 186→59ms)</td><td class="n">681</td><td><code>AITER_ATTN=1</code></td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>Fused RMSNorm</td><td>Qwen3RMSNorm uses LumenRMSNorm fused kernel (reduce+mul+rsqrt combined)</td><td class="n">647</td><td><code>LUMEN_NORM=1</code></td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>Fused RoPE</td><td>HF apply_rotary_pos_emb → AITER rope_cached (with autograd backward, fwd 56dB/dX 53dB)</td><td class="n">634</td><td><code>FUSE_ROPE=1</code></td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>RMSNorm backward kernel (large-M-small-N)</td><td>q/k per-head norm (large M, N=128) backward: original kernel grid capped at 80, rows serialized; new row-parallel specialization, backward 37→9ms (dX/dW SNR 95dB+)</td><td class="n">603</td><td>AITER (with image)</td><td><span class="pill pd">Numerically equivalent</span></td></tr>
+      <tr><td>FP8 GEMM gfx942 tune</td><td>Image tuned CSV only has gfx950; MI308X uses default; added gfx942 bpreshuffle config, FP8 GEMM 295→277ms</td><td class="n">578</td><td>AITER (with image)</td><td><span class="pill pd">Lossless</span></td></tr>
+      <tr><td>zero-copy RoPE layout</td><td>Fused RoPE previously permute().contiguous() back and forth (~2.3GB/step); now feed stride view, kernel writes contiguous BHSD directly, zero-copy (fwd/dQ/dK exact)</td><td class="n">568</td><td>Lumen (default)</td><td><span class="pill pd">Lossless</span></td></tr>
     </table>
-    <div style="font-size:13px;margin:14px 0 4px"><b>FP8 param-storage</b>（<code>FSDP_FP8_PARAM_STORAGE=1</code>）：冻结 base 权重以 FP8 存在<b>分片</b>里，在 all-gather 内逐分片量化（<code>Blockwise2DFP8Param.fsdp_pre_all_gather</code>），all-gather FP8 而非 BF16（约省一半参数通信）。</div>
-    <p class="sub" style="margin:4px 0 0">这<b>不是 8B 最快配置</b>——每次 all-gather（grad-ckpt 下每步两次前向）都重量化 → 拷贝/elementwise 暴涨（1419ms/step）。它的价值是<b>显存</b>：让 70B 装得下。已验证 llama2-70B param-storage 达 val_loss <span class="good">0.9235 @450</span>（token-only 归一化，数值逐位一致）。8B 求快请用 <code>cache_frozen_weight</code>（只量化一次）。</p>
+    <div style="font-size:13px;margin:14px 0 4px"><b>FP8 param-storage</b> (<code>FSDP_FP8_PARAM_STORAGE=1</code>): frozen base weights stored as FP8 in <b>shards</b>, quantized shard-by-shard inside all-gather (<code>Blockwise2DFP8Param.fsdp_pre_all_gather</code>), all-gather FP8 instead of BF16 (~half param comm).</div>
+    <p class="sub" style="margin:4px 0 0">This is <b>not the fastest 8B config</b> — every all-gather (two forwards per step under grad-ckpt) re-quantizes → copy/elementwise explodes (1419ms/step). Its value is <b>memory</b>: makes 70B fit. Verified llama2-70B param-storage reaches val_loss <span class="good">0.9235 @450</span> (token-only normalization, numerically bit-identical). For 8B speed, use <code>cache_frozen_weight</code> (quantize once).</p>
   </div>
 
-  <!-- 用法 -->
-  <h2>⑦ 怎么用</h2>
+  <!-- Usage -->
+  <h2>⑦ How to use</h2>
   <div class="card">
-    <div style="font-size:13px;margin-bottom:4px">FSDP2 全部优化（8B 最快，568ms，显存充足；RMSNorm 反向 kernel + gfx942 GEMM tune 在 AITER 随镜像生效，zero-copy RoPE 在 Lumen 默认生效）：</div>
+    <div style="font-size:13px;margin-bottom:4px">FSDP2 all optimizations (fastest 8B, 568ms, sufficient memory; RMSNorm backward kernel + gfx942 GEMM tune active via AITER image, zero-copy RoPE default in Lumen):</div>
     <pre>FSDP_VERSION=2 CACHE_FROZEN_WEIGHT=1 BPRESHUFFLE=1 GRAD_CKPT=0 \
 SHARDING=shard_grad_op LIMIT_ALL_GATHERS=0 FORWARD_PREFETCH=1 \
 AITER_ATTN=1 LUMEN_NORM=1 FUSE_ROPE=1 MODE=fp8_blockwise2d \
   bash examples/qwen3/run_qwen3_fsdp_mi308.sh</pre>
-    <div style="font-size:13px;margin:10px 0 4px">FSDP1（960ms，去掉融合三项与 <code>FSDP_VERSION</code>）。大模型防 OOM：<code>FSDP_VERSION=2 FSDP_FP8_PARAM_STORAGE=1</code>，去掉 <code>GRAD_CKPT=0</code>/<code>SHARDING</code> 与 <code>cache_frozen_weight</code>。</div>
+    <div style="font-size:13px;margin:10px 0 4px">FSDP1 (960ms, remove fusion trio and <code>FSDP_VERSION</code>). Large-model OOM prevention: <code>FSDP_VERSION=2 FSDP_FP8_PARAM_STORAGE=1</code>, remove <code>GRAD_CKPT=0</code>/<code>SHARDING</code> and <code>cache_frozen_weight</code>.</div>
   </div>
 
-  <p class="foot">Lumen · Qwen3-8B FSDP/FSDP2 FP8 blockwise2d · 8×MI308X (gfx942)。step time 为稳态中位数（排除含 JIT 的首步）；构成百分比为单步 torch.profiler Self CUDA 占比（近似）。详见 <code>qwen3_fp8_perf_notes.md</code> 与算子明细 <code>qwen3_fsdp2_operator_breakdown.xlsx</code>。</p>
+  <p class="foot">Lumen · Qwen3-8B FSDP/FSDP2 FP8 blockwise2d · 8×MI308X (gfx942). Step time is steady-state median (excluding first step with JIT); composition percentages are single-step torch.profiler Self CUDA share (approximate). See <code>qwen3_fp8_perf_notes.md</code> and operator breakdown <code>qwen3_fsdp2_operator_breakdown.xlsx</code>.</p>
 
 </div>
 </body>

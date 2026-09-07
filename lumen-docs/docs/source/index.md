@@ -52,6 +52,7 @@ advance/distributed
 advance/rl_training
 advance/rl_lora
 advance/feature_catalog
+advance/patch_registry
 ```
 
 ```{toctree}

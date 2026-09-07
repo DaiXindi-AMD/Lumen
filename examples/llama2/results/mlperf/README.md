@@ -418,7 +418,7 @@ allocation churn that caused allocator fragmentation. Post-eval delta is now **+
 | `lumen/csrc/hip_no_stream_capture.c` | **NEW**: LD_PRELOAD stub for `hipThreadExchangeStreamCaptureMode` no-op |
 | `lumen/models/_swiglu_fp8_fuse.py` | `is_contiguous()` guard |
 | `lumen/utils/hip_graphs.py` | HIP graph capture fixes (not actively used) |
-| `examples/llama2/run_tp1_dp8.sh` | All env flags including `LUMEN_FP8_DGRAD_OUTPUT=1`, `LUMEN_REUSE_QUANT_BUFFER=1` |
+| `examples/llama2/run_lora_finetune_llama2_70b.sh` | All env flags including `LUMEN_FP8_DGRAD_OUTPUT=1`, `LUMEN_REUSE_QUANT_BUFFER=1` |
 | `examples/llama2/run_profile.sh` | Profiling script additions |
 | `examples/llama2/scripts/patch_mlp_fp8_store.py` | SwiGLU pre-alloc fix |
 
