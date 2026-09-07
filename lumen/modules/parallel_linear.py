@@ -44,7 +44,7 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from torch.nn.parameter import Parameter
 
-from lumen.modules._megatron_compat import ensure_metadata_has_dp_cp_group
+from lumen.modules._megatron_compat import condition_init_method, ensure_metadata_has_dp_cp_group
 
 __all__ = ["LumenColumnParallelLinear", "LumenRowParallelLinear", "_DeferredWgrad"]
 
@@ -471,8 +471,6 @@ class LumenColumnParallelLinear(nn.Module):
                     torch.empty(self.output_size_per_partition, input_size, dtype=config.params_dtype)
                 )
                 if getattr(config, "perform_initialization", True):
-                    from megatron.core.tensor_parallel.layers import condition_init_method
-
                     _initialize_affine_weight_cpu(
                         self.weight,
                         output_size,
@@ -861,8 +859,6 @@ class LumenRowParallelLinear(nn.Module):
         if getattr(config, "use_cpu_initialization", False):
             self.weight = Parameter(torch.empty(output_size, self.input_size_per_partition, dtype=config.params_dtype))
             if getattr(config, "perform_initialization", True):
-                from megatron.core.tensor_parallel.layers import condition_init_method
-
                 _initialize_affine_weight_cpu(
                     self.weight,
                     output_size,

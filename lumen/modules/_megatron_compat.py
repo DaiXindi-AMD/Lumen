@@ -14,7 +14,7 @@ every entry point, including the ones that never touch the missing API.
 
 from __future__ import annotations
 
-__all__ = ["ensure_metadata_has_dp_cp_group"]
+__all__ = ["condition_init_method", "ensure_metadata_has_dp_cp_group"]
 
 
 try:
@@ -29,3 +29,22 @@ except ImportError:
     def ensure_metadata_has_dp_cp_group(metadata):
         """Return *metadata* unchanged; this Megatron has no group to inject."""
         return metadata
+
+
+try:
+    from megatron.core.tensor_parallel.layers import (  # type: ignore[attr-defined]
+        condition_init_method,
+    )
+except ImportError:
+    try:
+        # Where it lived before Megatron moved it out of the TE extensions.
+        from megatron.core.extensions.transformer_engine import (  # type: ignore[attr-defined]
+            condition_init_method,
+        )
+    except ImportError:
+
+        def condition_init_method(config, init_method):
+            """Condition *init_method* on ``config.perform_initialization``."""
+            if getattr(config, "perform_initialization", True):
+                return init_method
+            return lambda w: None
