@@ -169,6 +169,14 @@ Write back only meaningful tests or experiments that change confidence in a hypo
 
 ## Open
 
+### [2026-09-06 fused-permute-returns-raw-aiter-packed-sorted-ids]
+- Symptom: 4 failures in `tests/ops/test_moe_routing.py::TestFusedPermuteCorrectness` — `test_output_shapes`, `test_all_tokens_covered`, `test_sorted_weights_match_input`, `test_permute_unpermute_round_trip`.
+- These were invisible until the `lumen.ops.moe` import bug above was fixed; the whole file had been failing at import, so the 19 failures it reported hid these 4 real ones.
+- Not caused by the fix: verified by isolating it. Repairing only `__init__.py` while keeping the stale `fused_router.py` (so `decode_aiter_sorted_ids` is still importable) leaves exactly the same 4 failing.
+- Evidence: `sorted_ids.shape` is `torch.Size([158])` where the test expects `(32,)`; `token_id 8388610` (`0x800002`) is out of range for 16 tokens; only 31 unique tokens found where ≥32 expected. The high bits carry the expert index — AITER's `moe_sorting_fwd` returns padded, packed sorted ids, and the tests assert decoded, unpadded semantics.
+- The deleted `decode_aiter_sorted_ids` / `_build_flat_sort_order` pair in the old `fused_router.py` looks like an unfinished attempt at exactly this decode, never wired into `fused_permute`. So the open question is whether `fused_permute` is meant to decode before returning, or whether the tests encode a contract it never had.
+- Not on the MXFP4 path and not blocking anything. Deliberately not chased in the same pass.
+
 ### [2026-08-27 summarize_torch_trace.py-is-cited-everywhere-and-committed-nowhere]
 - Found while auditing whether every artifact the docs cite is actually in the repo: report §5.15 attributes the ms/iter category tables to `scripts/summarize_torch_trace.py`, and every `kernel_summary.txt` this campaign leans on is its output — the quantized-vs-BF16 split in §5.15, the `TAIL_BF16` profile in §5.18, the instruction-mix attribution in §5.19.
 - **The file does not exist anywhere in the tree.** Not under `scripts/`, not under `benchmarks/`, not renamed: nothing in either directory contains the categorisation logic (searched for `kernel_summary`, `categor`, and the `quantize / layout` bucket label that appears in the output).
@@ -216,6 +224,28 @@ Move disproved suspicions here instead of deleting them.
 - Status: ruled out
 
 ## Resolved
+
+### [2026-09-06 lumen-fused-moe-router-never-applied]
+- Symptom: nothing visible at default log level. Found while auditing the stranded `refactor/patch-registry-on-94560b7` branch, whose `d06433a` claimed to "restore Megatron fused-router APIs" — the file it touches turned out to be identical on `94560b7`, `origin/main` and `feature/mxfp4`, so it was not restoring anything the registry refactor broke. It was fixing a bug all three shared.
+- Root cause: `lumen/ops/moe/fused_router.py` was a stale duplicate of `fused_routing.py`'s contents (`fused_topk`, `fused_permute`, `fused_unpermute`, `decode_aiter_sorted_ids`), and the three score-function/aux-loss autograd functions existed **nowhere in the tree**. `lumen/ops/moe/__init__.py` imported those three from `fused_router` and `decode_aiter_sorted_ids` from `fused_routing` — both groups pointed at the wrong module, so `import lumen.ops.moe` raised ImportError. Because importing *any* submodule of a package runs the package `__init__` first, every MoE test failed, including tests that only touch `fused_routing`.
+- The part that mattered for training: `lumen/models/megatron.py:_patch_moe_fused_router` wraps the Megatron import and the Lumen import in one `try`, and its `except ImportError` logs `"Megatron-Core moe_utils not found, skipping MoE router patch"` at **debug** level — blaming Megatron for a Lumen-side failure. So the patch silently never applied and `moe_utils.fused_topk_with_score_function` stayed on `transformer_engine.pytorch.router`. Lumen's own AITER router kernels were dead code in every MoE run; TE's router served instead, which is why nothing crashed or looked wrong.
+- Evidence: before, `patch 前/后` both report `transformer_engine.pytorch.router`; after, `patch 后` reports `lumen.ops.moe.fused_router`. Test counts on `feature/mxfp4` before → after: `test_moe_fused_router.py` 24 failed/3 passed → **27 passed/3 skipped**, `test_moe_routing.py` 19 failed/2 passed → 4 failed/18 passed, `test_moe_fused.py` 5 failed/14 passed → **19 passed**. 48 failures → 4.
+- Fix: took `lumen/ops/moe/fused_router.py` and `lumen/ops/moe/__init__.py` from `d06433a` (the only two files of that commit worth landing; its `is_under_bf16_prefix` change is byte-identical to what `feature/mxfp4` already had, and the rest is registry-structure specific).
+- Status: resolved. The 4 remaining failures are a separate pre-existing bug, logged under Open.
+
+### [2026-09-06 mxfp4-scale-swizzle-fusion-unreachable-in-megatron]
+- Symptom: none observable — the MXFP4 weight scale-swizzle fusion simply never fired on the Megatron path, and quietly fell back to the unfused `scale, scale.t().contiguous()` branch.
+- Root cause: `make_lumen_model_provider` called `enable_fp8_for_parallel_linear` without `block_size`, so it defaulted to `None`. `enable_fp8` only overwrites `self.block_size` when the argument is truthy, leaving the linears on their `__init__` default of **128** even on an MXFP4 run (where `_override_te_args_for_lumen` had already coerced `args.linear_fp8_block_size` to 32). That 128 flowed into `_mxfp4_cached_weight`, where `_is_tile_grid` compares the scale shape the quantizer actually produced against a tile grid derived from `block_size` — the quantizer always uses 32 for mxfp4, so the two can never match.
+- Not a correctness bug: the quantizer ignores `block_size` for mxfp4 and always emits 32×32 weight block scales, so the numerics were always MXFP4-correct. The cost was the lost fusion the code comment describes (five passes over the scales instead of two, per weight per step).
+- Evidence, Qwen3-8B FFN shape 12288×4096 (divisible by both 32 and 128, so the `unpadded` gate is not what fails):
+  - `block_size=32` → `scale.shape=(384, 4096)`, tile grid `(384,128)`, fusion **hit**
+  - `block_size=128` → `scale.shape=(384, 128)`, tile grid `(96,32)`, fusion **missed**
+  - The `(384, 128)` grid is `12288/32 × 4096/32`, confirming the quantizer used 32 regardless.
+- Fix: two changes from `d06433a` — `block_size=cfg.quant_config.block_size` at the `make_lumen_model_provider` call site, plus a `if block_size is None and quant_config is not None` fallback inside `enable_fp8_for_parallel_linear` for other callers.
+- Checked for side effects: the fallback now hands 32 to `set_fused_swiglu_scaling` on MXFP4 runs instead of `None`→128, but `try_fused_swiglu_fp8` returns early for `mxfp4`/`mxfp8` before reading `block_size`, so the SwiGLU bridge is unaffected. FP8 blockwise runs carry `block_size=128` in QuantConfig, so that path is unchanged.
+- Tests added to `tests/models/test_megatron.py`: `test_mxfp4_run_forwards_block_size_32` and `test_block_size_taken_from_quant_config_when_unset`. Mutation-verified against unfixed production code — they fail with `KeyError: 'block_size'` and `assert None == 32` respectively.
+- Bearing on the step times in report §5.21: MXFP4's 6009.5 ms (tail5) and 5598.1 ms (tail0) were both measured with this fusion dead. Re-measurement deliberately deferred.
+- Status: resolved (code); perf impact unmeasured.
 
 ### [2026-07-21 mxfp4-8b-late-loss-spike]
 - Symptom: 8B MXFP4 (after FSDP2 fix) crashes at step 1275-3600 (varies by config). Loss spikes to 11.9375.

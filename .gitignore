@@ -9,6 +9,11 @@ build/
 /docs/
 outputs/2026-*/
 tunableop_results*.csv
+# rocprofv3 dumps its counter values here, tens of MB per profiled run. Nothing
+# under it is a source artifact, and with no rule a plain `git add -A` sweeps the
+# whole directory into a commit (which is how 230 MB of .dat files reached a
+# remote branch on 2026-09-06).
+.rocprofv3/
 data/
 *.parquet
 wandb/
