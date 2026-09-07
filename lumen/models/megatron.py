@@ -15,8 +15,9 @@ arguments) remains in the per-model subpackages.
 
 import logging
 import os
+import warnings
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, Optional, Set
 
 import torch
 
@@ -62,6 +63,10 @@ from lumen.patches.builders.megatron_model import (  # noqa: E402
     _patch_rmsnorm,
 )
 
+# Per-head QK norms sit one level down, inside the attention submodule spec, and
+# normalise over head_dim instead of hidden_size.
+_ATTN_NORM_ATTRS = ("q_layernorm", "k_layernorm")
+
 
 # ---------------------------------------------------------------------------
 # Override defaults for Lumen
@@ -70,6 +75,10 @@ from lumen.patches.builders.megatron_model import (  # noqa: E402
 from lumen.patches.builders.megatron_args import TE_FORCE_OVERRIDES as _TE_FORCE_OVERRIDES
 
 _FP8_FORMAT_MAP = {"e4m3": "fp8_e4m3", "hybrid": "hybrid"}
+
+# MX FP4 scales one block of 32 elements (OCP Microscaling spec); the FP4 GEMM
+# and quantization kernels all assume that block length.
+_MXFP4_BLOCK_SIZE = 32
 
 _BACKEND_MAP = {
     "auto": ("aiter_csrc", "aiter_triton_fp8"),
@@ -93,6 +102,20 @@ def resolve_attn_backend(backend: str, fp8_attn: str) -> str:
     return fp8_be if fp8_attn in ("dpa", "mha") else bf16_be
 
 
+def resolve_quant_format(args) -> Optional[str]:
+    """Return the effective Lumen quantisation format string, or None.
+
+    Follows the same precedence :data:`lumen.config._ARG_MAP` uses for the
+    ``format`` field: ``--linear-fp8-format`` first, then the value derived
+    from Megatron's ``--fp8-format``.
+    """
+    for attr in ("linear_fp8_format", "lumen_fp8_format"):
+        value = getattr(args, attr, None)
+        if value is not None:
+            return value
+    return None
+
+
 def _override_te_args_for_lumen(args):
     """Configure Lumen FP8 settings from Megatron args.
 
@@ -100,6 +123,9 @@ def _override_te_args_for_lumen(args):
     :class:`QuantFormat` string and stored as ``args.lumen_fp8_format`` for
     :func:`apply_fp8_training`.  ``args.fp8`` is then set to ``None`` so
     that ``TransformerConfig`` uses Lumen's own FP8 code-paths.
+    ``--linear-fp8-format`` overrides that mapping when given, which is the
+    only way to reach the MX formats since Megatron's own ``--fp8-format``
+    does not accept them.
 
     All other shared parameters (``fp8_margin``, ``fp8_recipe``,
     ``fp8_amax_history_len``, ``fp8_amax_compute_algo``, ``fp8_wgrad``,
@@ -109,6 +135,17 @@ def _override_te_args_for_lumen(args):
     if te_fp8 is not None:
         args.lumen_fp8_format = _FP8_FORMAT_MAP.get(te_fp8, te_fp8)
     args.fp8 = None
+
+    if resolve_quant_format(args) == "mxfp4":
+        # A wrong block size here would not fail loudly: the quant kernel would
+        # hand the FP4 GEMM scales of a shape it does not expect.
+        if getattr(args, "linear_fp8_block_size", None) not in (None, _MXFP4_BLOCK_SIZE):
+            logger.warning(
+                "mxfp4: overriding --linear-fp8-block-size %s with %d",
+                args.linear_fp8_block_size,
+                _MXFP4_BLOCK_SIZE,
+            )
+        args.linear_fp8_block_size = _MXFP4_BLOCK_SIZE
 
     for attr, value in _TE_FORCE_OVERRIDES.items():
         setattr(args, attr, value)
@@ -167,10 +204,18 @@ def lumen_gpt_builder(args, pre_process, post_process, vp_stage=None, config=Non
 
     _override_te_args_for_lumen(args)
 
+    # Rope fusion needs a kernel only TransformerEngine or Lumen's apex bridge
+    # supplies, so it stays opt-in. Set on args because
+    # core_transformer_config_from_args reads it from there.
+    args.apply_rope_fusion = getattr(args, "lumen_fused_rope", False)
+
     if config is None:
-        args.apply_rope_fusion = getattr(args, "lumen_fused_rope", False)
         config = core_transformer_config_from_args(args)
-        apply_config_build(config, args, tags={"lumen", "builder"})
+
+    # Outside the `if` on purpose: these hold regardless of whether the config
+    # was built here or handed down by Megatron's get_model, which passes one by
+    # keyword. The registry's lumen_gpt_config patch carries the assignments.
+    apply_config_build(config, args, tags={"lumen", "builder"})
 
     transformer_layer_spec = get_gpt_layer_local_spec(
         args.num_experts,
@@ -411,6 +456,14 @@ def enable_fp8_for_parallel_linear(
 
         fp8_dtype = _get_float8_e4m3()
 
+    # MXFP4 coerces the CLI block size to 32 on args, and QuantConfig carries it
+    # from there. Leaving block_size=None keeps the linears on their init default
+    # of 128, and _mxfp4_cached_weight then compares a scale grid the quantizer
+    # built at 32 against a tile grid derived from 128 -- never equal, so the
+    # scale-swizzle fusion is unreachable.
+    if block_size is None and quant_config is not None:
+        block_size = quant_config.block_size
+
     # Tell the fused SwiGLU quant bridge (LUMEN_FUSED_SWIGLU_QUANT) the global
     # activation scale granularity so its cached scale layout matches the fc2
     # GEMM that consumes it (blockwise2d needs a 2D 1×block scale, not 1D).
@@ -418,11 +471,39 @@ def enable_fp8_for_parallel_linear(
 
     set_fused_swiglu_scaling(scaling_type, block_size)
 
+    # --first-last-layers-bf16 has to be applied here as well. The other place
+    # that honours it, quantize._patch_linear_layers, only ever sees Megatron's
+    # own linear types, and --lumen-linear has already swapped those out by the
+    # time it runs -- so on this path the flag used to select nothing at all and
+    # every layer went to MXFP4 regardless.
+    from lumen.quantize import is_under_bf16_prefix
+
+    bf16_prefixes: Set[str] = set()
+    if quant_config is not None and quant_config.first_last_layers_bf16:
+        from lumen.quantize import _build_bf16_skip_prefixes
+
+        if quant_config.num_layers > 0:
+            bf16_prefixes = _build_bf16_skip_prefixes(model, quant_config)
+        else:
+            # Without the layer count the tail is unidentifiable, and the skip
+            # rule would read as "every layer". Quantizing everything is the
+            # documented-but-wrong behaviour; silently running the whole model
+            # in BF16 would be worse and much harder to notice.
+            warnings.warn(
+                "first_last_layers_bf16 is set but num_layers is 0, so the BF16 "
+                "tail cannot be located; quantizing every Lumen parallel linear.",
+                stacklevel=2,
+            )
+
     count = 0
-    for module in model.modules():
+    skipped = 0
+    for name, module in model.named_modules():
         if isinstance(
             module, (LumenColumnParallelLinear, LumenRowParallelLinear, LumenLayerNormLinear, LumenGroupedLinear)
         ):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
+                skipped += 1
+                continue
             _mgr = scaling_manager
             if _mgr is None and quant_config is not None:
                 from lumen.quantize import ScalingManager
@@ -452,7 +533,8 @@ def enable_fp8_for_parallel_linear(
             print_rank_0(f"> Attached Blockwise2DScaleManager to {attn_count} attention modules for FP8 MHA")
 
     if count > 0:
-        print_rank_0(f"> Enabled FP8 (scaling={scaling_type}) on {count} Lumen parallel linear modules")
+        note = f", {skipped} left in BF16" if skipped else ""
+        print_rank_0(f"> Enabled FP8 (scaling={scaling_type}) on {count} Lumen parallel linear modules{note}")
 
 
 # ---------------------------------------------------------------------------
@@ -662,18 +744,19 @@ def make_lumen_model_provider(
     3. Megatron-specific ``enable_fp8_for_parallel_linear`` (optional)
     """
 
-    def model_provider(pre_process=True, post_process=True, vp_stage=None):
+    def model_provider(
+        pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None
+    ):
+        # pg_collection is accepted but not forwarded: Megatron's get_model
+        # defaults it to ProcessGroupCollection.use_mpu_process_groups(), which is
+        # the same set GPTModel derives from parallel_state when given None.
         import os
         from dataclasses import replace as _replace
 
         from lumen.config import LumenConfig
 
-        from dataclasses import replace as _replace
-
-        from lumen.config import LumenConfig
-
         args = get_args()
-        model = model_builder(args, pre_process, post_process, vp_stage)
+        model = model_builder(args, pre_process, post_process, vp_stage, config=config)
 
         # 1. Megatron LoRA (not PEFT — stays separate)
         if getattr(args, "lora_rank", 0) > 0:
@@ -709,10 +792,14 @@ def make_lumen_model_provider(
 
         # 3. Megatron-specific parallel linear FP8 (not covered by LumenConfig)
         if getattr(args, "linear_fp8", False) and getattr(args, "lumen_linear", False):
-            scaling_type = getattr(args, "linear_fp8_scaling", "dynamic")
+            # The resolved recipe, not the raw --linear-fp8-scaling string: MX
+            # formats carry scaling in the format, so an MXFP4 run passes
+            # "blockwise" here and would silently run FP8 blockwise instead.
+            scaling_type = cfg.quant_config.recipe
             enable_fp8_for_parallel_linear(
                 model,
                 scaling_type=scaling_type,
+                block_size=cfg.quant_config.block_size,
                 fp8_mha=getattr(args, "lumen_fp8_attn", "none") == "mha",
                 gradient_accumulation_fusion=getattr(args, "lumen_gradient_accumulation_fusion", False),
                 delay_wgrad=getattr(args, "lumen_delay_wgrad", False),
@@ -937,7 +1024,9 @@ from lumen.patches.builders.megatron_args import add_common_megatron_args  # noq
 from lumen.patches.training.megatron_hooks import (  # noqa: E402
     install_fp8_param_gather_hook,
     install_fp8_param_storage_hook,
+    install_gc_freeze_hook,
     install_hip_graphs_hook,
+    install_mxfp4_weight_cache_hook,
     install_val_loss_early_stop_hook,
 )
 
@@ -945,7 +1034,9 @@ __all__ = [
     "add_common_megatron_args",
     "install_fp8_param_gather_hook",
     "install_fp8_param_storage_hook",
+    "install_gc_freeze_hook",
     "install_hip_graphs_hook",
+    "install_mxfp4_weight_cache_hook",
     "install_val_loss_early_stop_hook",
     "register_fp8_param_optimizer_hook",
 ]

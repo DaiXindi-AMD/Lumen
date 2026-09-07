@@ -29,9 +29,12 @@ def add_llama_pretrain_args(parser):
     PatchPhase.CONFIG_BUILD,
     description="Lumen GPT defaults: no persist_layer_norm / bias_swiglu_fusion",
     tags=frozenset({"lumen", "builder"}),
-    config_fields=("persist_layer_norm", "bias_swiglu_fusion"),
+    config_fields=("apply_rope_fusion", "persist_layer_norm", "bias_swiglu_fusion"),
 )
 def mutate_lumen_gpt_config(config, args) -> None:
+    # core_transformer_config_from_args reads rope fusion off args, so a config
+    # handed down by get_model can disagree with what the launcher asked for.
+    config.apply_rope_fusion = getattr(args, "apply_rope_fusion", False)
     config.persist_layer_norm = False
     config.bias_swiglu_fusion = False
     if getattr(args, "lumen_fp8_activation_store", False):

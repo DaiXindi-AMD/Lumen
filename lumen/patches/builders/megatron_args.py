@@ -268,6 +268,17 @@ def add_common_megatron_args(parser):
     )
     safe_add_argument(
         lfp8,
+        "--linear-fp8-format",
+        type=str,
+        default=None,
+        choices=["fp8_e4m3", "fp8_e5m2", "hybrid", "mxfp8", "mxfp4"],
+        help="Quantisation format for Linear layers. Takes precedence over "
+        "Megatron's --fp8-format, which cannot express the MX formats. "
+        "Default None means --fp8-format decides; do not give this a "
+        "non-None default or it would silently override --fp8-format.",
+    )
+    safe_add_argument(
+        lfp8,
         "--linear-fp8-scaling",
         type=str,
         default="delayed",
@@ -303,7 +314,7 @@ def add_common_megatron_args(parser):
         "--grad-quant-type",
         type=str,
         default=None,
-        choices=["fp8", "mxfp8", "fp4"],
+        choices=["fp8", "mxfp8", "mxfp4"],
         help="Gradient quantization type (None=disabled). Applies to Linear, Attention, and RMSNorm.",
     )
 

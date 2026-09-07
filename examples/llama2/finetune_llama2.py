@@ -253,6 +253,7 @@ def _run_megatron():
     apply_training_patches(
         names={
             "fp8_param_gather_hook",
+            "mxfp4_weight_cache_hook",
             "fp8_param_storage_hook",
             "hip_graphs_hook",
             "val_loss_early_stop_hook",

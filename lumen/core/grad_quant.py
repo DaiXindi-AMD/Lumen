@@ -16,7 +16,9 @@ from typing import Optional
 
 import torch
 
-GRAD_QUANT_TYPES = (None, "fp8", "mxfp8", "fp4")
+# Kept in sync with lumen.quantize.scaling_manager.GRAD_QUANT_TYPES, which is the
+# source of truth; duplicated as a literal here to keep this shim import-light.
+GRAD_QUANT_TYPES = (None, "fp8", "mxfp8", "mxfp4", "fp4")
 
 
 def quantize_grad_tensor(

@@ -3,6 +3,8 @@
 import sys
 import types
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 if "lumen" not in sys.modules:
     _lumen = types.ModuleType("lumen")
@@ -33,6 +35,8 @@ class TestMegatronTrainingPatches:
     def test_all_training_hooks_registered(self):
         expected = {
             "fp8_param_gather_hook",
+            "mxfp4_weight_cache_hook",
+            "gc_freeze_hook",
             "fp8_param_storage_hook",
             "hip_graphs_hook",
             "val_loss_early_stop_hook",
@@ -124,3 +128,82 @@ class TestMegatronTrainingPatches:
 
         monkeypatch.setattr(builtins, "__import__", _block_training_import)
         self.hooks.install_val_loss_early_stop_hook()
+
+    def test_gc_freeze_hook_skips_when_disabled(self, monkeypatch):
+        monkeypatch.setenv("LUMEN_GC_FREEZE", "0")
+        self.hooks.install_gc_freeze_hook()
+
+    def _stub_megatron_training(self, monkeypatch, *, setup=None, get_args=None):
+        """Point TRAINING installers at in-process stubs, not a real Megatron."""
+        training_mod = types.ModuleType("megatron.training.training")
+        training_mod.setup_model_and_optimizer = setup or (
+            lambda *a, **k: ("model", "optimizer", "scheduler")
+        )
+        training_mod.train_step = lambda *a, **k: None
+
+        training_pkg = types.ModuleType("megatron.training")
+        training_pkg.get_args = get_args or (lambda: SimpleNamespace())
+        training_pkg.print_rank_0 = lambda *a, **k: None
+        training_pkg.training = training_mod
+
+        megatron_pkg = types.ModuleType("megatron")
+        megatron_pkg.training = training_pkg
+
+        monkeypatch.setitem(sys.modules, "megatron", megatron_pkg)
+        monkeypatch.setitem(sys.modules, "megatron.training", training_pkg)
+        monkeypatch.setitem(sys.modules, "megatron.training.training", training_mod)
+        return training_mod
+
+    def _stub_mxfp4_hook_deps(self, monkeypatch, register):
+        """Avoid importing real lumen.quantize / megatron.py (AITER, ROCm)."""
+        megatron_compat = types.ModuleType("lumen.models.megatron")
+        megatron_compat.resolve_quant_format = lambda args: getattr(
+            args, "linear_fp8_format", None
+        )
+        quant = types.ModuleType("lumen.quantize")
+        quant.register_mxfp4_weight_optimizer_hooks = register
+        monkeypatch.setitem(sys.modules, "lumen.models.megatron", megatron_compat)
+        monkeypatch.setitem(sys.modules, "lumen.quantize", quant)
+
+    def test_mxfp4_weight_cache_hook_registers_on_mxfp4_run(self, monkeypatch):
+        model, optimizer = object(), object()
+        training_mod = self._stub_megatron_training(
+            monkeypatch,
+            setup=lambda *a, **k: (model, optimizer, None),
+            get_args=lambda: SimpleNamespace(linear_fp8=True, linear_fp8_format="mxfp4"),
+        )
+        register = mock.MagicMock()
+        self._stub_mxfp4_hook_deps(monkeypatch, register)
+        monkeypatch.delenv("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE", raising=False)
+
+        self.hooks.install_mxfp4_weight_cache_hook()
+        training_mod.setup_model_and_optimizer()
+
+        register.assert_called_once_with(model, optimizer)
+
+    def test_mxfp4_weight_cache_hook_skips_when_disabled(self, monkeypatch):
+        training_mod = self._stub_megatron_training(
+            monkeypatch,
+            get_args=lambda: SimpleNamespace(linear_fp8=True, linear_fp8_format="mxfp4"),
+        )
+        register = mock.MagicMock()
+        self._stub_mxfp4_hook_deps(monkeypatch, register)
+        monkeypatch.setenv("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE", "1")
+
+        self.hooks.install_mxfp4_weight_cache_hook()
+        training_mod.setup_model_and_optimizer()
+
+        register.assert_not_called()
+
+    def test_mxfp4_weight_cache_hook_skips_non_mxfp4_format(self, monkeypatch):
+        training_mod = self._stub_megatron_training(
+            monkeypatch,
+            get_args=lambda: SimpleNamespace(linear_fp8=True, linear_fp8_format="fp8_e4m3"),
+        )
+        register = mock.MagicMock()
+        self._stub_mxfp4_hook_deps(monkeypatch, register)
+
+        self.hooks.install_mxfp4_weight_cache_hook()
+        training_mod.setup_model_and_optimizer()
+
+        register.assert_not_called()

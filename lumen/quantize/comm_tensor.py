@@ -9,7 +9,12 @@ import torch.utils._pytree as pytree
 
 from lumen.quantize.fp8_params import quantize_param_to_fp8
 
-__all__ = ["FP8CommTensor", "Blockwise2DFP8Param", "Blockwise2DFP8Gathered"]
+__all__ = [
+    "FP8CommTensor",
+    "Blockwise2DFP8Param",
+    "Blockwise2DFP8Gathered",
+    "MXFP4CommTensor",
+]
 
 
 class FP8CommTensor(torch.Tensor):
@@ -282,3 +287,115 @@ class Blockwise2DFP8Param(torch.Tensor):
             return t
 
         return pytree.tree_map(_wrap, result)
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 FSDP2 all-gather: BF16 shard → FP4 on wire → BF16 dequantized
+# ---------------------------------------------------------------------------
+
+
+class MXFP4CommTensor(torch.Tensor):
+    """FSDP2 parameter wrapper for MXFP4 all-gather communication.
+
+    Wraps a BF16 parameter and provides FSDP2 hooks that quantize the
+    local shard to packed MXFP4 (2D 32×32 block scales) before all-gather,
+    then dequantize back to BF16 after.  This reduces all-gather bandwidth
+    by ~4x (0.5 byte/element + E8M0 scales vs 2 bytes/element for BF16)
+    without changing optimizer, gradient, or forward behaviour — the
+    module sees a normal BF16 weight after all-gather.
+
+    Works for both trainable and frozen weights (unlike the FP4-passthrough
+    approach which requires frozen weights).
+
+    Alignment: ``N % (32 × world_size) == 0`` and ``K % 32 == 0`` so each
+    rank's dim-0 shard is 32-row aligned for 2D block quantization.
+    """
+
+    _block_size: int
+
+    @staticmethod
+    def __new__(cls, data: torch.Tensor, block_size: int = 32):
+        return torch.Tensor._make_wrapper_subclass(
+            cls,
+            data.shape,
+            dtype=data.dtype,
+            device=data.device,
+            requires_grad=data.requires_grad,
+        )
+
+    def __init__(self, data: torch.Tensor, block_size: int = 32):
+        self._data = data
+        self._block_size = block_size
+
+    def __repr__(self):
+        return f"MXFP4CommTensor(shape={list(self.shape)}, dtype={self.dtype})"
+
+    def __tensor_flatten__(self):
+        return ["_data"], {"block_size": self._block_size}
+
+    @classmethod
+    def __tensor_unflatten__(cls, inner_tensors, metadata, outer_size, outer_stride):
+        return cls(inner_tensors["_data"], metadata["block_size"])
+
+    @staticmethod
+    def fsdp_pre_all_gather(tensor) -> tuple[tuple[torch.Tensor, ...], dict]:
+        from lumen.ops.quantize.ops import convert_to_mxfp4_2d
+
+        shard = tensor._data.contiguous()
+        fp4, scale = convert_to_mxfp4_2d(shard.float(), block_size=tensor._block_size)
+        return (fp4, scale), {"block_size": tensor._block_size}
+
+    @staticmethod
+    def fsdp_post_all_gather(
+        all_gather_outputs: tuple[torch.Tensor, ...],
+        metadata: dict,
+        param_dtype: torch.dtype,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        from lumen.ops.quantize.ops import convert_from_mxfp4_2d
+
+        fp4_gathered, scales_gathered = all_gather_outputs
+        block_size = metadata["block_size"]
+        result_f32 = convert_from_mxfp4_2d(
+            fp4_gathered, scales_gathered,
+            output_dtype=torch.float32, block_size=block_size,
+        )
+        if out is not None:
+            out.copy_(result_f32.to(param_dtype))
+            return out
+        return result_f32.to(param_dtype)
+
+    _FSDP2_SAFE_OPS = {
+        torch.ops.aten.copy_.default,
+        torch.ops.aten.split.Tensor,
+        torch.ops.aten.view.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.empty_like.default,
+        torch.ops.aten._to_copy.default,
+        torch.ops.aten.detach.default,
+    }
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args, kwargs=None):
+        kwargs = kwargs or {}
+
+        def _unwrap(x):
+            return x._data if isinstance(x, MXFP4CommTensor) else x
+
+        if func in cls._FSDP2_SAFE_OPS:
+            unwrapped_args = pytree.tree_map(_unwrap, args)
+            unwrapped_kwargs = pytree.tree_map(_unwrap, kwargs)
+            result = func(*unwrapped_args, **unwrapped_kwargs)
+            if isinstance(result, torch.Tensor) and not isinstance(result, MXFP4CommTensor):
+                source = next(
+                    (a for a in pytree.tree_leaves(args) if isinstance(a, MXFP4CommTensor)),
+                    None,
+                )
+                if source is not None:
+                    return MXFP4CommTensor(result, source._block_size)
+            return result
+
+        unwrapped_args = pytree.tree_map(_unwrap, args)
+        unwrapped_kwargs = pytree.tree_map(_unwrap, kwargs)
+        return func(*unwrapped_args, **unwrapped_kwargs)

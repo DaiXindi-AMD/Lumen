@@ -152,9 +152,15 @@ class TestAddCommonFsdpArgs:
         assert args.linear_fp8_wgrad is False
 
     def test_grad_quant_type_choices(self):
-        for gq in ["fp8", "mxfp8", "fp4"]:
+        for gq in ["fp8", "mxfp8", "mxfp4"]:
             args = self._parse(["--grad-quant-type", gq])
             assert args.grad_quant_type == gq
+
+    def test_grad_quant_type_rejects_unimplemented_fp4(self):
+        # ScalingManager still accepts "fp4" so it can raise a clear
+        # NotImplementedError, but offering it on the CLI only buys a crash.
+        with pytest.raises(SystemExit):
+            self._parse(["--grad-quant-type", "fp4"])
 
     def test_first_last_layers_bf16(self):
         args = self._parse(

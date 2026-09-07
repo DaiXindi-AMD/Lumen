@@ -31,6 +31,95 @@ def install_fp8_param_gather_hook() -> None:
     _mt_training.setup_model_and_optimizer = _setup_with_fp8_hook
 
 
+def install_mxfp4_weight_cache_hook() -> None:
+    """Install the Megatron optimizer hook that invalidates MXFP4 weight caches.
+
+    The MXFP4 linear path caches each layer's quantized weight so that
+    gradient-accumulation micro-batches (and gradient-checkpoint recomputes)
+    reuse it instead of re-deriving an identical FP4 tensor.  The cache is
+    keyed on nothing but the module, so it has to be dropped once the BF16
+    master weight changes — otherwise the run silently trains against the
+    step-0 weights.
+    """
+    import megatron.training.training as _mt_training
+    from megatron.training import get_args, print_rank_0
+
+    from lumen.models.megatron import resolve_quant_format
+
+    current_setup = _mt_training.setup_model_and_optimizer
+    if getattr(current_setup, "_lumen_mxfp4_weight_cache_hook", False):
+        return
+
+    def _setup_with_mxfp4_hook(*args, **kwargs):
+        model, optimizer, scheduler = current_setup(*args, **kwargs)
+        train_args = get_args()
+
+        if (
+            getattr(train_args, "linear_fp8", False)
+            and resolve_quant_format(train_args) == "mxfp4"
+            and os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") != "1"
+            and model
+        ):
+            from lumen.quantize import register_mxfp4_weight_optimizer_hooks
+
+            register_mxfp4_weight_optimizer_hooks(model, optimizer)
+            print_rank_0("> MXFP4 weight cache enabled (invalidated on optimizer step)")
+
+        return model, optimizer, scheduler
+
+    _setup_with_mxfp4_hook._lumen_mxfp4_weight_cache_hook = True
+    _mt_training.setup_model_and_optimizer = _setup_with_mxfp4_hook
+
+
+def install_gc_freeze_hook(warmup_steps: int = 20) -> None:
+    """Take the process's permanent Python objects out of the collector's reach.
+
+    A step allocates enough short-lived Python objects to reach a generation-2
+    collection every few steps, and that collection walks *every* tracked object
+    in the process: the imported modules, the Triton and AITER kernel caches,
+    every parameter and every autograd node. Here it measures ~1.2 s, landing on
+    whichever step it happens to fall in — the run's step time is fine at the
+    median and has a tail of steps that take twice as long.
+
+    Almost all of what it walks is alive for the whole run. ``gc.freeze()`` moves
+    the objects that exist when it is called into a permanent generation the
+    collector never visits, so later collections scan only the step's own
+    garbage. It runs after ``warmup_steps`` so that the kernel caches, which fill
+    in on the shapes' first call, are frozen too.
+
+    Set ``LUMEN_GC_FREEZE=0`` to keep stock collector behaviour.
+    """
+    if os.environ.get("LUMEN_GC_FREEZE", "1") == "0":
+        return
+
+    import gc
+
+    import megatron.training.training as _mt_training
+    from megatron.training import print_rank_0
+
+    current_train_step = _mt_training.train_step
+    if getattr(current_train_step, "_lumen_gc_freeze_hook", False):
+        return
+
+    state = {"calls": 0}
+
+    def _train_step_with_gc_freeze(*args, **kwargs):
+        out = current_train_step(*args, **kwargs)
+        state["calls"] += 1
+        if state["calls"] == warmup_steps:
+            gc.collect()
+            gc.freeze()
+            print_rank_0(
+                f"> GC: gc.freeze() after {warmup_steps} steps "
+                f"(freeze_count={gc.get_freeze_count()}; later collections skip frozen objects)"
+            )
+            _mt_training.train_step = current_train_step
+        return out
+
+    _train_step_with_gc_freeze._lumen_gc_freeze_hook = True
+    _mt_training.train_step = _train_step_with_gc_freeze
+
+
 def install_val_loss_early_stop_hook() -> None:
     """Stop training when reduced validation loss reaches ``val_loss_target``."""
     try:
@@ -180,6 +269,22 @@ register_patch(
     tags=frozenset({"fp8", "training", "megatron"}),
     default=False,
 )(install_fp8_param_gather_hook)
+
+register_patch(
+    "mxfp4_weight_cache_hook",
+    PatchPhase.TRAINING,
+    description="Invalidate the per-module MXFP4 weight cache on each optimizer step",
+    tags=frozenset({"mxfp4", "training", "megatron"}),
+    default=False,
+)(install_mxfp4_weight_cache_hook)
+
+register_patch(
+    "gc_freeze_hook",
+    PatchPhase.TRAINING,
+    description="gc.freeze() the long-lived objects after warmup to cut gen-2 pauses",
+    tags=frozenset({"training", "megatron"}),
+    default=False,
+)(install_gc_freeze_hook)
 
 register_patch(
     "fp8_param_storage_hook",

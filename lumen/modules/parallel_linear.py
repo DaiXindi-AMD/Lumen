@@ -41,8 +41,10 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_scatter_to_sequence_parallel_region,
 )
 from megatron.core.tensor_parallel.utils import divide
-from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from torch.nn.parameter import Parameter
+
+from lumen.modules._megatron_compat import condition_init_method, ensure_metadata_has_dp_cp_group
 
 __all__ = ["LumenColumnParallelLinear", "LumenRowParallelLinear", "_DeferredWgrad"]
 
@@ -330,6 +332,27 @@ def _do_gemm(
         return F.linear(input_, weight_bf16, bias)
 
     if scaling_type != "none" or delay_wgrad or use_gemm_bf16:
+        fp8_weight_cache = None
+        fp8_weight_scale = None
+        if scaling_type == "mxfp4":
+            # Native Lumen linears bypass quantize._replace_forward, where the
+            # per-optimizer-step MXFP4 cache is normally populated. Reuse the
+            # same cache on the Parameter itself so eight gradient-accumulation
+            # micro-batches do not re-quantize and transpose an unchanged weight.
+            # register_mxfp4_weight_optimizer_hooks clears it after step().
+            from lumen.quantize import _mxfp4_cached_weight
+
+            gemm_rows = input_.numel() // input_.shape[-1]
+            fp8_weight_cache, fp8_weight_scale = _mxfp4_cached_weight(
+                weight,
+                weight,
+                None,
+                None,
+                scaling_type,
+                fp8_dtype,
+                block_size,
+                gemm_rows=gemm_rows,
+            )
         _pqi = _resolve_pre_quantized_input_with_swiglu_cache(
             pre_quantized_input,
             consume_fp8_activation=(scaling_type != "none"),
@@ -347,6 +370,8 @@ def _do_gemm(
             deferred_wgrad=deferred_wgrad,
             activation_tensor_id=activation_tensor_id,
             pre_quantized_input=_pqi,
+            fp8_weight_cache=fp8_weight_cache,
+            fp8_weight_scale=fp8_weight_scale,
         )
     _discard_swiglu_fp8_cache_safe()
     return F.linear(input_, weight, bias)
@@ -446,8 +471,6 @@ class LumenColumnParallelLinear(nn.Module):
                     torch.empty(self.output_size_per_partition, input_size, dtype=config.params_dtype)
                 )
                 if getattr(config, "perform_initialization", True):
-                    from megatron.core.tensor_parallel.layers import condition_init_method
-
                     _initialize_affine_weight_cpu(
                         self.weight,
                         output_size,
@@ -836,8 +859,6 @@ class LumenRowParallelLinear(nn.Module):
         if getattr(config, "use_cpu_initialization", False):
             self.weight = Parameter(torch.empty(output_size, self.input_size_per_partition, dtype=config.params_dtype))
             if getattr(config, "perform_initialization", True):
-                from megatron.core.tensor_parallel.layers import condition_init_method
-
                 _initialize_affine_weight_cpu(
                     self.weight,
                     output_size,

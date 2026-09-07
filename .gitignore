@@ -9,5 +9,37 @@ build/
 /docs/
 outputs/2026-*/
 tunableop_results*.csv
+# rocprofv3 dumps its counter values here, tens of MB per profiled run. Nothing
+# under it is a source artifact, and with no rule a plain `git add -A` sweeps the
+# whole directory into a commit (which is how 230 MB of .dat files reached a
+# remote branch on 2026-09-06).
+.rocprofv3/
 data/
 *.parquet
+wandb/
+runs/
+train_*.log
+.claude/worktrees/
+
+# Corpora staged by the Megatron launchers (hundreds of MB each)
+examples/*/results/mock_data/
+examples/*/results/c4_data/
+# Run output: training logs and the per-shape GEMM backend cache. Megabytes per
+# run, and the numbers worth keeping are quoted in docs/mxfp4_training_report.md.
+# The handful of reference logs committed before this pattern stay tracked.
+examples/*/results/lumen_*.log
+examples/qwen3/results/*.log
+examples/*/results/mxfp4_autotune_*.json
+examples/*/results/*.shapes.csv
+examples/*/results/*.untuned.csv
+# Event files the --tensorboard-dir flag writes; wandb already has the curves.
+examples/*/results/tensorboard/
+# The profiled launchers write their event files and torch traces into per-run
+# prof_*/ directories instead, which the tensorboard/ rule above does not reach
+# (11 GB of them had accumulated untracked by 2026-09-07). Matched by extension
+# rather than by directory so the small curated summaries that live alongside
+# them -- kernel_summary.txt, compute_stream_gaps.txt -- stay tracked.
+examples/*/results/**/events.out.tfevents.*
+examples/*/results/**/*.pt.trace.json
+# Index of benchmark runs, rebuilt by examples/scripts/run_precision_matrix.sh
+examples/precision_matrix_runs.tsv

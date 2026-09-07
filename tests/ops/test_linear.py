@@ -30,7 +30,9 @@ LINEAR_SHAPES = [
 
 LINEAR_IDS = [repr(c) for c in LINEAR_SHAPES]
 
-ALL_SCALING_TYPES = ["delayed", "dynamic", "per_token", "blockwise", "blockwise2d", "mxfp8", "none"]
+ALL_SCALING_TYPES = [
+    "delayed", "dynamic", "per_token", "blockwise", "blockwise2d", "mxfp8", "mxfp4", "none",
+]
 
 # Backward reuses forward's weight_scale after transposing weight_fp8.
 # Only per-tensor (scalar) scales survive transposition; per_token (N,1) block
@@ -43,10 +45,20 @@ ALL_SCALING_TYPES = ["delayed", "dynamic", "per_token", "blockwise", "blockwise2
 # blockwise(1D) reaches full FP8 DGrad/WGrad via a columnwise re-quant copy of
 # the weight (1×128 along N); WGrad is shared with blockwise2d.
 # Both require M (token count) divisible by 128 — non-aligned M falls back to BF16.
-BWD_SCALING_TYPES = ["delayed", "dynamic", "blockwise", "blockwise2d", "none"]
+#
+# mxfp4 reaches full backward by a different route: DGrad reads a transposed
+# packed-FP4 weight and WGrad applies a Hadamard rotation before quantizing, so
+# neither leg depends on a scale surviving transposition.
+BWD_SCALING_TYPES = ["delayed", "dynamic", "blockwise", "blockwise2d", "mxfp4", "none"]
 
 # SNR floors per scaling type — coarser quantization ⇒ lower expected SNR.
 # mxfp8 uses E8M0 exponent-only scales; blockwise has block granularity.
+#
+# mxfp4 sits above mxfp8 here despite being the narrower format: its floors are
+# set from measurement, and a GEMM averages each operand's quantization error
+# over K, so 4-bit elements do not cost 4-bit accuracy in the product. Measured
+# 15.3 fwd / 17.4-17.8 dx / 15.9-18.9 dw across LINEAR_SHAPES on gfx950; the
+# floors leave room for the run-to-run spread stochastic rounding puts on dw.
 _FWD_SNR = {
     "delayed": 12,
     "dynamic": 12,
@@ -54,6 +66,7 @@ _FWD_SNR = {
     "blockwise": 8,
     "blockwise2d": 8,
     "mxfp8": 5,
+    "mxfp4": 12,
     "none": 25,
 }
 _BWD_DX_SNR = {
@@ -63,6 +76,7 @@ _BWD_DX_SNR = {
     "blockwise": 4,
     "blockwise2d": 4,
     "mxfp8": 3,
+    "mxfp4": 12,
     "none": 20,
 }
 _BWD_DW_SNR = {
@@ -72,20 +86,24 @@ _BWD_DW_SNR = {
     "blockwise": 4,
     "blockwise2d": 4,
     "mxfp8": 3,
+    "mxfp4": 10,
     "none": 20,
 }
 
 
 def _block_size_for(scaling_type, default=128):
     """Effective block_size used by quantize_input for this scaling type."""
-    if scaling_type == "mxfp8":
+    if scaling_type in ("mxfp8", "mxfp4"):
         return 32 if default > 64 else default
     return default
 
 
 def _skip_if_unaligned(config, scaling_type, *, bwd=False):
     block_size = _block_size_for(scaling_type)
-    if scaling_type in ("blockwise", "blockwise2d", "mxfp8") and config.K % block_size != 0:
+    if (
+        scaling_type in ("blockwise", "blockwise2d", "mxfp8", "mxfp4")
+        and config.K % block_size != 0
+    ):
         pytest.skip(f"K={config.K} not divisible by block_size={block_size}")
     # blockwise2d backward needs M (token count) % 128 == 0 because the WGrad
     # kernel groups along the M axis with GROUP_K=128. Non-aligned M would

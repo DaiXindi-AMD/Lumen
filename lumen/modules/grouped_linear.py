@@ -19,10 +19,11 @@ import torch.nn.functional as F
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.moe.moe_utils import ProcessGroupCollection
-from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.utils import get_pg_rank, get_pg_size
 from torch.nn.parameter import Parameter
 
+from lumen.modules._megatron_compat import ensure_metadata_has_dp_cp_group
 from lumen.modules.parallel_linear import _DeferredWgrad, _get_tp_group, _pg_size
 
 __all__ = [

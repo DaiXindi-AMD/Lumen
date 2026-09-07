@@ -87,6 +87,10 @@ _NORM_ATTRS = (
     "final_layernorm",
 )
 
+# Per-head QK norms sit one level down, inside the attention submodule spec, and
+# normalise over head_dim instead of hidden_size.
+_ATTN_NORM_ATTRS = ("q_layernorm", "k_layernorm")
+
 
 def patch_norms_in_spec(spec, norm_cls=None) -> None:
     """Replace norm classes in a spec tree with Lumen norm factories."""
@@ -105,6 +109,17 @@ def patch_norms_in_spec(spec, norm_cls=None) -> None:
             cur = getattr(spec.submodules, attr, None)
             if cur is not None and cur is not IdentityOp:
                 setattr(spec.submodules, attr, norm_cls)
+
+        for attn_attr in ("self_attention", "cross_attention"):
+            attn_sub = getattr(getattr(spec.submodules, attn_attr, None), "submodules", None)
+            if attn_sub is None:
+                continue
+            for attr in _ATTN_NORM_ATTRS:
+                cur = getattr(attn_sub, attr, None)
+                # L2Norm is a different normalisation, not an RMSNorm variant.
+                if cur is None or cur is IdentityOp or getattr(cur, "__name__", "") == "L2Norm":
+                    continue
+                setattr(attn_sub, attr, norm_cls)
 
     layer_specs = getattr(spec, "layer_specs", None)
     if layer_specs is None and hasattr(spec, "submodules"):

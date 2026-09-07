@@ -32,6 +32,11 @@ import torch
 import torch.nn as nn
 
 from lumen.core.grad_quant import quantize_grad_tensor
+from lumen.kernels.rmsnorm import (
+    NARROW_RMSNORM_MAX_N,
+    narrow_rmsnorm_backward,
+    narrow_rmsnorm_forward,
+)
 from lumen.ops.dispatch import (
     Backend,
     _probe_aiter_fused_add_rmsnorm_pad,
@@ -105,6 +110,48 @@ def _get_triton_fused_add_rmsnorm_pad():
 def _rmsnorm_triton(x_2d, weight, eps):
     fn = _get_triton_rms_norm()
     return fn(x_2d, weight, eps)
+
+
+_num_sms_cached = None
+
+
+def _num_sms(device) -> int:
+    global _num_sms_cached
+    if _num_sms_cached is None:
+        _num_sms_cached = torch.cuda.get_device_properties(device).multi_processor_count
+    return _num_sms_cached
+
+
+def _rows_are_short(x_2d: torch.Tensor, weight: torch.Tensor) -> bool:
+    """True when the row is too short to fill a wavefront.
+
+    AITER specialises its forward for this case but not its backward, so per-head
+    norms (``N = head_dim``) spend most of the backward with idle lanes.
+    """
+    return (
+        x_2d.shape[-1] <= NARROW_RMSNORM_MAX_N
+        and x_2d.is_cuda
+        and weight.dim() == 1
+        and weight.is_contiguous()
+    )
+
+
+class _NarrowRMSNorm(torch.autograd.Function):
+    """RMSNorm over short rows, using Lumen's row-tiling kernels."""
+
+    @staticmethod
+    def forward(ctx, x_2d, weight, eps):
+        y, rsigma = narrow_rmsnorm_forward(x_2d, weight, eps)
+        ctx.save_for_backward(x_2d, weight, rsigma)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        x_2d, weight, rsigma = ctx.saved_tensors
+        if not dy.is_contiguous():
+            dy = dy.contiguous()
+        dx, dw = narrow_rmsnorm_backward(dy, x_2d, weight, rsigma, _num_sms(x_2d.device))
+        return dx, dw, None
 
 
 def _build_rmsnorm_chain():
@@ -205,10 +252,13 @@ def rmsnorm(
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
+    needs_grad = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
 
     if _USE_APEX_RMSNORM:
         y = _rmsnorm_apex(x_2d, weight, eps)
-    elif torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad) and _probe_aiter_triton_rmsnorm():
+    elif needs_grad and _rows_are_short(x_2d, weight):
+        y = _NarrowRMSNorm.apply(_to_2d(x), weight, eps)
+    elif needs_grad and _probe_aiter_triton_rmsnorm():
         y = _rmsnorm_triton(x_2d, weight, eps)
     else:
         y = try_backends(_get_rmsnorm_chain(), x_2d, weight, eps, op_name="rmsnorm")

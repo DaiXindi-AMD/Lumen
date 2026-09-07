@@ -191,6 +191,54 @@ def test_rmsnorm_fwd_bwd(config, dtype):
     assert dw_snr > min_snr - 5, f"RMSNorm dw SNR: {dw_snr:.1f} dB"
 
 
+# Per-head QK norms: many rows, each too short to fill a wavefront. This is the
+# shape that routes to Lumen's row-tiling kernels instead of AITER's.
+NARROW_SHAPES = [NormConfig(524288, 128), NormConfig(131072, 128), NormConfig(65535, 64)]
+
+
+@pytest.mark.parametrize("config", NARROW_SHAPES, ids=[repr(c) for c in NARROW_SHAPES])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_rmsnorm_narrow_rows(config, dtype):
+    x = torch.randn(config.M, config.N, device="cuda", dtype=dtype, requires_grad=True)
+    weight = torch.randn(config.N, device="cuda", dtype=dtype, requires_grad=True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    w_ref = weight.detach().clone().requires_grad_(True)
+
+    go = torch.randn_like(x)
+    rmsnorm_ref(x_ref, w_ref, eps=1e-6).backward(go)
+    norm_ops.rmsnorm(x, weight, eps=1e-6).backward(go)
+
+    min_snr = 30 if dtype == torch.float32 else 20
+    for label, ref, got in (
+        ("output", rmsnorm_ref(x_ref, w_ref, eps=1e-6), norm_ops.rmsnorm(x, weight, eps=1e-6)),
+        ("dx", x_ref.grad, x.grad),
+        ("dw", w_ref.grad, weight.grad),
+    ):
+        snr = compute_snr(ref, got)
+        assert snr > min_snr - 5, f"narrow RMSNorm {label} SNR: {snr:.1f} dB"
+
+
+def test_rmsnorm_narrow_rows_handles_noncontiguous_input():
+    """Megatron hands per-head norms a strided view out of the fused QKV output."""
+    s, b, heads, head_dim = 512, 2, 8, 128
+    qkv = torch.randn(s, b, heads, head_dim * 3, device="cuda", dtype=torch.bfloat16)
+    x = qkv[..., :head_dim]
+    assert not x.reshape(-1, head_dim).is_contiguous()
+
+    weight = torch.randn(head_dim, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    x_lumen = x.detach().clone().requires_grad_(True)
+    x_ref = x.detach().clone().requires_grad_(True)
+    w_ref = weight.detach().clone().requires_grad_(True)
+
+    go = torch.randn_like(x)
+    out = norm_ops.rmsnorm(x_lumen, weight, eps=1e-6)
+    out.backward(go)
+    rmsnorm_ref(x_ref, w_ref, eps=1e-6).backward(go)
+
+    assert out.shape == x.shape
+    assert compute_snr(x_ref.grad, x_lumen.grad) > 15
+
+
 # ===================================================================
 # RMSNorm with fused quantization — forward
 # ===================================================================

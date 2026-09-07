@@ -357,6 +357,52 @@ def test_attention_csrc_causal(config):
     _run_fwd_test(config, "aiter_csrc", causal=True, min_snr=20, label="CK causal")
 
 
+@pytest.mark.skipif(not _aiter_available, reason="AITER not installed")
+@pytest.mark.parametrize(
+    "config",
+    [AttnConfig(512, 512, 8, 2, 128, 128)],
+    ids=["sq512_sk512_hq8_hkv2_d128"],
+)
+def test_attention_csrc_seq_major_out_matches_default(config):
+    """``seq_major_out`` must change only where the values land, not what they are.
+
+    The output buffer is handed to CK as a transposed view, so the kernel writes
+    a strided destination and the backward then reads strided ``out`` / ``dout``.
+    The forward is exact under that change. The gradients cannot be held to bit
+    equality -- they accumulate through fp32 atomics, so the default path does
+    not reproduce itself either -- but atomic reordering only costs a last bit,
+    which leaves the SNR far above what any real layout error could survive.
+    """
+    dtype = torch.bfloat16
+    device = "cuda"
+    batch_size = 2
+    sm_scale = config.head_dim_qk ** (-0.5)
+
+    def run(seq_major):
+        q, k, v = _make_tensors(config, batch_size, dtype, device)
+        for t in (q, k, v):
+            t.requires_grad_(True)
+        out = attn_ops.attention(
+            q, k, v, softmax_scale=sm_scale, causal=True,
+            backend_type="aiter_csrc", seq_major_out=seq_major,
+        )
+        # randn_like would inherit the output's strides and so hand the two runs
+        # different values; allocate the upstream gradient explicitly.
+        torch.manual_seed(0)
+        out.backward(torch.randn(out.shape, dtype=out.dtype, device=out.device))
+        return out, q.grad, k.grad, v.grad
+
+    ref_out, ref_dq, ref_dk, ref_dv = run(False)
+    got_out, got_dq, got_dk, got_dv = run(True)
+
+    assert not ref_out.permute(1, 0, 2, 3).is_contiguous()
+    assert got_out.permute(1, 0, 2, 3).is_contiguous(), "seq-major layout not honoured"
+
+    torch.testing.assert_close(got_out, ref_out, atol=0, rtol=0)
+    for name, ref, got in (("dQ", ref_dq, got_dq), ("dK", ref_dk, got_dk), ("dV", ref_dv, got_dv)):
+        _assert_fwd_snr(ref, got, 50, f"seq-major {name}")
+
+
 # ###################################################################
 # FP8 quantized attention (attention_fp8_quant)
 # ###################################################################
