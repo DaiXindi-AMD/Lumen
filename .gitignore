@@ -34,5 +34,12 @@ examples/*/results/*.shapes.csv
 examples/*/results/*.untuned.csv
 # Event files the --tensorboard-dir flag writes; wandb already has the curves.
 examples/*/results/tensorboard/
+# The profiled launchers write their event files and torch traces into per-run
+# prof_*/ directories instead, which the tensorboard/ rule above does not reach
+# (11 GB of them had accumulated untracked by 2026-09-07). Matched by extension
+# rather than by directory so the small curated summaries that live alongside
+# them -- kernel_summary.txt, compute_stream_gaps.txt -- stay tracked.
+examples/*/results/**/events.out.tfevents.*
+examples/*/results/**/*.pt.trace.json
 # Index of benchmark runs, rebuilt by examples/scripts/run_precision_matrix.sh
 examples/precision_matrix_runs.tsv
