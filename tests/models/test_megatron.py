@@ -1171,6 +1171,28 @@ class TestEnableFP8ForParallelLinear:
         enable_fp8_for_parallel_linear(model)
         mock_print.assert_not_called()
 
+    @mock.patch("lumen.models.megatron.print_rank_0")
+    def test_block_size_taken_from_quant_config_when_unset(self, mock_print):
+        from lumen.modules.parallel_linear import LumenColumnParallelLinear
+        from lumen.quantize.config import QuantConfig
+
+        class _MockLumenCol(LumenColumnParallelLinear):
+            def __init__(self):
+                nn.Module.__init__(self)
+                self.enable_fp8 = mock.MagicMock()
+
+        mock_linear = _MockLumenCol()
+        model = nn.Sequential(mock_linear)
+
+        enable_fp8_for_parallel_linear(
+            model,
+            scaling_type="mxfp4",
+            block_size=None,
+            quant_config=QuantConfig(block_size=32),
+        )
+
+        assert mock_linear.enable_fp8.call_args.kwargs["block_size"] == 32
+
 
 # ===================================================================
 # model_provider -> parallel linear recipe
@@ -1199,7 +1221,7 @@ class TestModelProviderParallelLinearRecipe:
             num_layers=4,
         )
 
-    def _captured_scaling_type(self, fmt):
+    def _captured_kwargs(self, fmt):
         from lumen.models.megatron import make_lumen_model_provider
 
         provider = make_lumen_model_provider(
@@ -1213,16 +1235,21 @@ class TestModelProviderParallelLinearRecipe:
             side_effect=lambda model, **kw: captured.update(kw),
         ):
             provider()
-        return captured["scaling_type"]
+        return captured
 
     def test_mxfp4_run_configures_linears_for_mxfp4(self):
-        assert self._captured_scaling_type("mxfp4") == "mxfp4"
+        assert self._captured_kwargs("mxfp4")["scaling_type"] == "mxfp4"
 
     def test_mxfp8_run_configures_linears_for_mxfp8(self):
-        assert self._captured_scaling_type("mxfp8") == "mxfp8"
+        assert self._captured_kwargs("mxfp8")["scaling_type"] == "mxfp8"
 
     def test_fp8_run_still_uses_its_scaling_string(self):
-        assert self._captured_scaling_type("fp8_e4m3") == "blockwise"
+        assert self._captured_kwargs("fp8_e4m3")["scaling_type"] == "blockwise"
+
+    def test_mxfp4_run_forwards_block_size_32(self):
+        # Omitting block_size leaves the linears at their init default of 128,
+        # which silently disables the MXFP4 scale-swizzle fusion.
+        assert self._captured_kwargs("mxfp4")["block_size"] == 32
 
 
 # ===================================================================

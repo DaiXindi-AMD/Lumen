@@ -820,6 +820,14 @@ def enable_fp8_for_parallel_linear(
 
         fp8_dtype = _get_float8_e4m3()
 
+    # MXFP4 coerces the CLI block size to 32 on args, and QuantConfig carries it
+    # from there. Leaving block_size=None keeps the linears on their init default
+    # of 128, and _mxfp4_cached_weight then compares a scale grid the quantizer
+    # built at 32 against a tile grid derived from 128 -- never equal, so the
+    # scale-swizzle fusion is unreachable.
+    if block_size is None and quant_config is not None:
+        block_size = quant_config.block_size
+
     # Tell the fused SwiGLU quant bridge (LUMEN_FUSED_SWIGLU_QUANT) the global
     # activation scale granularity so its cached scale layout matches the fc2
     # GEMM that consumes it (blockwise2d needs a 2D 1×block scale, not 1D).
@@ -1211,6 +1219,7 @@ def make_lumen_model_provider(
             enable_fp8_for_parallel_linear(
                 model,
                 scaling_type=scaling_type,
+                block_size=cfg.quant_config.block_size,
                 fp8_mha=getattr(args, "lumen_fp8_attn", "none") == "mha",
                 gradient_accumulation_fusion=getattr(args, "lumen_gradient_accumulation_fusion", False),
                 delay_wgrad=getattr(args, "lumen_delay_wgrad", False),
