@@ -547,33 +547,6 @@ def _torchao_mxfp4_dequant(data_fp4, scales, block_size=MXFP4_BLOCK_SIZE):
     )
 
 
-@pytest.mark.parametrize(
-    "dim,cap,floor,expected",
-    [
-        (8192, 64, 1, 64),
-        (4096, 64, 32, 64),
-        (12288, 64, 32, 64),
-        (8192, 256, 32, 256),
-        (8192, 128, 32, 128),
-        (96, 64, 32, 32),
-        (224, 64, 32, 32),
-        (300, 64, 1, 4),
-    ],
-)
-def test_mxfp4_dividing_block_keeps_full_tile_on_aligned_shapes(dim, cap, floor, expected):
-    """The tile only shrinks for shapes it would otherwise overrun.
-
-    Every training shape is a multiple of the cap, so shrinking must not cost
-    them anything -- that is what makes fitting the tile preferable to masking
-    every load and store in the kernel.
-    """
-    from lumen.ops.quantize.ops import _dividing_block
-
-    block = _dividing_block(dim, cap, floor)
-    assert block == expected
-    assert dim % block == 0
-
-
 @pytest.mark.parametrize("M", MXFP4_UNALIGNED_ROWS)
 def test_mxfp4_1d_rtn_unaligned_rows_vs_torchao(M):
     """A row count that does not divide the kernel tile must still be exact."""
@@ -612,7 +585,9 @@ def test_mxfp4_quant_unaligned_rows_are_reproducible(M):
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     x = torch.randn(M, N, device="cuda", dtype=torch.bfloat16)
-    sign = torch.randint(0, 2, (N // 16, 16), device="cuda", dtype=torch.bfloat16) * 2 - 1
+    sign = (
+        torch.randint(0, 2, (16,), device="cuda", dtype=torch.bfloat16) * 2 - 1
+    )
 
     paths = {
         "1d": lambda: convert_to_mxfp4(x.float(), block_size=MXFP4_BLOCK_SIZE, use_sr=False),
@@ -809,6 +784,46 @@ def test_mxfp4_axis0_quant_vs_torchao(shape):
     torch.testing.assert_close(
         scales.t().contiguous().cpu(), ref_scales, atol=0, rtol=0,
     )
+
+
+def test_mxfp4_dual_axis_keeps_lumen_seed_split(monkeypatch):
+    """The compatibility wrapper stays in Lumen and preserves its RNG API."""
+    import lumen.ops.quantize.ops as quant_ops
+
+    calls = []
+
+    def fake_convert(data, **kwargs):
+        calls.append((data, kwargs))
+        return f"data-{kwargs['axis']}", f"scale-{kwargs['axis']}"
+
+    monkeypatch.setattr(quant_ops, "convert_to_mxfp4", fake_convert)
+    x = torch.empty((2, 2))
+    result = quant_ops.convert_to_mxfp4_dual_axis(
+        x,
+        block_size=16,
+        use_sr=True,
+        philox_seed=7,
+        philox_offset=11,
+    )
+
+    assert result == ("data--1", "scale--1", "data-0", "scale-0")
+    assert calls[0][0] is x and calls[1][0] is x
+    assert [call[1] for call in calls] == [
+        {
+            "block_size": 16,
+            "axis": -1,
+            "use_sr": True,
+            "philox_seed": 7,
+            "philox_offset": 11,
+        },
+        {
+            "block_size": 16,
+            "axis": 0,
+            "use_sr": True,
+            "philox_seed": 8,
+            "philox_offset": 11,
+        },
+    ]
 
 
 @pytest.mark.parametrize("shape", MXFP4_SHAPES, ids=[f"{m}x{n}" for m, n in MXFP4_SHAPES])

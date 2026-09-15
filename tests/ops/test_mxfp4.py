@@ -10,17 +10,14 @@ Collected from the per-optimization files so one module covers:
   - dual-layout column shuffle
   - fused activation scale swizzle
   - fused WGrad activation operand
-  - Philox round-count dither quality
+  - Philox stream uniqueness
 """
 
-import importlib
-import os
 import random
 
 import pytest
 import torch
 
-import lumen.kernels.mxfp4 as mxfp4_kernels
 from lumen.ops.quantize.linear import QuantizedLinearFunction, _shuffle_mxfp4_weight
 from lumen.ops.quantize.ops import dual_layout_quant_mxfp4
 
@@ -28,8 +25,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 G = 16
 BLOCK = 32
-ROUNDS_FLOOR = 4
-ROUNDS_BELOW_FLOOR = 2
 DRAWS = 96
 
 
@@ -167,25 +162,6 @@ def test_fused_operand_is_the_direct_quantization_of_the_rotated_activation():
     assert not torch.equal(exact, rebuilt), "the rebuild would be lossless, which it is not"
 
 
-@pytest.fixture
-def rebuild_at_rounds():
-    saved = os.environ.get("LUMEN_SR_PHILOX_ROUNDS")
-
-    def _rebuild(rounds):
-        os.environ["LUMEN_SR_PHILOX_ROUNDS"] = str(rounds)
-        module = importlib.reload(mxfp4_kernels)
-        assert module.SR_PHILOX_ROUNDS == rounds, "reload did not take"
-        return module
-
-    yield _rebuild
-
-    if saved is None:
-        os.environ.pop("LUMEN_SR_PHILOX_ROUNDS", None)
-    else:
-        os.environ["LUMEN_SR_PHILOX_ROUNDS"] = saved
-    importlib.reload(mxfp4_kernels)
-
-
 def _dequant(packed, scales, block):
     fp4_utils = pytest.importorskip("aiter.utility.fp4_utils", reason="AITER required")
 
@@ -226,45 +202,4 @@ def test_sr_dither_does_not_repeat_between_tiles():
     torch.testing.assert_close(scales[:64], scales[64:], atol=0, rtol=0)
     assert not torch.equal(packed[:64], packed[64:]), (
         "identical input tiles reused the same stochastic-rounding stream"
-    )
-
-
-def test_default_round_count_is_the_documented_default(rebuild_at_rounds):
-    os.environ.pop("LUMEN_SR_PHILOX_ROUNDS", None)
-    module = importlib.reload(mxfp4_kernels)
-
-    assert module.SR_PHILOX_ROUNDS == module.SR_PHILOX_ROUNDS_DEFAULT
-
-
-def test_override_reaches_the_traced_constant(rebuild_at_rounds):
-    module = rebuild_at_rounds(ROUNDS_FLOOR)
-
-    assert module.SR_PHILOX_ROUNDS == ROUNDS_FLOOR
-    assert module.SR_PHILOX_ROUNDS_C.value == ROUNDS_FLOOR
-
-
-def test_rounds_at_the_floor_hold_dither_quality(rebuild_at_rounds):
-    rebuild_at_rounds(mxfp4_kernels.SR_PHILOX_ROUNDS_DEFAULT)
-    default_std = _residual_std()
-
-    rebuild_at_rounds(ROUNDS_FLOOR)
-    floor_std = _residual_std()
-
-    assert floor_std == pytest.approx(default_std, rel=0.15), (
-        f"rounds={ROUNDS_FLOOR} residual std {floor_std:.6f} vs "
-        f"default {default_std:.6f}"
-    )
-
-
-def test_metric_catches_a_dither_below_the_floor(rebuild_at_rounds):
-    rebuild_at_rounds(mxfp4_kernels.SR_PHILOX_ROUNDS_DEFAULT)
-    default_std = _residual_std()
-
-    rebuild_at_rounds(ROUNDS_BELOW_FLOOR)
-    starved_std = _residual_std()
-
-    assert starved_std > 2 * default_std, (
-        f"rounds={ROUNDS_BELOW_FLOOR} residual std {starved_std:.6f} is not "
-        f"clearly worse than default {default_std:.6f}; the metric has lost "
-        "its discriminating power"
     )

@@ -1287,6 +1287,10 @@ def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_s
     if not row_scales_swizzled or not _mxfp4_can_fuse_scale_swizzle((K, M // block)):
         return None
 
+    # AITER's per_1x32_f4_quant_for_dot_scaled is only a convenience wrapper
+    # around two independent deterministic quantizations.  It cannot serve
+    # this path: the second layout must contain the original blockwise H16 RHT,
+    # and the fused operator also avoids rereading the dense activation.
     from lumen.ops.quantize.ops import dual_layout_quant_mxfp4
     from lumen.quantize.descriptor import FP8Descriptor
 
@@ -2539,7 +2543,9 @@ class QuantizedLinearFunction(torch.autograd.Function):
         # quantized once into both layouts DGrad and WGrad need; and the
         # activation's WGrad operand goes from stored FP4 straight to rotated,
         # transposed FP4, never writing the BF16 form in between.
-        # Per layer: 3 quant, 3 FP4 GEMM, no dequant/Hadamard/transpose.
+        # Per layer: 3 quant and 3 FP4 GEMMs, with no separate global-memory
+        # dequant/Hadamard/transpose passes. The two WGrad operands still receive
+        # the same RHT as before; it is fused into the AITER quantizers below.
         if scaling_type == "mxfp4":
             from lumen.ops.quantize.ops import (
                 convert_from_mxfp4,
@@ -2613,6 +2619,9 @@ class QuantizedLinearFunction(torch.autograd.Function):
                         # rotated + transposed for WGrad. Quantizing it once for
                         # both keeps the read dense; taking dY^T as a view instead
                         # costs 1.70x on the same shape (report §5.10).
+                        # per_1x32_f4_quant_for_dot_scaled is not equivalent: it
+                        # is two deterministic reference calls, with neither
+                        # payload SR nor the shared H16 RHT required here.
                         sign_m = _get_mxfp4_rht_sign(grad_flat.device)
                         # Storing the scales already swizzled saves a permuting
                         # pass over each on the way into the GEMM.

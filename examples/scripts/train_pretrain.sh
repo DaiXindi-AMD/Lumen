@@ -156,14 +156,6 @@ AITER_OPTIONAL=(
     ops/triton/_triton_kernels/quant/quant_fp8_blockwise.py
     ops/triton/_triton_kernels/quant/quant_mxfp8.py
 )
-# The swiglu kernels are Lumen's own and absent from aiter at the pinned
-# submodule commit, so they live under third_party/aiter_vendor. A file check
-# would not catch it: activation.py is there, only the two symbols are not.
-AITER_VENDOR_FILES=(
-    ops/triton/activation.py
-    ops/triton/_triton_kernels/activation.py
-)
-
 aiter_missing() {
     local rel
     for rel in "$@"; do
@@ -193,11 +185,8 @@ if [ ${#MISSING_OPTIONAL[@]} -gt 0 ]; then
 fi
 
 if ! python -c "from aiter.ops.triton.activation import swiglu_fwd, swiglu_bwd" 2>/dev/null; then
-    echo "[setup] WARNING: the installed aiter (${AITER_DIR}) has no swiglu kernels."
-    echo "[setup] Training will run with LUMEN_FUSED_SWIGLU=1 silently inactive:"
-    for rel in "${AITER_VENDOR_FILES[@]}"; do
-        echo "  cp ${LUMEN_ROOT}/third_party/aiter_vendor/aiter/${rel} ${AITER_DIR}/${rel}"
-    done
+    echo "[setup] WARNING: the installed aiter (${AITER_DIR}) has no public fused SwiGLU training API."
+    echo "[setup] Training will run with LUMEN_FUSED_SWIGLU=1 silently inactive."
 fi
 
 # The RMSNorm layer-spec patch rewrites Megatron to use apex's FusedRMSNorm, so

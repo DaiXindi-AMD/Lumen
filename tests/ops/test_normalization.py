@@ -191,8 +191,8 @@ def test_rmsnorm_fwd_bwd(config, dtype):
     assert dw_snr > min_snr - 5, f"RMSNorm dw SNR: {dw_snr:.1f} dB"
 
 
-# Per-head QK norms: many rows, each too short to fill a wavefront. This is the
-# shape that routes to Lumen's row-tiling kernels instead of AITER's.
+# Per-head QK norms: many rows, each too short to fill a wavefront. These shapes
+# exercise AITER's persistent narrow-row backward schedule through Lumen.
 NARROW_SHAPES = [NormConfig(524288, 128), NormConfig(131072, 128), NormConfig(65535, 64)]
 
 

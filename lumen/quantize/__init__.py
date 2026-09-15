@@ -138,12 +138,12 @@ def get_quant_backend(prefer: str = "auto") -> str:
 
 # MXFP4 is supported on gfx950 (MI350/MI355) and nowhere else.
 #
-# The FP4 conversion has two implementations. gfx950 has the arithmetic in
-# hardware -- ``v_cvt_scalef32_[sr_]pk_fp4_{f32,bf16}``, which round correctly
-# and whose SR is unbiased by construction -- and that is the path this feature
-# was built, measured and trained on. Every other architecture lands in the
-# Triton software fallback in ``lumen.kernels.mxfp4._pack_fp4``, which is not
-# equivalent to it:
+# AITER's gfx950 path uses the native
+# ``v_cvt_scalef32_[sr_]pk_fp4_{f32,bf16}`` instructions, which round correctly
+# and whose SR is unbiased by construction. That is the path this feature was
+# built, measured and trained on. AITER deliberately refuses payload SR on
+# architectures where an equivalent implementation has not been validated.
+# Historical software fallbacks had the following correctness problems:
 #
 #   - SR's dither is one-sided. ``tl.randint4x`` returns signed int32, so the
 #     noise lands in [-0.5, 0.5) and ``(noise - 0.5) * 0.01`` is never
