@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lumen Tests"
+  short_description: "Validate Lumen ops, modules, and numerical accuracy"

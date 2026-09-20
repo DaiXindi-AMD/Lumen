@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lumen Benchmarks"
+  short_description: "Measure Lumen GPU performance and overlap"

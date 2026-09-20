@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lumen Training"
+  short_description: "Debug Lumen training against a trusted reference"

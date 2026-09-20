@@ -1,0 +1,3 @@
+interface:
+  display_name: "Lumen SDMA"
+  short_description: "Choose SDMA or RCCL for the measured schedule"
