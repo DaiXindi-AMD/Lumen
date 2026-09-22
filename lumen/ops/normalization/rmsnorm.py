@@ -205,11 +205,15 @@ def rmsnorm(
 
     orig_shape = x.shape
     x_2d = x.reshape(-1, x.shape[-1])
+    needs_grad = torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad)
 
     if _USE_APEX_RMSNORM:
         y = _rmsnorm_apex(x_2d, weight, eps)
-    elif torch.is_grad_enabled() and (x.requires_grad or weight.requires_grad) and _probe_aiter_triton_rmsnorm():
-        y = _rmsnorm_triton(x_2d, weight, eps)
+    elif needs_grad and _probe_aiter_triton_rmsnorm():
+        # AITER owns both the generic and persistent large-M/small-N schedules.
+        # Keep the contiguous conversion here because Megatron Q/K norm inputs
+        # can be non-contiguous views.
+        y = _rmsnorm_triton(_to_2d(x), weight, eps)
     else:
         y = try_backends(_get_rmsnorm_chain(), x_2d, weight, eps, op_name="rmsnorm")
     return y.reshape(orig_shape)
@@ -547,6 +551,9 @@ class LumenRMSNorm(nn.Module):
         hidden_size: Last dimension of the input.
         eps: Epsilon for numerical stability.
         grad_quant_type: Gradient quantization format.
+        sequence_parallel: Whether the input sequence is split across the tensor
+            parallel group. Each rank then holds a partial weight gradient, which
+            Megatron only all-reduces for parameters tagged with this flag.
 
     Example::
 
@@ -559,11 +566,13 @@ class LumenRMSNorm(nn.Module):
         hidden_size: int,
         eps: float = 1e-6,
         grad_quant_type: Optional[str] = None,
+        sequence_parallel: bool = False,
     ):
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(hidden_size))
         self.grad_quant_type = grad_quant_type
+        self.weight.sequence_parallel = sequence_parallel
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return rmsnorm(x, self.weight.to(x.dtype), self.eps, self.grad_quant_type)

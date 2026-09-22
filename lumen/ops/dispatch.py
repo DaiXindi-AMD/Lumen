@@ -16,13 +16,14 @@ import functools
 import logging
 import os
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 _SKIP_BACKEND_SYNC = os.environ.get("LUMEN_SKIP_BACKEND_SYNC", "0") == "1"
 
-_backend_cache: Dict[str, int] = {}
+# op_name -> winning backend label; also op_name + ":hits" / ":prev" / ":warned".
+_backend_cache: Dict[str, Any] = {}
 _BACKEND_WARMUP_CALLS = 3
 
 _IN_GRAPH_CAPTURE = False
@@ -221,6 +222,53 @@ def _probe_aiter_triton_gemm_mxfp8():
 
 
 @functools.lru_cache(maxsize=1)
+def _probe_aiter_triton_gemm_mxfp4():
+    """Check if AITER Triton MXFP4 GEMM (gemm_afp4wfp4) is available."""
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4 as _  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_aiter_triton_gemm_mxfp4_preshuffle():
+    """Check if AITER Triton MXFP4 GEMM with shuffled operand layout is available.
+
+    Needs both the kernel and the shuffle helpers that build its layout.
+    """
+    try:
+        from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import gemm_afp4wfp4_preshuffle as _  # noqa: F401
+        from aiter.ops.triton.utils.shuffle import (  # noqa: F401
+            shuffle_scale_gemm as _s,
+            shuffle_weight as _w,
+        )
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_aiter_gemm_mxfp4_asm():
+    """Check if AITER's prebuilt A4W4 ASM/CK MXFP4 GEMM is available.
+
+    Needs the dispatcher, the tuned-config table it picks kernels from, and the
+    two layout helpers that build the operand layout those kernels read.
+    """
+    try:
+        from aiter import gemm_a4w4 as _  # noqa: F401
+        from aiter.ops.gemm_op_a4w4 import get_GEMM_config as _c  # noqa: F401
+        from aiter.ops.shuffle import shuffle_weight as _w  # noqa: F401
+        from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm as _s  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
 def _probe_aiter_triton_rope_cached():
     """Check if AITER Triton cached RoPE (SBHD layout) is available."""
     try:
@@ -390,7 +438,10 @@ def _probe_aiter_fused_ungated():
 def _probe_aiter_swiglu():
     """Check if AITER Triton fused SwiGLU fwd/bwd kernels are available."""
     try:
-        from aiter.ops.triton.activation import swiglu_fwd as _  # noqa: F401
+        from aiter.ops.triton.activation import (  # noqa: F401
+            swiglu_bwd as _backward,
+            swiglu_fwd as _,
+        )
 
         return True
     except (ImportError, OSError):
@@ -437,10 +488,24 @@ def _probe_aiter_fused_gemm_blockscale_mul_add():
 # ---------------------------------------------------------------------------
 
 
+def _entry_label(entry: Tuple) -> str:
+    """Stable identity for one fallback-chain entry.
+
+    ``Backend`` on its own is not unique: ``gemm_mxfp4`` offers three
+    ``Backend.TRITON`` entries (preshuffled, row-major, and the dequant→BF16
+    fallback), so a chain that reuses a ``Backend`` passes an explicit label as
+    a third tuple element.
+    """
+    if len(entry) >= 3:
+        return entry[2]
+    return entry[0].value
+
+
 def try_backends(
     backends: List[Tuple[Backend, Callable]],
     *args,
     op_name: str = "op",
+    slow_labels: Sequence[str] = (),
     **kwargs,
 ) -> Any:
     """Try each ``(backend, fn)`` pair in order; return first success.
@@ -453,8 +518,17 @@ def try_backends(
     lookup fails.  If all fail, raises the last exception.
 
     After a backend succeeds ``_BACKEND_WARMUP_CALLS`` consecutive times
-    for a given ``op_name``, the winning index is cached and subsequent
-    calls skip the fallback chain entirely.
+    for a given ``op_name``, the winning backend is cached by *label* and
+    subsequent calls skip the fallback chain entirely.  Caching the label
+    rather than the list position matters for any op that rebuilds its chain
+    per call: a position means a different backend once the order or length
+    changes, so an index cached from one shape can hand a later shape the
+    fallback -- or a kernel that shape is not allowed to use.  A label that is
+    no longer on offer simply misses and re-runs the chain.
+
+    Labels named in ``slow_labels`` are reported at ``warning`` rather than
+    ``debug`` when they win, because locking onto a degraded path is not
+    something a run should have to read debug logs to discover.
 
     ``torch.cuda.synchronize()`` is issued during warmup for error
     detection.  After warmup (or when ``LUMEN_SKIP_BACKEND_SYNC=1``),
@@ -466,10 +540,26 @@ def try_backends(
     if _TritonOutOfResources is not None:
         _catchable = _catchable + (_TritonOutOfResources,)
 
-    cached_idx = _backend_cache.get(op_name)
-    if cached_idx is not None and cached_idx < len(backends):
-        _, fn = backends[cached_idx]
-        return fn(*args, **kwargs)
+    cached_label = _backend_cache.get(op_name)
+    if cached_label is not None:
+        for entry in backends:
+            if _entry_label(entry) == cached_label:
+                try:
+                    return entry[1](*args, **kwargs)
+                except _catchable as exc:
+                    # The lock is a warmup shortcut, not a promise that these
+                    # operands still suit the winner. Forget it and re-run the
+                    # chain rather than propagating, so the degradation the
+                    # chain exists to provide survives warmup.
+                    logger.warning(
+                        "%s: cached %s backend failed (%s), re-running the fallback chain",
+                        op_name,
+                        cached_label,
+                        exc,
+                    )
+                    for suffix in ("", ":hits", ":prev"):
+                        _backend_cache.pop(op_name + suffix, None)
+                break
 
     if _IN_GRAPH_CAPTURE:
         raise RuntimeError(
@@ -477,29 +567,44 @@ def try_backends(
         )
 
     last_exc = None
-    for i, (backend, fn) in enumerate(backends):
+    for entry in backends:
+        backend, fn = entry[0], entry[1]
+        label = _entry_label(entry)
         try:
             result = fn(*args, **kwargs)
             if torch.cuda.is_available() and not _SKIP_BACKEND_SYNC and not _IN_GRAPH_CAPTURE:
                 torch.cuda.synchronize()
 
-            hit_count = _backend_cache.get(op_name + ":hits", 0) + 1
-            prev_idx = _backend_cache.get(op_name + ":prev", i)
-            if prev_idx == i:
-                _backend_cache[op_name + ":hits"] = hit_count
+            # Count consecutive wins for *this* backend. Reading the running
+            # count before comparing would let a switch of backend inherit the
+            # previous one's streak and lock on its first success.
+            if _backend_cache.get(op_name + ":prev") == label:
+                hit_count = _backend_cache.get(op_name + ":hits", 0) + 1
             else:
-                _backend_cache[op_name + ":hits"] = 1
-            _backend_cache[op_name + ":prev"] = i
+                hit_count = 1
+            _backend_cache[op_name + ":hits"] = hit_count
+            _backend_cache[op_name + ":prev"] = label
 
             if hit_count >= _BACKEND_WARMUP_CALLS:
-                _backend_cache[op_name] = i
-                logger.debug(
-                    "%s: locked to %s backend (index %d) after %d successes",
-                    op_name,
-                    backend.value,
-                    i,
-                    hit_count,
-                )
+                _backend_cache[op_name] = label
+                if label in slow_labels and not _backend_cache.get(op_name + ":warned"):
+                    _backend_cache[op_name + ":warned"] = True
+                    logger.warning(
+                        "%s: locked to the %s fallback after %d successes -- every later "
+                        "call with this operand shape takes it. The faster backends were "
+                        "tried first and failed; check the warnings above.",
+                        op_name,
+                        label,
+                        hit_count,
+                    )
+                else:
+                    logger.debug(
+                        "%s: locked to %s backend (%s) after %d successes",
+                        op_name,
+                        backend.value,
+                        label,
+                        hit_count,
+                    )
 
             return result
         except _catchable as exc:
@@ -509,9 +614,10 @@ def try_backends(
                 backend.value,
                 exc,
             )
-            _backend_cache.pop(op_name, None)
-            _backend_cache.pop(op_name + ":hits", None)
-            _backend_cache.pop(op_name + ":prev", None)
+            # Deliberately *not* resetting the streak here. The winner's count
+            # has to survive a failure earlier in the chain, or a backend that
+            # is never first can never lock -- which left every call paying the
+            # cost of a kernel known to reject these operands, plus a warning.
             last_exc = exc
     raise RuntimeError(f"{op_name}: all AITER backends exhausted. Last error: {last_exc}") from last_exc
 

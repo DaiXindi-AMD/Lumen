@@ -7,7 +7,7 @@
 """
 lumen.quantize — low-precision training lifecycle for AMD GPUs.
 
-Supports FP8 (E4M3 / E5M2), MXFP8, and FP4 formats.
+Supports FP8 (E4M3 / E5M2), MXFP8, MXFP4, and FP4 formats.
 
 Usage::
 
@@ -30,6 +30,7 @@ Usage::
 
 import functools
 import logging
+import os as _os
 import re
 import threading
 from typing import Optional, Set
@@ -135,6 +136,69 @@ def get_quant_backend(prefer: str = "auto") -> str:
 # Quantization enablement
 # ---------------------------------------------------------------------------
 
+# MXFP4 is supported on gfx950 (MI350/MI355) and nowhere else.
+#
+# AITER's gfx950 path uses the native
+# ``v_cvt_scalef32_[sr_]pk_fp4_{f32,bf16}`` instructions, which round correctly
+# and whose SR is unbiased by construction. That is the path this feature was
+# built, measured and trained on. AITER deliberately refuses payload SR on
+# architectures where an equivalent implementation has not been validated.
+# Historical software fallbacks had the following correctness problems:
+#
+#   - SR's dither is one-sided. ``tl.randint4x`` returns signed int32, so the
+#     noise lands in [-0.5, 0.5) and ``(noise - 0.5) * 0.01`` is never
+#     positive: a debiasing term with mean -0.005, and about 200x too small.
+#   - RTN breaks ties away from even. All seven boundaries use ``>=``, and
+#     E2M1's even codes are 0.0/1.0/2.0/4.0, so 0.25, 1.25, 2.50 and 5.00 all
+#     round the wrong way. They err in the same direction, so they do not
+#     cancel -- the result is systematic magnitude inflation.
+#   - The dither pattern repeats every BLOCK_M x BLOCK_N, because the Philox
+#     offset carries no program id. Rounding errors at the same position in
+#     each tile are then fully correlated, which is exactly the correlation the
+#     reduction along K is supposed to average away.
+#   - A block whose amax is subnormal is off by 2x: the scale is clamped up for
+#     packing, but the unclamped byte is what gets stored.
+#
+# Fixing those is a numerics change that needs the precision harness behind it,
+# and until it has one, a fallback with no test that forces ``use_asm=False``
+# must not be presented as MI300X support. So the support matrix is gfx950, and
+# this is where it is enforced rather than discovered as a quiet accuracy loss.
+_MXFP4_SUPPORTED_ARCHS = ("gfx950",)
+
+_MXFP4_ARCH_OVERRIDE_ENV = "LUMEN_MXFP4_ALLOW_UNVALIDATED_ARCH"
+
+
+def assert_mxfp4_arch_supported() -> None:
+    """Refuse MXFP4 on an architecture whose FP4 conversion is not validated.
+
+    A no-op when the format is not MXFP4, when no GPU is visible (the arch is
+    not knowable then, and nothing will run either), or when
+    ``LUMEN_MXFP4_ALLOW_UNVALIDATED_ARCH=1`` opts in deliberately.
+    """
+    if _os.environ.get(_MXFP4_ARCH_OVERRIDE_ENV) == "1":
+        return
+    if not torch.cuda.is_available():
+        return
+
+    from lumen.ops.quantize.ops import triton_arch
+
+    arch = triton_arch()
+    # An unreadable arch is not evidence of an unsupported one; the GEMM
+    # dispatch will still refuse a chip that has no FP4 kernel.
+    if not arch or arch in _MXFP4_SUPPORTED_ARCHS:
+        return
+
+    raise RuntimeError(
+        f"MXFP4 is supported on {'/'.join(_MXFP4_SUPPORTED_ARCHS)} and this is "
+        f"{arch}. The hardware FP4 conversion instructions only exist on gfx950; "
+        "elsewhere the Triton software fallback takes over, and its rounding is "
+        "known to be wrong (one-sided SR dither, ties rounded away from even, a "
+        "dither pattern that repeats per tile, and a 2x error on subnormal-amax "
+        "blocks). It has no test that exercises it, so it is not MI300X support. "
+        f"Set {_MXFP4_ARCH_OVERRIDE_ENV}=1 to run it anyway, for kernel work "
+        "rather than for training."
+    )
+
 
 def enable(
     model,
@@ -173,6 +237,9 @@ def enable(
         if recipe is not None:
             scaling = recipe
         config = QuantConfig.from_str(format=format, scaling=scaling, **kwargs)
+
+    if config.format == QuantFormat.MXFP4:
+        assert_mxfp4_arch_supported()
 
     resolved_backend = get_quant_backend(backend)
     manager = ScalingManager(config)
@@ -234,6 +301,19 @@ def _build_bf16_skip_prefixes(
     bf16_end = config.num_layers_at_end_in_bf16
     total = config.num_layers
 
+    if total <= 0:
+        # ``total - bf16_end`` goes non-positive, so _should_skip answers True
+        # for every index and the caller keeps the whole model in BF16 with
+        # nothing said. The Megatron native path guards this at its call site;
+        # putting it here covers the generic path too, which has the same hole.
+        logger.warning(
+            "first_last_layers_bf16 is set but num_layers=%d, so the BF16 tail "
+            "cannot be located; quantizing every layer instead of none. Set "
+            "num_layers on the quant config to use this option.",
+            total,
+        )
+        return set()
+
     def _should_skip(global_idx: int) -> bool:
         return global_idx < bf16_start or global_idx >= total - bf16_end
 
@@ -278,6 +358,19 @@ def _build_bf16_skip_prefixes(
     return prefixes
 
 
+def is_under_bf16_prefix(name: str, bf16_prefixes: Set[str]) -> bool:
+    """Whether ``name`` is one of the BF16 layers, or lives inside one.
+
+    A plain ``startswith`` is wrong here: the prefixes are layer module paths
+    ending in an index, so ``decoder.layers.1`` also prefixes ``decoder.layers.10``
+    through ``.19``. That silently drags every one of those layers into BF16, and
+    only for the configurations where a skipped index happens to prefix another
+    one -- a tail of 5 in 36 layers (indices 31-35) is clean, while a *start* of 2
+    pulls in 10-19 as well. Requiring the boundary dot makes the match exact.
+    """
+    return any(name == p or name.startswith(p + ".") for p in bf16_prefixes)
+
+
 def _patch_linear_layers(
     model: nn.Module,
     manager: ScalingManager,
@@ -300,7 +393,7 @@ def _patch_linear_layers(
     block_size = config.block_size
     quant_act = config.quantize_activation
     fp8_wgrad = config.fp8_wgrad
-    scaling_type = config.scaling.value
+    scaling_type = config.recipe
 
     megatron_types = _get_megatron_linear_types()
     quantizable_types = (nn.Linear,) + megatron_types
@@ -311,21 +404,14 @@ def _patch_linear_layers(
     skipped = 0
     for name, module in model.named_modules():
         if isinstance(module, quantizable_types):
-            if bf16_prefixes and any(name.startswith(p) for p in bf16_prefixes):
+            if bf16_prefixes and is_under_bf16_prefix(name, bf16_prefixes):
                 skipped += 1
                 continue
 
-            # Keep the output/vocab-projection layer in BF16 unless explicitly
-            # opted in: its M×N output overflows int32 pointer arithmetic in the
-            # Triton FP8 GEMM kernels for large vocab × long sequence (page fault).
             if not config.quantize_output_layer and _is_output_layer(name):
                 skipped += 1
                 continue
 
-            # Keep PEFT LoRA adapter matrices (lora_A / lora_B) in BF16: they are
-            # the trainable low-rank update and their rank dim (e.g. 16) is not
-            # block-quantizable (blockwise / blockwise2d require dims divisible by
-            # block_size). Only the wrapped base_layer weight is quantized.
             if "lora_" in name:
                 skipped += 1
                 continue
@@ -454,6 +540,119 @@ def _maybe_cache_frozen_weight(module, scaling_type, fp8_dtype, block_size):
             pass
 
 
+def _mxfp4_cached_weight(
+    module, weight, wcache, wscale, scaling_type, fp8_dtype, block_size,
+    gemm_rows=None,
+):
+    """Quantize an MXFP4 weight once per optimizer step, not once per micro-batch.
+
+    MXFP4 weight quantization is round-to-nearest, so every micro-batch of a
+    gradient accumulation step re-derives byte-identical FP4 data, packed
+    transpose and transposed scales from an unchanged weight.
+    ``register_mxfp4_weight_optimizer_hooks`` drops the cache when
+    ``optimizer.step()`` moves the master weights, so a stale cache cannot
+    outlive the weight it came from.
+
+    ``gemm_rows`` is the row count of the GEMMs this weight is about to serve,
+    which is what decides whether either operand can be stored pre-shuffled.
+
+    Returns the (data, scale) pair to hand the GEMM, unchanged when the caller
+    already has a weight cache of its own or the format is not MXFP4.
+    """
+    if (
+        wcache is not None
+        or scaling_type != "mxfp4"
+        or _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") == "1"
+    ):
+        return wcache, wscale
+
+    from lumen.ops.quantize.linear import (
+        _mark_mxfp4_data_shuffled,
+        _mark_mxfp4_scale_swizzled,
+        _mxfp4_can_fuse_b_shuffle,
+        _mxfp4_can_fuse_scale_swizzle,
+        quantize_input,
+    )
+    from lumen.ops.quantize.ops import (
+        swizzle_expanded_mxfp4_scale,
+        transpose_packed_fp4,
+    )
+
+    n_out, k_in = weight.shape
+    # Anything the quantizer has to pad no longer matches the shapes the fusions
+    # were cleared for, and every shape they pay off on is aligned already.
+    unpadded = n_out % block_size == 0 and k_in % block_size == 0
+
+    # Neither weight operand has a consumer other than a GEMM, so when the
+    # backend for its shape reads the shuffled order it is built in that order:
+    # the forward's by the quantizer, DGrad's by the transpose. Each fusion
+    # drops a read+write pass over the whole FP4 weight, once per step.
+    fuse_fwd_shuffle = unpadded and gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, n_out, k_in), n_out, k_in // 2,
+    )
+    fuse_dgrad_shuffle = unpadded and gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, k_in, n_out), k_in, n_out // 2,
+    )
+
+    # The two fusions are what the layout depends on, and they are decided from
+    # gemm_rows -- so the cache is keyed on them, not on the module alone.
+    # Keyed on the module, the first micro-batch's row count fixed the layout
+    # for the whole step: a later GEMM whose row count dispatches to a backend
+    # reading the other order either trips the quantizer/dispatch disagreement
+    # assertion or, for the operand with no such check, reads permuted bytes as
+    # if they were in place. A pipeline's last micro-batch and a ragged final
+    # batch both change the row count. Two row counts that agree on both
+    # fusions share the entry, so nothing is rebuilt that need not be.
+    layout = (fuse_fwd_shuffle, fuse_dgrad_shuffle)
+    cached = getattr(module, "_mxfp4_w_cache", None)
+    # Optimizers update Parameters in-place and increment ``_version``. Keying
+    # the cache on that generation makes the generic ``quant.enable(nn.Linear)``
+    # path correct even when its training loop cannot register Lumen's optional
+    # post-step hook. The hook remains useful for eagerly releasing old buffers,
+    # but correctness must not depend on framework-specific optimizer wiring.
+    weight_version = weight._version
+    if (
+        cached is not None
+        and cached[0] == layout
+        and getattr(module, "_mxfp4_w_cache_version", None) == weight_version
+    ):
+        return cached[1], cached[2]
+
+    desc = quantize_input(
+        weight.contiguous(), "mxfp4", fp8_dtype, block_size,
+        None, None, is_weight=True, shuffle_data=fuse_fwd_shuffle,
+    )
+    data, scale = desc.data, desc.scale
+
+    data_t = transpose_packed_fp4(
+        data, shuffle_data=fuse_dgrad_shuffle, in_shuffled=fuse_fwd_shuffle,
+    )
+    if fuse_dgrad_shuffle:
+        _mark_mxfp4_data_shuffled(data_t)
+
+    # Both operand layouts read the same tile scales, only replicated down a
+    # different axis, and a GEMM is their only consumer. Building each one
+    # directly in the GEMM's order turns five passes over the scales -- two
+    # expansions, two swizzles and a transposing copy -- into two.
+    _is_tile_grid = tuple(scale.shape) == (n_out // block_size, k_in // block_size)
+    if _is_tile_grid and _mxfp4_can_fuse_scale_swizzle(
+        (n_out, k_in // block_size), (k_in, n_out // block_size),
+    ):
+        fwd_scale = _mark_mxfp4_scale_swizzled(
+            swizzle_expanded_mxfp4_scale(scale, block_size=block_size)
+        )
+        dgrad_scale = _mark_mxfp4_scale_swizzled(
+            swizzle_expanded_mxfp4_scale(scale, block_size=block_size, transpose=True)
+        )
+    else:
+        fwd_scale, dgrad_scale = scale, scale.t().contiguous()
+
+    data._mxfp4_wt_cached = (data_t, dgrad_scale)
+    module._mxfp4_w_cache = (layout, data, fwd_scale)
+    module._mxfp4_w_cache_version = weight_version
+    return data, fwd_scale
+
+
 def _replace_forward(
     module,
     manager,
@@ -518,15 +717,14 @@ def _replace_forward(
             _wcache = getattr(module, "_fp8_weight_data", None)
             _wscale = getattr(module, "_fp8_weight_scale", None)
             if isinstance(w, Blockwise2DFP8Gathered):
-                # FSDP2 all-gathered frozen FP8 base: feed its FP8 data + 2D scale
-                # straight to the GEMM (no per-step re-quant), reusing the verified
-                # blockwise2d cache backward path. Frozen → WGrad is skipped.
                 _wcache, _wscale = w._fp8, w._scale
                 w._lumen_frozen = True
             elif getattr(module, "_lumen_frozen", False):
-                # thread the patch-time frozen fact onto the live weight tensor so the
-                # autograd Function can skip its WGrad (FSDP may swap the param view).
                 w._lumen_frozen = True
+            _wcache, _wscale = _mxfp4_cached_weight(
+                module, w, _wcache, _wscale, scaling_type, fp8_dtype, block_size,
+                gemm_rows=input_tensor.numel() // input_tensor.shape[-1],
+            )
             return quantized_linear(
                 input_tensor,
                 w,
@@ -576,6 +774,14 @@ def _replace_forward(
                     tensor_parallel_output_grad=True,
                     group=tp_group,
                 )
+
+            # After the gather, so the row count handed to the weight cache is the
+            # one the GEMMs will see; it decides which backend layout to build for.
+            _wcache, _wscale = _mxfp4_cached_weight(
+                module, module.weight, _wcache, _wscale,
+                scaling_type, fp8_dtype, block_size,
+                gemm_rows=input_tensor.numel() // input_tensor.shape[-1],
+            )
 
             result = quantized_linear(
                 input_tensor,
@@ -662,6 +868,26 @@ def store_weights_fp8(
     for _name, module in model.named_modules():
         if not getattr(module, "_quant_enabled", False):
             continue
+        # This cache holds per-tensor FP8 with a scalar scale, and the forward
+        # hands whatever is in it straight to the GEMM: _mxfp4_cached_weight
+        # passes a populated cache through untouched, and quantize_input is
+        # skipped. An MXFP4 GEMM then receives e4m3 bytes where it expects
+        # packed FP4 and a scalar where it expects an E8M0 tile grid, and dies
+        # unpacking an empty shape several frames from the cause. Refuse here,
+        # where the feature and the format are both still named.
+        if getattr(module, "_quant_scaling_type", None) == "mxfp4":
+            raise ValueError(
+                f"{_name or type(module).__name__}: the FP8 weight cache "
+                "(LUMEN_FP8_WEIGHT_CACHE=1, or fp8_weight_cache on LumenConfig) "
+                "does not apply to MXFP4. It stores per-tensor FP8 with a scalar "
+                "scale, which no MXFP4 GEMM can read. Nothing is lost by turning "
+                "it off: MXFP4 caches its own FP4 weight per optimizer step "
+                "unconditionally (lumen.quantize._mxfp4_cached_weight, opt out "
+                "with LUMEN_MXFP4_DISABLE_WEIGHT_CACHE=1). It could not be filled "
+                "from here anyway -- the operand layout depends on the backend "
+                "measured for the consuming GEMM shape, which is not known until "
+                "that shape's first call."
+            )
         weight = getattr(module, "weight", None)
         if weight is None or not isinstance(weight, nn.Parameter):
             continue
@@ -803,6 +1029,75 @@ def register_fp8_weight_optimizer_hooks(
                 m._fp8_weight_scale.copy_(scale)
 
     optimizer.register_step_post_hook(_post_step)
+
+
+def register_mxfp4_weight_optimizer_hooks(
+    model,
+    optimizer,
+) -> None:
+    """Register a post-step hook to invalidate MXFP4 weight caches.
+
+    MXFP4 weight quantization (RTN, deterministic) is cached on each patched
+    module, or on the weight Parameter for native Lumen linears, across
+    micro-batches within a gradient accumulation step. After ``optimizer.step()``
+    updates BF16 master weights, this hook clears both cache locations so the
+    next forward re-quantizes from the updated weights.
+
+    Without this the cached FP4 weight is never invalidated, so forward and
+    DGrad keep using the step-0 weights for the whole run — the loss flattens
+    and nothing raises.
+
+    Args:
+        model: A module, or the list of model chunks Megatron builds under
+            virtual pipeline parallelism.
+        optimizer: Any optimizer. Megatron's wrappers are not
+            ``torch.optim.Optimizer`` subclasses and are handled too.
+    """
+    chunks = list(model) if isinstance(model, (list, tuple)) else [model]
+
+    def _invalidate():
+        for chunk in chunks:
+            for m in chunk.modules():
+                if hasattr(m, "_mxfp4_w_cache"):
+                    del m._mxfp4_w_cache
+                    if hasattr(m, "_mxfp4_w_cache_version"):
+                        del m._mxfp4_w_cache_version
+                # Native Lumen parallel linears cache on their Parameter because
+                # they call the shared _do_gemm helper rather than the patched
+                # module forward above. Every parameter the module owns has to be
+                # swept, not just ``.weight``: a grouped MoE layer holds its
+                # experts as weight0..weightN and hands them to the linear's
+                # forward one at a time, so the cache lands on a Parameter that
+                # is not reachable under that name. Those entries were never
+                # cleared, leaving the experts quantized from the step-0 master
+                # weights for the whole run while the dense layers updated -- and
+                # nothing raises, the loss just stops moving.
+                for param in m._parameters.values():
+                    if param is not None and hasattr(param, "_mxfp4_w_cache"):
+                        del param._mxfp4_w_cache
+                        if hasattr(param, "_mxfp4_w_cache_version"):
+                            del param._mxfp4_w_cache_version
+
+    # Megatron's ChainedOptimizer / DistributedOptimizer are not
+    # torch.optim.Optimizer subclasses and lack register_step_post_hook, so
+    # wrap step() in that case (same approach as
+    # ScalingManager.register_fp8_optimizer_hook).
+    if hasattr(optimizer, "register_step_post_hook"):
+        optimizer.register_step_post_hook(lambda _opt, _a, _k: _invalidate())
+        logger.info("register_mxfp4_weight_optimizer_hooks: registered post-step hook")
+    else:
+        _orig_step = optimizer.step
+
+        def _wrapped_step(*args, **kwargs):
+            result = _orig_step(*args, **kwargs)
+            _invalidate()
+            return result
+
+        optimizer.step = _wrapped_step
+        logger.info(
+            "register_mxfp4_weight_optimizer_hooks: wrapped optimizer.step() "
+            "(no register_step_post_hook)"
+        )
 
 
 def disable(model: nn.Module) -> None:

@@ -11,38 +11,72 @@ autograd-aware quantized linear, see :mod:`~.linear`.  For the nn.Module
 wrapper, see :mod:`lumen.modules.quantize`.
 """
 
+import functools
 import logging
+import os
 import random
 from typing import Optional, Tuple
 
 import torch
 import triton
 from aiter.ops.quant import static_per_tensor_quant
-from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
-    quant_fp8_blockwise_for_act_grad_kernel,
-    quant_fp8_blockwise_kernel,
-    quant_fp8_blockwise_segment_m_kernel,
-)
+try:
+    from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
+        quant_fp8_blockwise_for_act_grad_kernel,
+        quant_fp8_blockwise_kernel,
+        quant_fp8_blockwise_segment_m_kernel,
+    )
+except (ImportError, ModuleNotFoundError):
+    quant_fp8_blockwise_for_act_grad_kernel = None  # type: ignore[assignment]
+    quant_fp8_blockwise_kernel = None  # type: ignore[assignment]
+    quant_fp8_blockwise_segment_m_kernel = None  # type: ignore[assignment]
 try:
     from aiter.ops.triton._triton_kernels.quant.quant_fp8_blockwise import (
         requant_fp8_row_to_col_kernel,
     )
     _HAVE_REQUANT_ROW_TO_COL = True
-except ImportError:
+except (ImportError, ModuleNotFoundError):
     requant_fp8_row_to_col_kernel = None  # type: ignore[assignment]
     _HAVE_REQUANT_ROW_TO_COL = False
-from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
-    _convert_from_mxfp8_kernel,
-    _convert_to_mxfp8_kernel,
-)
+try:
+    from aiter.ops.triton._triton_kernels.quant.quant_mxfp8 import (
+        _convert_from_mxfp8_kernel,
+        _convert_to_mxfp8_kernel,
+    )
+except (ImportError, ModuleNotFoundError):
+    _convert_from_mxfp8_kernel = None  # type: ignore[assignment]
+    _convert_to_mxfp8_kernel = None  # type: ignore[assignment]
 from torch.library import triton_op, wrap_triton
 
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=None)
+def _triton_target(device: int):
+    """Triton's target for one device, asked once.
+
+    ``get_current_target()`` queries the HIP runtime for the device properties
+    on every call. The quantize path asks per launch, and a training step makes
+    hundreds of those, which is dead CPU time in front of kernels the GPU is
+    already waiting for. A device's architecture cannot change under a live
+    process, so the answer is cacheable; keying on the device keeps it right for
+    a process that switches between unlike GPUs.
+    """
+    return triton.runtime.driver.active.get_current_target()
+
+
 def is_cdna4():
-    target = triton.runtime.driver.active.get_current_target()
+    target = _triton_target(torch.cuda.current_device())
     return target is not None and target.backend == "hip" and target.arch == "gfx950"
+
+
+def triton_arch() -> str:
+    """Architecture name of the current device, e.g. ``gfx950``.
+
+    Same answer as AITER's ``get_arch()``, without its per-call device query.
+    """
+    target = _triton_target(torch.cuda.current_device())
+    return "" if target is None else target.arch
 
 
 # ---------------------------------------------------------------------------
@@ -425,3 +459,76 @@ def _fake_convert_from_mxfp8(
 ) -> torch.Tensor:
     data_hp = data_lp.new_empty(data_lp.shape, dtype=output_dtype)
     return data_hp
+
+
+# ---------------------------------------------------------------------------
+# MXFP4 Conversion (implemented in AITER)
+# ---------------------------------------------------------------------------
+
+# Preserve the old Lumen tuning knob while ownership moves into AITER.  The
+# AITER-prefixed name wins when both are set.
+if "LUMEN_SR_PHILOX_ROUNDS" in os.environ:
+    os.environ.setdefault(
+        "AITER_MXFP4_SR_PHILOX_ROUNDS",
+        os.environ["LUMEN_SR_PHILOX_ROUNDS"],
+    )
+
+# The RHT-bearing APIs below must stay distinct from plain convert_to_mxfp4:
+# they perform the original training-path rotation inside AITER before packing.
+from aiter.ops.mxfp4 import (  # noqa: E402
+    convert_from_mxfp4,
+    convert_from_mxfp4_2d,
+    convert_to_mxfp4,
+    convert_to_mxfp4_2d,
+    dequant_hadamard_quant_mxfp4,
+    dequant_transpose_mxfp4,
+    dual_layout_quant_mxfp4,
+    hadamard_quant_mxfp4,
+    hadamard_transform,
+    mxfp4_data_shuffle_supported,
+    mxfp4_scale_swizzle_supported,
+    swizzle_expanded_mxfp4_scale,
+    swizzle_mxfp4_scale,
+    transpose_packed_fp4,
+)
+
+
+def convert_to_mxfp4_dual_axis(
+    data_hp: torch.Tensor,
+    block_size: int = 32,
+    use_sr: bool = True,
+    philox_seed: Optional[int] = None,
+    philox_offset: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compose Lumen's row-wise and column-wise compatibility outputs.
+
+    This is two calls to AITER's one-axis conversion API, not an AITER kernel.
+    Keep the composition here so AITER's public surface contains only reusable
+    operators.  It is also deliberately separate from
+    ``dual_layout_quant_mxfp4``, whose second output includes Lumen's H16 RHT.
+    """
+    # Preserve the original Lumen API's seeded stream split exactly.  This
+    # helper predates the AITER migration and callers may use explicit seeds
+    # when comparing the two axis layouts.
+    if philox_seed is None:
+        philox_seed = random.randint(0, 2**31 - 2)
+    if philox_offset is None:
+        philox_offset = random.randint(0, 2**31 - 2)
+
+    row_fp4, row_scales = convert_to_mxfp4(
+        data_hp,
+        block_size=block_size,
+        axis=-1,
+        use_sr=use_sr,
+        philox_seed=philox_seed,
+        philox_offset=philox_offset,
+    )
+    col_fp4, col_scales = convert_to_mxfp4(
+        data_hp,
+        block_size=block_size,
+        axis=0,
+        use_sr=use_sr,
+        philox_seed=philox_seed + 1,
+        philox_offset=philox_offset,
+    )
+    return row_fp4, row_scales, col_fp4, col_scales
