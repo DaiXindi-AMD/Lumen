@@ -12,6 +12,8 @@ Covers:
   - Bias, weight-only quant, BF16 wgrad, edge cases
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from conftest import LinearConfig, compute_snr
@@ -50,6 +52,8 @@ ALL_SCALING_TYPES = [
 # packed-FP4 weight and WGrad applies a Hadamard rotation before quantizing, so
 # neither leg depends on a scale surviving transposition.
 BWD_SCALING_TYPES = ["delayed", "dynamic", "blockwise", "blockwise2d", "mxfp4", "none"]
+
+_CUDA = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 # SNR floors per scaling type — coarser quantization ⇒ lower expected SNR.
 # mxfp8 uses E8M0 exponent-only scales; blockwise has block granularity.
@@ -124,6 +128,216 @@ def _skip_if_unaligned(config, scaling_type, *, bwd=False):
                 )
         except ImportError:
             pass
+
+
+@_CUDA
+def test_mxfp4_gate_up_linear_fwd_bwd_and_context_lifetime():
+    """Packed gate/up matches two BF16 projections without retaining their cat."""
+    from lumen.quantize import _mxfp4_cached_weight_pair
+
+    m, k, n = 32, 256, 256
+    x_ref = (torch.randn(m, k, device="cuda") * 0.1).to(torch.bfloat16)
+    gate_ref = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    up_ref = (torch.randn(n, k, device="cuda") * 0.02).to(torch.bfloat16)
+    x_ref.requires_grad_(True)
+    gate_ref.requires_grad_(True)
+    up_ref.requires_grad_(True)
+    ref = torch.cat(
+        (
+            torch.nn.functional.linear(x_ref, gate_ref),
+            torch.nn.functional.linear(x_ref, up_ref),
+        ),
+        dim=-1,
+    )
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+
+    x = x_ref.detach().clone().requires_grad_(True)
+    gate = gate_ref.detach().clone().requires_grad_(True)
+    up = up_ref.detach().clone().requires_grad_(True)
+    owner = torch.nn.Module()
+    packed, scale = _mxfp4_cached_weight_pair(
+        owner, gate, up, None, 32, gemm_rows=m
+    )
+    out = linear_ops.mxfp4_gate_up_linear(
+        x, gate, up, packed, scale, block_size=32
+    )
+
+    grad_node = out.grad_fn
+    assert not hasattr(grad_node, "weight_ref")
+    assert all(
+        not (
+            tensor.dtype == torch.bfloat16
+            and tuple(tensor.shape) == (2 * n, k)
+        )
+        for tensor in grad_node.saved_tensors
+    )
+    out.backward(grad)
+
+    assert x.grad is not None
+    assert gate.grad is not None
+    assert up.grad is not None
+    assert compute_snr(ref, out) > 12
+    assert compute_snr(x_ref.grad, x.grad) > 12
+    assert compute_snr(gate_ref.grad, gate.grad) > 10
+    assert compute_snr(up_ref.grad, up.grad) > 10
+
+
+def test_mxfp4_gate_up_backward_quantizes_source_gradients_separately(monkeypatch):
+    calls = []
+
+    class _Manager:
+        def quantize_grad(self, grad):
+            calls.append(tuple(grad.shape))
+            return grad + len(calls)
+
+    combined = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+    monkeypatch.setattr(
+        linear_ops,
+        "_mxfp4_backward_core",
+        lambda _ctx, _grad: (torch.ones(2, 6), lambda: combined),
+    )
+    ctx = SimpleNamespace(
+        gate_rows=2,
+        gate_needs_grad=True,
+        up_needs_grad=True,
+        scaling_manager=_Manager(),
+    )
+
+    result = linear_ops.MXFP4GateUpFunction.backward(ctx, torch.empty(2, 4))
+
+    assert calls == [(2, 6), (2, 6)]
+    torch.testing.assert_close(result[1], combined[:2] + 1)
+    torch.testing.assert_close(result[2], combined[2:] + 2)
+
+
+@_CUDA
+def test_mxfp4_qkv_linear_unequal_rows_fwd_bwd_noncontiguous_grad():
+    """Packed QKV matches three projections and accepts a strided output grad."""
+    from lumen.quantize import _mxfp4_cached_weight_qkv
+
+    m, width = 32, 256
+    q_rows, k_rows, v_rows = 256, 128, 128
+    x_ref = (torch.randn(m, width, device="cuda") * 0.1).to(torch.bfloat16)
+    q_ref = (torch.randn(q_rows, width, device="cuda") * 0.02).to(
+        torch.bfloat16
+    )
+    k_ref = (torch.randn(k_rows, width, device="cuda") * 0.02).to(
+        torch.bfloat16
+    )
+    v_ref = (torch.randn(v_rows, width, device="cuda") * 0.02).to(
+        torch.bfloat16
+    )
+    x_ref.requires_grad_(True)
+    q_ref.requires_grad_(True)
+    k_ref.requires_grad_(True)
+    v_ref.requires_grad_(True)
+    ref = torch.cat(
+        tuple(
+            torch.nn.functional.linear(x_ref, weight)
+            for weight in (q_ref, k_ref, v_ref)
+        ),
+        dim=-1,
+    )
+    grad = torch.randn(
+        m,
+        2 * (q_rows + k_rows + v_rows),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )[:, ::2]
+    assert not grad.is_contiguous()
+    ref.backward(grad)
+
+    x = x_ref.detach().clone().requires_grad_(True)
+    q = q_ref.detach().clone().requires_grad_(True)
+    k = k_ref.detach().clone().requires_grad_(True)
+    v = v_ref.detach().clone().requires_grad_(True)
+    packed, scale = _mxfp4_cached_weight_qkv(
+        torch.nn.Module(), q, k, v, None, 32, gemm_rows=m
+    )
+    out = linear_ops.mxfp4_qkv_linear(
+        x, q, k, v, packed, scale, block_size=32
+    )
+
+    grad_node = out.grad_fn
+    assert all(
+        not (
+            tensor.dtype == torch.bfloat16
+            and tuple(tensor.shape) == (q_rows + k_rows + v_rows, width)
+        )
+        for tensor in grad_node.saved_tensors
+    )
+    out.backward(grad)
+
+    assert x.grad is not None
+    assert q.grad is not None and q.grad.is_contiguous()
+    assert k.grad is not None and k.grad.is_contiguous()
+    assert v.grad is not None and v.grad.is_contiguous()
+    assert compute_snr(ref, out) > 12
+    assert compute_snr(x_ref.grad, x.grad) > 12
+    assert compute_snr(q_ref.grad, q.grad) > 10
+    assert compute_snr(k_ref.grad, k.grad) > 10
+    assert compute_snr(v_ref.grad, v.grad) > 10
+
+
+def test_mxfp4_qkv_backward_splits_once_and_quantizes_each_contiguous(monkeypatch):
+    calls = []
+    wgrad_calls = 0
+
+    class _Manager:
+        def quantize_grad(self, grad):
+            assert grad.is_contiguous()
+            calls.append(tuple(grad.shape))
+            # Return the same values through a non-contiguous view. The Function
+            # must still hand autograd contiguous source gradients.
+            return (grad + len(calls)).t().contiguous().t()
+
+    combined = torch.arange(54, dtype=torch.float32).reshape(6, 9).t()
+    assert not combined.is_contiguous()
+
+    def _backward_core(_ctx, grad_output):
+        assert not grad_output.is_contiguous()
+
+        def _compute_wgrad():
+            nonlocal wgrad_calls
+            wgrad_calls += 1
+            return combined
+
+        return torch.ones(2, 6), _compute_wgrad
+
+    monkeypatch.setattr(linear_ops, "_mxfp4_backward_core", _backward_core)
+    ctx = SimpleNamespace(
+        qkv_rows=(4, 2, 3),
+        qkv_needs_grad=(True, True, True),
+        scaling_manager=_Manager(),
+    )
+    grad_output = torch.empty(2, 8)[:, ::2]
+    assert not grad_output.is_contiguous()
+
+    result = linear_ops.MXFP4QKVFunction.backward(ctx, grad_output)
+
+    assert wgrad_calls == 1
+    assert calls == [(4, 6), (2, 6), (3, 6)]
+    expected = combined.split((4, 2, 3), dim=0)
+    for index, (actual, reference) in enumerate(zip(result[1:4], expected), 1):
+        assert actual.is_contiguous()
+        torch.testing.assert_close(actual, reference + index)
+
+
+def test_mxfp4_qkv_rejects_dgrad_hadamard(monkeypatch):
+    monkeypatch.setattr(linear_ops, "_MXFP4_DGRAD_HADAMARD", True)
+    weights = tuple(torch.randn(32, 32) for _ in range(3))
+    packed = torch.empty(96, 16, dtype=torch.uint8)
+    scale = torch.empty(3, 1, dtype=torch.uint8)
+
+    with pytest.raises(ValueError, match="packed QKV.*DGRAD_HADAMARD"):
+        linear_ops.mxfp4_qkv_linear(
+            torch.randn(2, 32),
+            *weights,
+            packed,
+            scale,
+            fp8_dtype=torch.float8_e4m3fn,
+        )
 
 
 # ===================================================================

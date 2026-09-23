@@ -81,10 +81,17 @@ if [ "${LAUNCH}" = "native" ]; then
     }
 
     # MXFP4-only: the tuned A4W4 table widens which shapes reach AITER's prebuilt
-    # ASM kernels and the autotune cache makes the per-shape backend choice
-    # reproducible across processes. Every MXFP4 backend is bit-identical, so both
-    # affect speed only (docs/mxfp4_training_report.md §2.2).
+    # ASM kernels and the autotune cache makes the per-shape backend choice and
+    # its correctness/profile evidence reproducible across processes.
     if [ "${PRECISION}" = "mxfp4" ]; then
+        if [ "${LUMEN_MXFP4_FLYDSL:-0}" = "1" ]; then
+            if [ -n "${ROCM_PATH:-}" ]; then
+                LUMEN_ROCM_PATH="${ROCM_PATH}"
+            else
+                LUMEN_ROCM_PATH="$(hipconfig --path)"
+            fi
+            RUNTIME_ENV+=(ROCM_PATH="${LUMEN_ROCM_PATH}")
+        fi
         # AITER_CONFIG_GEMM_A4W4 is deliberately left alone. Setting it here to
         # the generic table shadowed the list train_qwen3_8b.sh builds, which is
         # the only one carrying Qwen3-8B's fused qkv/gate_up shapes -- every
@@ -94,7 +101,12 @@ if [ "${LAUNCH}" = "native" ]; then
         # the tuned table missing pins "use Triton" for every shape and later
         # runs inherit it. A/B work needs to be able to point somewhere fresh.
         RUNTIME_ENV+=(
+            LUMEN_MXFP4_AUTOTUNE="${LUMEN_MXFP4_AUTOTUNE:-1}"
             LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-${RESULTS_DIR}/mxfp4_autotune_qwen3_8b.json}"
+            LUMEN_MXFP4_FLYDSL="${LUMEN_MXFP4_FLYDSL:-0}"
+            LUMEN_MXFP4_PROFILE_WARMUP="${LUMEN_MXFP4_PROFILE_WARMUP:-10}"
+            LUMEN_MXFP4_PROFILE_ITERS="${LUMEN_MXFP4_PROFILE_ITERS:-81}"
+            LUMEN_MXFP4_GEMM_SHAPE_LOG="${LUMEN_MXFP4_GEMM_SHAPE_LOG:-}"
             LUMEN_FAST_QUANT_DISPATCH=1
         )
     fi
@@ -118,7 +130,13 @@ if [ "${PRECISION}" = "mxfp4" ]; then
     # issues lives in the model one -- so pinning the stock table alone dropped
     # 8 of the 11 MXFP4 GEMMs to Triton, ~132 ms/step.
     RUNTIME_ENV+=(
-        LUMEN_MXFP4_AUTOTUNE_CACHE=/results/mxfp4_autotune_qwen3_8b.json
+        ROCM_PATH="${ROCM_PATH:-/opt/rocm}"
+        LUMEN_MXFP4_AUTOTUNE="${LUMEN_MXFP4_AUTOTUNE:-1}"
+        LUMEN_MXFP4_AUTOTUNE_CACHE="${LUMEN_MXFP4_AUTOTUNE_CACHE:-/results/mxfp4_autotune_qwen3_8b.json}"
+        LUMEN_MXFP4_FLYDSL="${LUMEN_MXFP4_FLYDSL:-0}"
+        LUMEN_MXFP4_PROFILE_WARMUP="${LUMEN_MXFP4_PROFILE_WARMUP:-10}"
+        LUMEN_MXFP4_PROFILE_ITERS="${LUMEN_MXFP4_PROFILE_ITERS:-81}"
+        LUMEN_MXFP4_GEMM_SHAPE_LOG="${LUMEN_MXFP4_GEMM_SHAPE_LOG:-}"
         LUMEN_FAST_QUANT_DISPATCH=1
     )
 fi

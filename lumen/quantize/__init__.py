@@ -248,6 +248,8 @@ def enable(
         manager.set_dp_group(dp_group)
 
     _patch_linear_layers(model, manager, resolved_backend, config)
+    if config.format == QuantFormat.MXFP4:
+        _register_mxfp4_load_state_dict_hooks(model)
     return manager
 
 
@@ -653,6 +655,282 @@ def _mxfp4_cached_weight(
     return data, fwd_scale
 
 
+def _mxfp4_cached_weight_pair(
+    module,
+    gate_weight,
+    up_weight,
+    fp8_dtype,
+    block_size,
+    gemm_rows=None,
+):
+    """Cache one compact MXFP4 operand built from gate and up Parameters.
+
+    The sources stay separate BF16 Parameters. Only their packed uint8 data and
+    E8M0 scale grids are concatenated when the optional AITER two-way builder is
+    unavailable, so autograd never retains a full ``cat((gate, up))`` tensor.
+    """
+    if block_size != 32:
+        raise ValueError(f"MXFP4 gate/up packing requires block_size=32, got {block_size}")
+    if gate_weight.dim() != 2 or up_weight.dim() != 2:
+        raise ValueError("MXFP4 gate/up weights must both be 2D")
+    if gate_weight.shape != up_weight.shape:
+        raise ValueError(
+            "MXFP4 gate/up weights must have identical shapes, got "
+            f"{tuple(gate_weight.shape)} and {tuple(up_weight.shape)}"
+        )
+    if gate_weight.dtype != up_weight.dtype or gate_weight.device != up_weight.device:
+        raise ValueError("MXFP4 gate/up weights must share dtype and device")
+
+    from lumen.ops.quantize.linear import (
+        _mark_mxfp4_data_shuffled,
+        _mark_mxfp4_scale_swizzled,
+        _mxfp4_can_fuse_b_shuffle,
+        _mxfp4_can_fuse_scale_swizzle,
+        _shuffle_mxfp4_weight,
+    )
+    from lumen.ops.quantize.ops import (
+        convert_to_mxfp4_2d,
+        swizzle_expanded_mxfp4_scale,
+        transpose_packed_fp4,
+    )
+
+    n_each, k_in = gate_weight.shape
+    n_out = n_each * 2
+    unpadded = n_each % block_size == 0 and k_in % block_size == 0
+    if not unpadded:
+        raise ValueError(
+            "MXFP4 gate/up packing requires both dimensions to be multiples "
+            f"of {block_size}; got {tuple(gate_weight.shape)}"
+        )
+    fuse_fwd_shuffle = gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, n_out, k_in), n_out, k_in // 2,
+    )
+    fuse_dgrad_shuffle = gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, k_in, n_out), k_in, n_out // 2,
+    )
+    layout = (fuse_fwd_shuffle, fuse_dgrad_shuffle)
+    weight_version = (gate_weight._version, up_weight._version)
+    weight_sources = (id(gate_weight), id(up_weight))
+    cache_enabled = _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") != "1"
+    cached = getattr(module, "_mxfp4_w_cache", None) if cache_enabled else None
+    if (
+        cached is not None
+        and cached[0] == layout
+        and getattr(module, "_mxfp4_w_cache_version", None) == weight_version
+        and getattr(module, "_mxfp4_w_cache_sources", None) == weight_sources
+    ):
+        return cached[1], cached[2]
+
+    data = scale = None
+    fallback_reason = None
+    from lumen.ops.dispatch import _probe_aiter_triton_quant_mxfp4_2way
+
+    with torch.no_grad():
+        if (
+            gate_weight.dtype == torch.bfloat16
+            and gate_weight.is_cuda
+            and _probe_aiter_triton_quant_mxfp4_2way()
+        ):
+            try:
+                from aiter.ops.triton.quant import dynamic_mxfp4_quant_2way
+
+                data, scale = dynamic_mxfp4_quant_2way(
+                    gate_weight.contiguous(),
+                    up_weight.contiguous(),
+                    shuffle_data=fuse_fwd_shuffle,
+                )
+            except (AssertionError, RuntimeError, TypeError, ValueError) as error:
+                fallback_reason = f"AITER two-way quantizer rejected the inputs ({error})"
+        else:
+            fallback_reason = "AITER two-way quantizer is unavailable for this dtype/device"
+
+        if data is None:
+            if not getattr(module, "_mxfp4_pair_quant_fallback_warned", False):
+                logger.warning(
+                    "MXFP4 gate/up cache: %s; using two compact quantizations "
+                    "followed by uint8 concatenation",
+                    fallback_reason,
+                )
+                module._mxfp4_pair_quant_fallback_warned = True
+            gate_data, gate_scale = convert_to_mxfp4_2d(
+                gate_weight.contiguous(), block_size=block_size, use_sr=False,
+            )
+            up_data, up_scale = convert_to_mxfp4_2d(
+                up_weight.contiguous(), block_size=block_size, use_sr=False,
+            )
+            data = torch.cat((gate_data, up_data), dim=0)
+            scale = torch.cat((gate_scale, up_scale), dim=0)
+            if fuse_fwd_shuffle:
+                data = _shuffle_mxfp4_weight(data)
+
+        if fuse_fwd_shuffle:
+            _mark_mxfp4_data_shuffled(data)
+        data_t = transpose_packed_fp4(
+            data,
+            shuffle_data=fuse_dgrad_shuffle,
+            in_shuffled=fuse_fwd_shuffle,
+        )
+        if fuse_dgrad_shuffle:
+            _mark_mxfp4_data_shuffled(data_t)
+
+        if _mxfp4_can_fuse_scale_swizzle(
+            (n_out, k_in // block_size), (k_in, n_out // block_size),
+        ):
+            fwd_scale = _mark_mxfp4_scale_swizzled(
+                swizzle_expanded_mxfp4_scale(scale, block_size=block_size)
+            )
+            dgrad_scale = _mark_mxfp4_scale_swizzled(
+                swizzle_expanded_mxfp4_scale(
+                    scale, block_size=block_size, transpose=True,
+                )
+            )
+        else:
+            fwd_scale, dgrad_scale = scale, scale.t().contiguous()
+
+    data._mxfp4_wt_cached = (data_t, dgrad_scale)
+    if cache_enabled:
+        module._mxfp4_w_cache = (layout, data, fwd_scale)
+        module._mxfp4_w_cache_version = weight_version
+        module._mxfp4_w_cache_sources = weight_sources
+    return data, fwd_scale
+
+
+def _mxfp4_cached_weight_qkv(
+    module,
+    q_weight,
+    k_weight,
+    v_weight,
+    fp8_dtype,
+    block_size,
+    gemm_rows=None,
+):
+    """Cache one compact MXFP4 operand built from separate Q/K/V weights.
+
+    Q, K, and V may have different output widths, but must share their input
+    width, dtype, and device. Each source is quantized independently so no
+    concatenated BF16 weight is ever materialized; only packed uint8 data and
+    E8M0 scale tiles are concatenated.
+    """
+    weights = (q_weight, k_weight, v_weight)
+    names = ("Q", "K", "V")
+    if block_size != 32:
+        raise ValueError(f"MXFP4 QKV packing requires block_size=32, got {block_size}")
+    if any(weight.dim() != 2 for weight in weights):
+        raise ValueError("MXFP4 QKV weights must all be 2D")
+
+    k_in = q_weight.shape[1]
+    if any(weight.shape[1] != k_in for weight in weights[1:]):
+        raise ValueError(
+            "MXFP4 QKV weights must share one input width, got "
+            f"{tuple(weight.shape[1] for weight in weights)}"
+        )
+    if any(
+        weight.dtype != q_weight.dtype or weight.device != q_weight.device
+        for weight in weights[1:]
+    ):
+        raise ValueError("MXFP4 QKV weights must share dtype and device")
+
+    row_counts = tuple(weight.shape[0] for weight in weights)
+    if any(rows % block_size for rows in row_counts) or k_in % block_size:
+        raise ValueError(
+            "MXFP4 QKV packing requires every dimension to be a multiple of "
+            f"{block_size}; got {tuple(tuple(weight.shape) for weight in weights)}"
+        )
+
+    from lumen.ops.quantize.linear import (
+        _mark_mxfp4_data_shuffled,
+        _mark_mxfp4_scale_swizzled,
+        _mxfp4_can_fuse_b_shuffle,
+        _mxfp4_can_fuse_scale_swizzle,
+        _shuffle_mxfp4_weight,
+    )
+    from lumen.ops.quantize.ops import (
+        convert_to_mxfp4_2d,
+        swizzle_expanded_mxfp4_scale,
+        transpose_packed_fp4,
+    )
+
+    n_out = sum(row_counts)
+    fuse_fwd_shuffle = gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, n_out, k_in), n_out, k_in // 2,
+    )
+    fuse_dgrad_shuffle = gemm_rows is not None and _mxfp4_can_fuse_b_shuffle(
+        (gemm_rows, k_in, n_out), k_in, n_out // 2,
+    )
+    layout = (fuse_fwd_shuffle, fuse_dgrad_shuffle)
+    weight_shapes = tuple(tuple(weight.shape) for weight in weights)
+    cache_metadata = (
+        weight_shapes,
+        q_weight.dtype,
+        q_weight.device,
+        block_size,
+        layout,
+    )
+    weight_version = tuple(weight._version for weight in weights)
+    weight_sources = tuple(id(weight) for weight in weights)
+    cache_enabled = _os.environ.get("LUMEN_MXFP4_DISABLE_WEIGHT_CACHE") != "1"
+    cached = getattr(module, "_mxfp4_w_cache", None) if cache_enabled else None
+    if (
+        cached is not None
+        and cached[0] == layout
+        and getattr(module, "_mxfp4_w_cache_version", None) == weight_version
+        and getattr(module, "_mxfp4_w_cache_sources", None) == weight_sources
+        and getattr(module, "_mxfp4_w_cache_metadata", None) == cache_metadata
+    ):
+        return cached[1], cached[2]
+
+    with torch.no_grad():
+        data_parts = []
+        scale_parts = []
+        for name, weight in zip(names, weights):
+            data_part, scale_part = convert_to_mxfp4_2d(
+                weight.contiguous(), block_size=block_size, use_sr=False,
+            )
+            if data_part.dtype != torch.uint8 or scale_part.dtype != torch.uint8:
+                raise TypeError(
+                    f"MXFP4 {name} quantization must return uint8 data and scale, "
+                    f"got {data_part.dtype} and {scale_part.dtype}"
+                )
+            data_parts.append(data_part)
+            scale_parts.append(scale_part)
+
+        data = torch.cat(data_parts, dim=0)
+        scale = torch.cat(scale_parts, dim=0)
+        if fuse_fwd_shuffle:
+            data = _shuffle_mxfp4_weight(data)
+            _mark_mxfp4_data_shuffled(data)
+
+        data_t = transpose_packed_fp4(
+            data,
+            shuffle_data=fuse_dgrad_shuffle,
+            in_shuffled=fuse_fwd_shuffle,
+        )
+        if fuse_dgrad_shuffle:
+            _mark_mxfp4_data_shuffled(data_t)
+
+        if _mxfp4_can_fuse_scale_swizzle(
+            (n_out, k_in // block_size), (k_in, n_out // block_size),
+        ):
+            fwd_scale = _mark_mxfp4_scale_swizzled(
+                swizzle_expanded_mxfp4_scale(scale, block_size=block_size)
+            )
+            dgrad_scale = _mark_mxfp4_scale_swizzled(
+                swizzle_expanded_mxfp4_scale(
+                    scale, block_size=block_size, transpose=True,
+                )
+            )
+        else:
+            fwd_scale, dgrad_scale = scale, scale.t().contiguous()
+
+    data._mxfp4_wt_cached = (data_t, dgrad_scale)
+    if cache_enabled:
+        module._mxfp4_w_cache = (layout, data, fwd_scale)
+        module._mxfp4_w_cache_version = weight_version
+        module._mxfp4_w_cache_sources = weight_sources
+        module._mxfp4_w_cache_metadata = cache_metadata
+    return data, fwd_scale
+
+
 def _replace_forward(
     module,
     manager,
@@ -676,6 +954,8 @@ def _replace_forward(
     module._lumen_scaling_manager = manager
     module._lumen_scaling_type = scaling_type
     module._lumen_fp8_dtype = fp8_dtype
+    module._lumen_block_size = block_size
+    module._lumen_quantize_activation = quantize_activation
     module._lumen_act_tensor_id = tensor_id.replace(".weight", ".activation")
 
     _delay_wgrad = getattr(module, "delay_wgrad", False)
@@ -1031,17 +1311,64 @@ def register_fp8_weight_optimizer_hooks(
     optimizer.register_step_post_hook(_post_step)
 
 
+_MXFP4_WEIGHT_CACHE_ATTRS = (
+    "_mxfp4_w_cache",
+    "_mxfp4_w_cache_version",
+    "_mxfp4_w_cache_sources",
+    "_mxfp4_w_cache_metadata",
+)
+_MXFP4_LOAD_HOOK_HANDLE = "_mxfp4_weight_load_state_dict_post_hook_handle"
+
+
+def _clear_mxfp4_weight_cache(owner) -> None:
+    """Drop every derived MXFP4 weight-cache attribute from one owner."""
+    for attr in _MXFP4_WEIGHT_CACHE_ATTRS:
+        if hasattr(owner, attr):
+            delattr(owner, attr)
+
+
+def _invalidate_mxfp4_weight_caches(model) -> None:
+    """Invalidate module-owned and Parameter-owned MXFP4 weight caches."""
+    chunks = list(model) if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        for module in chunk.modules():
+            _clear_mxfp4_weight_cache(module)
+            # Native Lumen parallel linears cache on their Parameter because
+            # they call the shared _do_gemm helper rather than the patched
+            # module forward. A grouped MoE module can own weight0..weightN,
+            # so sweep every direct Parameter instead of only ``.weight``.
+            for parameter in module._parameters.values():
+                if parameter is not None:
+                    _clear_mxfp4_weight_cache(parameter)
+
+
+def _register_mxfp4_load_state_dict_hooks(model) -> None:
+    """Invalidate derived caches after any ordinary or DCP model load."""
+
+    def _post_load(module, _incompatible_keys) -> None:
+        _invalidate_mxfp4_weight_caches(module)
+
+    chunks = list(model) if isinstance(model, (list, tuple)) else [model]
+    for chunk in chunks:
+        if hasattr(chunk, _MXFP4_LOAD_HOOK_HANDLE):
+            continue
+        handle = chunk.register_load_state_dict_post_hook(_post_load)
+        setattr(chunk, _MXFP4_LOAD_HOOK_HANDLE, handle)
+
+
 def register_mxfp4_weight_optimizer_hooks(
     model,
     optimizer,
 ) -> None:
-    """Register a post-step hook to invalidate MXFP4 weight caches.
+    """Invalidate MXFP4 weight caches after optimizer steps and state loads.
 
     MXFP4 weight quantization (RTN, deterministic) is cached on each patched
     module, or on the weight Parameter for native Lumen linears, across
     micro-batches within a gradient accumulation step. After ``optimizer.step()``
-    updates BF16 master weights, this hook clears both cache locations so the
-    next forward re-quantizes from the updated weights.
+    updates BF16 master weights, a post-step hook clears both cache locations
+    so the next forward re-quantizes from the updated weights. A model
+    ``load_state_dict`` post-hook performs the same invalidation after ordinary
+    or distributed-checkpoint loads.
 
     Without this the cached FP4 weight is never invalidated, so forward and
     DGrad keep using the step-0 weights for the whole run — the loss flattens
@@ -1055,28 +1382,16 @@ def register_mxfp4_weight_optimizer_hooks(
     """
     chunks = list(model) if isinstance(model, (list, tuple)) else [model]
 
+    # ``torch.distributed.checkpoint.state_dict.set_state_dict`` eventually
+    # calls ``Module.load_state_dict(assign=False)``. With FSDP2, the gathered
+    # Parameter view can keep the same object identity and ``_version`` across
+    # that in-place load, so the normal cache key cannot detect that its bytes
+    # came from the pre-load weights. A post-load hook is the authoritative
+    # lifecycle boundary and also covers ordinary ``load_state_dict`` calls.
+    _register_mxfp4_load_state_dict_hooks(chunks)
+
     def _invalidate():
-        for chunk in chunks:
-            for m in chunk.modules():
-                if hasattr(m, "_mxfp4_w_cache"):
-                    del m._mxfp4_w_cache
-                    if hasattr(m, "_mxfp4_w_cache_version"):
-                        del m._mxfp4_w_cache_version
-                # Native Lumen parallel linears cache on their Parameter because
-                # they call the shared _do_gemm helper rather than the patched
-                # module forward above. Every parameter the module owns has to be
-                # swept, not just ``.weight``: a grouped MoE layer holds its
-                # experts as weight0..weightN and hands them to the linear's
-                # forward one at a time, so the cache lands on a Parameter that
-                # is not reachable under that name. Those entries were never
-                # cleared, leaving the experts quantized from the step-0 master
-                # weights for the whole run while the dense layers updated -- and
-                # nothing raises, the loss just stops moving.
-                for param in m._parameters.values():
-                    if param is not None and hasattr(param, "_mxfp4_w_cache"):
-                        del param._mxfp4_w_cache
-                        if hasattr(param, "_mxfp4_w_cache_version"):
-                            del param._mxfp4_w_cache_version
+        _invalidate_mxfp4_weight_caches(chunks)
 
     # Megatron's ChainedOptimizer / DistributedOptimizer are not
     # torch.optim.Optimizer subclasses and lack register_step_post_hook, so
@@ -1102,6 +1417,15 @@ def register_mxfp4_weight_optimizer_hooks(
 
 def disable(model: nn.Module) -> None:
     """Remove FP8 quantized forward from all patched layers."""
+    from lumen.models.qwen3 import (
+        disable_mxfp4_qwen_gate_up,
+        disable_mxfp4_qwen_qkv,
+        disable_mxfp4_qwen_swiglu,
+    )
+
+    disable_mxfp4_qwen_qkv(model)
+    disable_mxfp4_qwen_gate_up(model)
+    disable_mxfp4_qwen_swiglu(model)
     for module in model.modules():
         if hasattr(module, "_original_forward"):
             module.forward = module._original_forward

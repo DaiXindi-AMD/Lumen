@@ -129,6 +129,44 @@ fi
 export PYTHONPATH="${MEGATRON_ROOT}:${LUMEN_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 python -c "import megatron" || { echo "ERROR: megatron not importable"; exit 1; }
 
+# Both the native and container launchers arrive here. Fail before allocating
+# GPUs if the opt-in 4-wave challenger cannot be compiled by this Python/ROCm
+# pair; never silently run a different FlyDSL candidate under an old runtime.
+if [ "${PRECISION}" = "mxfp4" ] && [ "${LUMEN_MXFP4_FLYDSL:-0}" = "1" ]; then
+    FLYDSL_VERSION="$(
+        python -c '
+import importlib.metadata
+import re
+
+try:
+    installed = importlib.metadata.version("flydsl")
+except importlib.metadata.PackageNotFoundError:
+    installed = "unavailable"
+print(installed)
+match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:[.+-].*)?$", installed)
+supported = match is not None and tuple(map(int, match.groups())) >= (0, 3, 2)
+raise SystemExit(0 if supported else 1)
+'
+    )" || {
+        echo "ERROR: LUMEN_MXFP4_FLYDSL=1 requires FlyDSL >= 0.3.2; found ${FLYDSL_VERSION:-unavailable}."
+        echo "  Install ROCm/FlyDSL >= 0.3.2 in this Python environment or expose it on PYTHONPATH."
+        echo "  To run without the FlyDSL challenger, set LUMEN_MXFP4_FLYDSL=0."
+        exit 1
+    }
+
+    if [ -n "${ROCM_PATH:-}" ]; then
+        FLYDSL_ROCM_PATH="${ROCM_PATH}"
+    else
+        FLYDSL_ROCM_PATH="$(hipconfig --path)"
+    fi
+    if [ ! -x "${FLYDSL_ROCM_PATH}/llvm/bin/ld.lld" ]; then
+        echo "ERROR: FlyDSL needs ROCM_PATH to contain llvm/bin/ld.lld; got ${FLYDSL_ROCM_PATH}"
+        exit 1
+    fi
+    export ROCM_PATH="${FLYDSL_ROCM_PATH}"
+    echo "[setup] FlyDSL ${FLYDSL_VERSION}, ROCM_PATH=${ROCM_PATH}"
+fi
+
 # Lumen vendors Triton kernels under third_party/aiter that the installed aiter
 # does not ship. They have to be copied over the installed tree rather than put
 # on PYTHONPATH: the submodule has no compiled extensions for hipbsolgemm (every
@@ -321,14 +359,15 @@ case "${PRECISION}" in
         ;;
 esac
 
-# AITER can only reach its prebuilt A4W4 asm kernels for shapes listed in the
-# tuned table, and Qwen3-8B's fused qkv/gate_up shapes at this token count are
-# absent from the stock one: 8 of the 11 MXFP4 GEMMs fell back to Triton, worth
-# ~132 ms/step (docs/mxfp4_training_report.md §5.5). The extra rows were produced
-# by scripts/mxfp4_tune_shapes.py and each is bit-exact against Triton. They key
-# on the exact M/N/K, so they only fire at MBS x SEQ_LEN = 16384 with TP=1.
-# Setting the variable turns off AITER's own config discovery, hence relisting
-# the stock tables it would otherwise have merged.
+# Lumen's ASM-only registry admits prebuilt A4W4 kernels only for shapes named
+# by these tables. Qwen3-8B's fused qkv/gate_up shapes at this token count are
+# absent from the stock table: 8 of the 11 MXFP4 GEMMs otherwise fall back to
+# Triton, worth ~132 ms/step (docs/mxfp4_training_report.md §5.5). The extra
+# rows were produced by scripts/mxfp4_tune_shapes.py and are keyed by exact
+# M/N/K, so they only fire at MBS x SEQ_LEN = 16384 with TP=1. The environment
+# variable is retained as the table-path interface, but Lumen parses and
+# validates every admitted ASM row itself; list the stock tables explicitly
+# because setting it replaces the default path discovery.
 #
 # A model with no tuned table of its own still trains: every shape falls back to
 # Triton, which is correct but slower, so the log says which case it is rather

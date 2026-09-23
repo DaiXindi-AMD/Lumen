@@ -5,11 +5,9 @@
 ###############################################################################
 
 """Quantized linear forward + backward with explicit autograd and
-multi-backend ASM → Triton fallback.
+multi-backend ASM → FlyDSL → Triton fallback.
 
-All backends are AITER implementations — no torch.nn.functional fallbacks.
-
-All AITER GEMM kernels follow TN layout convention:
+All GEMM kernels follow TN layout convention:
     ``Y = X @ W^T``  where X is (M, K) and W is (N, K).
 
 Supports all 8 scaling modes:
@@ -34,7 +32,7 @@ import logging as _logging
 import os
 import threading
 import weakref
-from typing import Optional, Set
+from typing import NamedTuple, Optional, Set
 
 import torch
 from torch.autograd.function import once_differentiable
@@ -50,9 +48,10 @@ from lumen.ops.dispatch import (
     _probe_aiter_triton_gemm_mxfp4,
     _probe_aiter_triton_gemm_mxfp4_preshuffle,
     _probe_aiter_gemm_mxfp4_asm,
+    _probe_flydsl_gemm_mxfp4,
     try_backends,
 )
-from lumen.ops.quantize import mxfp4_autotune
+from lumen.ops.quantize import flydsl_mxfp4, mxfp4_asm, mxfp4_autotune
 from lumen.quantize.config import _get_float8_e4m3
 from lumen.quantize.descriptor import FP8Descriptor
 
@@ -79,6 +78,7 @@ _MIXED_SCALED_MM = os.environ.get("LUMEN_MIXED_SCALED_MM", "0") == "1"
 # ---------------------------------------------------------------------------
 _MXFP4_RHT_SIGN: Optional[torch.Tensor] = None
 _MXFP4_RHT_G = 16
+_MXFP4_DGRAD_HADAMARD = os.environ.get("LUMEN_MXFP4_DGRAD_HADAMARD", "0") == "1"
 
 
 def _get_mxfp4_rht_sign(device: torch.device) -> torch.Tensor:
@@ -242,7 +242,14 @@ def _fp8_cache_pop(bf16_ptr: int, expected_shape: tuple = None):
             return None
     return entry
 
-__all__ = ["QuantizedLinearFunction", "quantized_linear"]
+__all__ = [
+    "MXFP4GateUpFunction",
+    "MXFP4QKVFunction",
+    "QuantizedLinearFunction",
+    "mxfp4_gate_up_linear",
+    "mxfp4_qkv_linear",
+    "quantized_linear",
+]
 
 # When per-step weight quantization is active (LUMEN_WEIGHT_QUANT_ONCE), the
 # backward reuses the scaling manager's step-cached weight descriptor (whose
@@ -1205,11 +1212,11 @@ def _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w):
     )
 
 
-# aiter.gemm_a4w4 raises on gfx942, and on gfx1250 it forks to the F4GEMM preload
-# kernels, which want their own operand layout. Only gfx950 is validated here.
+# This direct A4W4 ASM API and operand layout are validated only on gfx950.
+# Other architectures use separate kernels and layouts.
 _MXFP4_ASM_ARCHS = ("gfx950",)
 
-# Scale padding the ASM/CK kernels index against, matching what TransformerEngine's
+# Scale padding the ASM kernels index against, matching what TransformerEngine's
 # MXFP4 quantizer allocates: rows up to 256, K/32 columns up to 8.
 _MXFP4_ASM_SCALE_ROW_MULTIPLE = 256
 _MXFP4_ASM_SCALE_COL_MULTIPLE = 8
@@ -1218,11 +1225,10 @@ _MXFP4_ASM_SCALE_COL_MULTIPLE = 8
 def _mxfp4_can_fuse_scale_swizzle(*scale_shapes):
     """Whether a quantizer may store these scales in the GEMM layout directly.
 
-    Which of the three MXFP4 backends runs is decided per shape after the
-    operands exist, so the quantizer cannot know its consumer. Requiring the
-    strictest alignment of the two that read swizzled scales -- the ASM
-    kernels', which also fixes the padding -- makes the fused layout valid for
-    either, and the row-major backends undo it.
+    The MXFP4 backend is decided per shape after the operands exist, so the
+    quantizer cannot know its consumer. Requiring the strict ASM alignment,
+    which also fixes the padding used by FlyDSL, makes the fused layout valid
+    for either direct implementation; row-major fallbacks undo it.
     """
     from lumen.ops.quantize.ops import mxfp4_scale_swizzle_supported, triton_arch
 
@@ -1250,13 +1256,57 @@ def _mxfp4_can_fuse_b_shuffle(gemm_key, rows, packed_cols):
     """
     from lumen.ops.quantize.ops import mxfp4_data_shuffle_supported
 
+    cached_backend = mxfp4_autotune.cached(gemm_key)
     return (
-        mxfp4_autotune.cached(gemm_key) in ("asm", "shuffled")
+        _mxfp4_cached_preshuffle_choice_is_trusted(gemm_key, cached_backend)
         and mxfp4_data_shuffle_supported(rows, packed_cols)
     )
 
 
-def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_swizzled, needs_wgrad):
+def _mxfp4_cached_preshuffle_choice_is_trusted(key, name):
+    """Only let a replayable decision change the quantizer's B layout."""
+    if name != "asm" and not flydsl_mxfp4.is_backend_name(name):
+        if name != "shuffled":
+            return False
+
+    asm_snapshot = mxfp4_asm.runtime_snapshot(*key)
+    if not asm_snapshot.cacheable:
+        return False
+    current_asm_identity = mxfp4_asm.snapshot_identity(asm_snapshot)
+    expected_identities = {}
+    required_incumbent = None
+    if name == "shuffled":
+        # A profiled Triton result cannot supersede an ASM kernel that is now
+        # available. It may only drive fused B storage when its exact entrypoint
+        # won a replayable no-ASM profile for this shape.
+        if current_asm_identity is not None:
+            return False
+        expected_identities["shuffled"] = _mxfp4_triton_identity("shuffled")
+    elif name == "asm":
+        if current_asm_identity is None:
+            return False
+        expected_identities["asm"] = current_asm_identity
+        required_incumbent = "asm"
+    else:
+        expected_identities[name] = _mxfp4_flydsl_identity(name)
+        if current_asm_identity is not None:
+            expected_identities["asm"] = current_asm_identity
+            required_incumbent = "asm"
+    return mxfp4_autotune.cached_profile_supports(
+        key,
+        name,
+        expected_identities=expected_identities,
+        required_incumbent=required_incumbent,
+    )
+
+
+def _mxfp4_wgrad_activation_operand(
+    input_2d,
+    n_out,
+    scaling_type,
+    row_scales_swizzled,
+    needs_wgrad,
+):
     """Quantize the activation into the forward operand *and* WGrad's, in one pass.
 
     WGrad reads the same activation rotated and transposed. Derived in backward
@@ -1278,6 +1328,9 @@ def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_s
     if input_2d.dtype not in (torch.bfloat16, torch.float32):
         return None
 
+    from lumen.ops.quantize.ops import dual_layout_quant_mxfp4
+    from lumen.quantize.descriptor import FP8Descriptor
+
     M, K = input_2d.shape
     block = 32
     if M % block or K % block or M % _MXFP4_RHT_G:
@@ -1287,12 +1340,9 @@ def _mxfp4_wgrad_activation_operand(input_2d, weight, scaling_type, row_scales_s
     if not row_scales_swizzled or not _mxfp4_can_fuse_scale_swizzle((K, M // block)):
         return None
 
-    from lumen.ops.quantize.ops import dual_layout_quant_mxfp4
-    from lumen.quantize.descriptor import FP8Descriptor
-
     # WGrad consumes this operand as B, so store it in that GEMM's order too
     # once the backend for the shape is known (see _mxfp4_can_fuse_b_shuffle).
-    shuffled = _mxfp4_can_fuse_b_shuffle((weight.shape[0], K, M), K, M // 2)
+    shuffled = _mxfp4_can_fuse_b_shuffle((n_out, K, M), K, M // 2)
     # NVFP4 §4.4: stochastic rounding is for gradients; the activation is RTN in
     # both layouts, as it was when WGrad rebuilt this operand for itself.
     row_fp4, row_scale, col_fp4, col_scale = dual_layout_quant_mxfp4(
@@ -1321,38 +1371,33 @@ _MXFP4_ASM_MIN_WEIGHT_BYTES = 26 * 1024 * 1024
 _MXFP4_ASM_ENV = os.environ.get("LUMEN_MXFP4_ASM")
 
 
-@functools.lru_cache(maxsize=256)
+def _mxfp4_asm_config(M, N, K):
+    """Return only an installed, explicitly tuned ASM kernel for this shape."""
+    return mxfp4_asm.lookup_runtime(M, N, K)
+
+
 def _mxfp4_asm_tuned(M, N, K):
-    """True when AITER has a tuned A4W4 kernel for this shape.
-
-    Without one, ``gemm_a4w4`` falls back to a default kernel choice that is not
-    validated for correctness: at (64, 64, 128) it silently returns garbage
-    (0.6 dB against the plain Triton kernel). Every tuned shape measured is
-    bit-exact, so a tuned hit is the gate -- and it also keeps us on the shapes
-    AMD actually benchmarked, which are the ones the ASM path wins on.
-    """
-    try:
-        from aiter.ops.gemm_op_a4w4 import get_GEMM_config
-
-        return get_GEMM_config(M, N, K) is not None
-    except Exception:
-        return False
+    """True when the tuned table names a validated ASM symbol for this shape."""
+    return _mxfp4_asm_config(M, N, K) is not None
 
 
-def _mxfp4_asm_supported(a_fp4, w_fp4):
-    """True when the prebuilt A4W4 ASM/CK kernels can correctly run this shape."""
+def _mxfp4_asm_supported(a_fp4, w_fp4, asm_snapshot=None):
+    """True when a prebuilt A4W4 ASM kernel can correctly run this shape."""
     from lumen.ops.quantize.ops import triton_arch
 
-    if triton_arch() not in _MXFP4_ASM_ARCHS:
+    arch = asm_snapshot.arch if asm_snapshot is not None else triton_arch()
+    if arch not in _MXFP4_ASM_ARCHS:
         return False
     # shuffle_weight(layout=(16, 16)) tiles both dims of the packed weight by 16.
     if w_fp4.shape[0] % 16 != 0 or w_fp4.shape[1] % 16 != 0:
         return False
+    if asm_snapshot is not None:
+        return asm_snapshot.config is not None
     return _mxfp4_asm_tuned(a_fp4.shape[0], w_fp4.shape[0], a_fp4.shape[1] * 2)
 
 
-def _mxfp4_asm_eligible(a_fp4, w_fp4):
-    """True when the A4W4 ASM/CK kernels should also be worth their prologue.
+def _mxfp4_asm_eligible(a_fp4, w_fp4, asm_snapshot=None):
+    """True when the A4W4 ASM kernels should also be worth their prologue.
 
     The static policy, used when autotune is off. With autotune on, only
     ``_mxfp4_asm_supported`` matters and the winner is measured — which is the
@@ -1364,7 +1409,7 @@ def _mxfp4_asm_eligible(a_fp4, w_fp4):
             return False
     elif w_fp4.numel() < _MXFP4_ASM_MIN_WEIGHT_BYTES:
         return False
-    return _mxfp4_asm_supported(a_fp4, w_fp4)
+    return _mxfp4_asm_supported(a_fp4, w_fp4, asm_snapshot)
 
 
 def _pad_and_swizzle_mxfp4_scale(scale, arch, tiling):
@@ -1449,15 +1494,44 @@ def _cached_weight_operands(w_fp4, scale_w, key, build):
     return built
 
 
-def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
-    """MXFP4 GEMM via AITER's prebuilt A4W4 ASM/CK kernels.
+def _mxfp4_preshuffled_operands(w_fp4, scale_w, arch, tiling):
+    """Build/cache the identical B and scale layout shared by ASM and FlyDSL."""
 
-    Same math as ``_gemm_mxfp4_aiter``. Lumen only builds the operand layout;
-    ``aiter.gemm_a4w4`` owns the tuned-config lookup that picks between the ASM
-    and CK kernels, and slices the row-padded output back to M.
+    def _build():
+        sw = _expand_2d_scale_to_1d(
+            scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2)
+        )
+        return (
+            _shuffle_mxfp4_weight(w_fp4, arch=arch),
+            _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
+        )
+
+    return _cached_weight_operands(
+        w_fp4, scale_w, "_mxfp4_preshuffled_operands", _build
+    )
+
+
+def _gemm_mxfp4_aiter_asm(
+    a_fp4, w_fp4, scale_a, scale_w, asm_config=None
+):
+    """MXFP4 GEMM via AITER's direct prebuilt A4W4 ASM entry point.
+
+    The tuned entry is validated before launch and the direct API fixes the
+    implementation behind the ``asm`` backend name.
     """
-    import aiter
+    from aiter.ops.gemm_op_a4w4 import gemm_a4w4_asm
     from lumen.ops.quantize.ops import triton_arch
+
+    M = a_fp4.shape[0]
+    N = w_fp4.shape[0]
+    K = a_fp4.shape[1] * 2
+    if asm_config is None:
+        asm_config = _mxfp4_asm_config(M, N, K)
+    if asm_config is None:
+        raise RuntimeError(
+            f"MXFP4 ASM backend requires an explicit ASM tuned entry for {(M, N, K)}"
+        )
+    kernel_name, split_k = asm_config
 
     arch = triton_arch()
     tiling = _MXFP4_SCALE_SHUFFLE_TILING.get(arch)
@@ -1466,24 +1540,58 @@ def _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w):
 
     sa = _expand_2d_scale_to_1d(scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2))
 
-    def _build():
-        sw = _expand_2d_scale_to_1d(scale_w, (w_fp4.shape[0], w_fp4.shape[1] * 2))
-        return (
-            _shuffle_mxfp4_weight(w_fp4, arch=arch),
-            _pad_and_swizzle_mxfp4_scale(sw, arch, tiling),
-        )
-
-    w_shuf, sw_shuf = _cached_weight_operands(
-        w_fp4, scale_w, "_mxfp4_asm_operands", _build
+    w_shuf, sw_shuf = _mxfp4_preshuffled_operands(
+        w_fp4, scale_w, arch, tiling
     )
 
-    return aiter.gemm_a4w4(
+    out = torch.empty(
+        (((M + 31) // 32) * 32, N), dtype=torch.bfloat16, device=a_fp4.device
+    )
+    gemm_a4w4_asm(
         a_fp4,
         w_shuf,
         _pad_and_swizzle_mxfp4_scale(sa, arch, tiling),
         sw_shuf,
-        dtype=torch.bfloat16,
+        out,
+        kernelName=kernel_name,
+        bpreshuffle=True,
+        log2_k_split=split_k,
     )
+    return out[:M]
+
+
+def _mxfp4_flydsl_backend_names(a_fp4, w_fp4):
+    """Explicit FlyDSL configurations that can run these operands."""
+    from lumen.ops.quantize.ops import triton_arch
+
+    if triton_arch() != "gfx950":
+        return ()
+    M = a_fp4.shape[0]
+    N = w_fp4.shape[0]
+    K = a_fp4.shape[1] * 2
+    return tuple(config.name for config in flydsl_mxfp4.supported_configs(M, N, K))
+
+
+def _gemm_mxfp4_flydsl(config_name, a_fp4, w_fp4, scale_a, scale_w):
+    """MXFP4 GEMM through one pinned, explicitly named FlyDSL configuration."""
+    from lumen.ops.quantize.ops import triton_arch
+
+    arch = triton_arch()
+    if arch != "gfx950":
+        raise NotImplementedError(f"FlyDSL MXFP4 GEMM requires gfx950, got {arch}")
+
+    config = flydsl_mxfp4.get_config(config_name)
+    sa = _expand_2d_scale_to_1d(
+        scale_a, (a_fp4.shape[0], a_fp4.shape[1] * 2)
+    )
+
+    w_shuf, sw_shuf = _mxfp4_preshuffled_operands(
+        w_fp4, scale_w, arch, _MXFP4_SCALE_SHUFFLE_TILING[arch]
+    )
+    sa_shuf = _pad_and_swizzle_mxfp4_scale(
+        sa, arch, _MXFP4_SCALE_SHUFFLE_TILING[arch]
+    )
+    return flydsl_mxfp4.run(config, a_fp4, w_shuf, sa_shuf, sw_shuf)
 
 
 def _gemm_mxfp4_fallback(a_fp4, w_fp4, scale_a, scale_w):
@@ -1519,78 +1627,235 @@ _fast_mxfp4_gemm_probed = False
 
 _fast_mxfp4_preshuffle_ok = False
 _fast_mxfp4_asm_ok = False
+_fast_mxfp4_flydsl_ok = False
 
 _MXFP4_BACKENDS = {
     "asm": lambda a, w, sa, sw: _gemm_mxfp4_aiter_asm(a, w, sa, sw),
     "shuffled": lambda a, w, sa, sw: _gemm_mxfp4_aiter_preshuffle(a, w, sa, sw),
     "plain": lambda a, w, sa, sw: _gemm_mxfp4_aiter(a, w, sa, sw),
 }
+for _flydsl_name in flydsl_mxfp4.backend_names():
+    _MXFP4_BACKENDS[_flydsl_name] = functools.partial(
+        _gemm_mxfp4_flydsl, _flydsl_name
+    )
 
 
 def _mxfp4_probe_backends():
     """Work out once which optional MXFP4 backends this install can reach.
 
-    Returns whether the plain AITER kernel is available at all; without it there
-    is nothing to dispatch to and the caller falls back to dequant + BF16.
+    Returns whether any direct MXFP4 implementation is available.
     """
     global _fast_mxfp4_gemm_fn, _fast_mxfp4_gemm_probed
-    global _fast_mxfp4_preshuffle_ok, _fast_mxfp4_asm_ok
+    global _fast_mxfp4_preshuffle_ok, _fast_mxfp4_asm_ok, _fast_mxfp4_flydsl_ok
     if not _fast_mxfp4_gemm_probed:
         _fast_mxfp4_gemm_probed = True
         if _probe_aiter_triton_gemm_mxfp4():
             _fast_mxfp4_gemm_fn = _gemm_mxfp4_aiter
         _fast_mxfp4_preshuffle_ok = _probe_aiter_triton_gemm_mxfp4_preshuffle()
         _fast_mxfp4_asm_ok = _probe_aiter_gemm_mxfp4_asm()
-    return _fast_mxfp4_gemm_fn is not None
+        _fast_mxfp4_flydsl_ok = _probe_flydsl_gemm_mxfp4()
+    return bool(
+        _fast_mxfp4_gemm_fn is not None
+        or _fast_mxfp4_preshuffle_ok
+        or _fast_mxfp4_asm_ok
+        or _fast_mxfp4_flydsl_ok
+    )
 
 
-_mxfp4_legality_cache = {}  # ShapeKey -> (asm_ok, shuf_ok)
+_mxfp4_legality_cache = {}  # ShapeKey -> (shuf_ok, flydsl_names)
 
 
-def _mxfp4_backend_legality(key, a_fp4, w_fp4):
-    """Which backends may correctly run this shape, memoized per shape.
+class _MXFP4BackendResolution(NamedTuple):
+    name: str
+    asm_snapshot: mxfp4_asm.RuntimeSnapshot
+    asm_ok: bool
+    shuf_ok: bool
+    flydsl_names: tuple
 
-    Both predicates read only the operand shapes, the arch and AITER's tuned
-    A4W4 table, none of which change once the process has issued its first
-    MXFP4 GEMM. That is what makes it cheap enough to consult before trusting a
-    cached decision rather than after.
+
+# (device type, device index, shape, B layout) -> (validation token, backend).
+# The token contains live ASM file signatures and the autotune decision epoch,
+# so this skips expensive identity/profile reconstruction without weakening the
+# existing in-process invalidation rules.
+_mxfp4_resolved_backend_cache = {}
+
+
+def _mxfp4_backend_legality(key, a_fp4, w_fp4, asm_snapshot=None):
+    """Which backends may correctly run this shape.
+
+    FlyDSL and Triton legality depend only on shape and installation, so those
+    results are memoized. ASM state comes from the dispatch's live snapshot: a
+    cached decision stops being usable immediately if its tuned-table row no
+    longer names the exact direct ASM family.
     """
     hit = _mxfp4_legality_cache.get(key)
     if hit is None:
         hit = (
-            bool(_fast_mxfp4_asm_ok and _mxfp4_asm_supported(a_fp4, w_fp4)),
             bool(_fast_mxfp4_preshuffle_ok and _mxfp4_preshuffle_supported(a_fp4, w_fp4)),
+            (
+                _mxfp4_flydsl_backend_names(a_fp4, w_fp4)
+                if _fast_mxfp4_flydsl_ok
+                else ()
+            ),
         )
         _mxfp4_legality_cache[key] = hit
-    return hit
+    asm_ok = bool(
+        _fast_mxfp4_asm_ok
+        and _mxfp4_asm_supported(a_fp4, w_fp4, asm_snapshot)
+    )
+    shuf_ok, flydsl_names = hit
+    return asm_ok, shuf_ok, flydsl_names
 
 
-_MXFP4_BACKEND_REQUIRES = {"asm": 0, "shuffled": 1}
+def _mxfp4_backend_is_legal(name, asm_ok, shuf_ok, flydsl_names, shuffled_b):
+    if name == "asm":
+        return asm_ok
+    if name == "shuffled":
+        return shuf_ok
+    if name == "plain":
+        return not shuffled_b and _fast_mxfp4_gemm_fn is not None
+    return name in flydsl_names
 
 
-def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
-    """Name of the MXFP4 backend to run for these operands.
+def _mxfp4_asm_identity(config):
+    from lumen.ops.quantize.ops import triton_arch
+
+    return mxfp4_asm.identity(config, triton_arch())
+
+
+def _mxfp4_flydsl_identity(name):
+    return flydsl_mxfp4.config_identity(flydsl_mxfp4.get_config(name))
+
+
+def _mxfp4_triton_identity(name):
+    entrypoints = {
+        "plain": "gemm_afp4wfp4",
+        "shuffled": "gemm_afp4wfp4_preshuffle",
+    }
+    try:
+        entrypoint = entrypoints[name]
+    except KeyError as exc:
+        raise ValueError(f"unknown MXFP4 Triton backend: {name!r}") from exc
+    return {"implementation": "triton", "entrypoint": entrypoint}
+
+
+def _mxfp4_resolution_cache_key(key, a_fp4, shuffled_b):
+    device = getattr(a_fp4, "device", None)
+    if device is None:
+        # Offline cache validation deliberately replays dispatch with lightweight
+        # shape-only operands so it need not allocate the model's very large
+        # tensors. Keep those entries in their own in-process namespace while
+        # preserving the exact device-scoped key used by real tensors.
+        return "shape-only", None, key, shuffled_b
+    return device.type, device.index, key, shuffled_b
+
+
+def _mxfp4_resolution_validation_token(
+    name, asm_snapshot, asm_ok, shuf_ok, flydsl_names
+):
+    flydsl_identity = (
+        _mxfp4_flydsl_identity(name)
+        if flydsl_mxfp4.is_backend_name(name)
+        else None
+    )
+    consensus_context = (
+        mxfp4_autotune.replay_context()
+        if flydsl_identity is not None
+        else None
+    )
+    return (
+        asm_snapshot.validation_token,
+        mxfp4_autotune.decision_epoch(),
+        name,
+        asm_ok,
+        shuf_ok,
+        flydsl_names,
+        _fast_mxfp4_gemm_fn is not None,
+        flydsl_identity,
+        consensus_context,
+    )
+
+
+def _mxfp4_resolve_backend(
+    a_fp4, w_fp4, scale_a, scale_w, backends_probed=False
+):
+    """Resolve the MXFP4 backend and the exact ASM config for this dispatch.
 
     Autotune measures the backends that can legally run the shape and remembers
-    the winner; the static byte thresholds are only the fallback. All three
-    backends are bit-for-bit identical, so this choice is purely about speed.
+    the winner; the static byte thresholds are only the fallback. A legal ASM
+    entry is the incumbent and only a clearly faster FlyDSL result may replace
+    it.  A validated hot entry is keyed by live registry signatures, so file
+    changes still take effect on the next dispatch without rebuilding full
+    implementation identities on every GEMM.
     """
-    _mxfp4_probe_backends()
+    if not backends_probed:
+        _mxfp4_probe_backends()
     key = (a_fp4.shape[0], w_fp4.shape[0], a_fp4.shape[1] * 2)
-    asm_ok, shuf_ok = _mxfp4_backend_legality(key, a_fp4, w_fp4)
+    asm_snapshot = mxfp4_asm.runtime_snapshot(*key)
+    asm_ok, shuf_ok, flydsl_names = _mxfp4_backend_legality(
+        key, a_fp4, w_fp4, asm_snapshot
+    )
     shuffled_b = _is_mxfp4_data_shuffled(w_fp4)
+    resolution = _MXFP4BackendResolution(
+        "", asm_snapshot, asm_ok, shuf_ok, flydsl_names
+    )
 
     name = mxfp4_autotune.cached(key)
     if name is not None:
+        cache_key = _mxfp4_resolution_cache_key(key, a_fp4, shuffled_b)
+        validation_token = _mxfp4_resolution_validation_token(
+            name, asm_snapshot, asm_ok, shuf_ok, flydsl_names
+        )
+        cached_resolution = _mxfp4_resolved_backend_cache.get(cache_key)
+        if (
+            asm_snapshot.cacheable
+            and cached_resolution == (validation_token, name)
+            and _mxfp4_backend_is_legal(
+                name, asm_ok, shuf_ok, flydsl_names, shuffled_b
+            )
+        ):
+            mxfp4_autotune.record_shape(
+                key, asm_available=asm_ok, backend=name
+            )
+            return resolution._replace(name=name)
+
         # A decision is only as good as the conditions it was measured under.
         # A persisted cache outlives the run that earned it, and "asm" recorded
-        # with a tuned table in front of AITER means garbage without one --
-        # gemm_a4w4 falls back to an unvalidated kernel choice. The cache blob
+        # with an ASM tuned-table entry means the direct launch is unavailable
+        # without one. The cache blob
         # fingerprints the tables, but that cannot see a table narrowed within
         # the process, so check legality here too and re-measure if it lapsed.
-        required = _MXFP4_BACKEND_REQUIRES.get(name)
-        if required is None or (asm_ok, shuf_ok)[required]:
-            return name
+        exact_identity = not (asm_ok and name not in ("asm", *flydsl_names))
+        if name == "asm" or flydsl_mxfp4.is_backend_name(name):
+            expected_identities = {}
+            current_asm_identity = (
+                mxfp4_asm.snapshot_identity(asm_snapshot) if asm_ok else None
+            )
+            if name == "asm":
+                expected_identities["asm"] = current_asm_identity
+            else:
+                expected_identities[name] = _mxfp4_flydsl_identity(name)
+                if asm_ok:
+                    # The winning FlyDSL time was compared with this exact ASM
+                    # symbol/split-K pair, not merely with an ``asm`` label.
+                    expected_identities["asm"] = current_asm_identity
+            exact_identity = mxfp4_autotune.cached_profile_supports(
+                key,
+                name,
+                expected_identities=expected_identities,
+                required_incumbent="asm" if asm_ok else None,
+            )
+        if exact_identity and _mxfp4_backend_is_legal(
+            name, asm_ok, shuf_ok, flydsl_names, shuffled_b
+        ):
+            if asm_snapshot.cacheable:
+                _mxfp4_resolved_backend_cache[cache_key] = (
+                    validation_token,
+                    name,
+                )
+            mxfp4_autotune.record_shape(key, asm_available=asm_ok, backend=name)
+            return resolution._replace(name=name)
+        _mxfp4_resolved_backend_cache.pop(cache_key, None)
         _logger.warning(
             "MXFP4 autotune: cached %s backend for shape %s is not legal for these "
             "operands; re-measuring. A cache reused with a different "
@@ -1602,12 +1867,32 @@ def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
 
     candidates = []
     if asm_ok:
-        candidates.append(("asm", lambda: _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, scale_a, scale_w)))
+        candidates.append(
+            (
+                "asm",
+                lambda: _gemm_mxfp4_aiter_asm(
+                    a_fp4,
+                    w_fp4,
+                    scale_a,
+                    scale_w,
+                    asm_config=asm_snapshot.config,
+                ),
+            )
+        )
+    for flydsl_name in flydsl_names:
+        candidates.append(
+            (
+                flydsl_name,
+                lambda name=flydsl_name: _gemm_mxfp4_flydsl(
+                    name, a_fp4, w_fp4, scale_a, scale_w
+                ),
+            )
+        )
     if shuf_ok:
         candidates.append(
             ("shuffled", lambda: _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, scale_a, scale_w))
         )
-    if not shuffled_b:
+    if not shuffled_b and _fast_mxfp4_gemm_fn is not None:
         candidates.append(("plain", lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, scale_a, scale_w)))
     if not candidates:
         raise AssertionError(
@@ -1615,50 +1900,117 @@ def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
             f"for shape {key}"
         )
 
-    if asm_ok and _mxfp4_asm_eligible(a_fp4, w_fp4):
+    identities = {}
+    if asm_ok:
+        identities["asm"] = mxfp4_asm.snapshot_identity(asm_snapshot)
+    for flydsl_name in flydsl_names:
+        identities[flydsl_name] = _mxfp4_flydsl_identity(flydsl_name)
+    if shuf_ok:
+        identities["shuffled"] = _mxfp4_triton_identity("shuffled")
+    if not shuffled_b and _fast_mxfp4_gemm_fn is not None:
+        identities["plain"] = _mxfp4_triton_identity("plain")
+
+    if asm_ok and _mxfp4_asm_eligible(a_fp4, w_fp4, asm_snapshot):
         static = "asm"
     elif shuf_ok and _mxfp4_preshuffle_eligible(a_fp4, w_fp4):
         static = "shuffled"
     else:
-        static = candidates[0][0] if shuffled_b else "plain"
+        static = candidates[0][0]
 
-    name = mxfp4_autotune.pick_backend(key, candidates, fallback=static)
-    mxfp4_autotune.record_shape(key, tuned=asm_ok, backend=name)
-    return name
+    incumbent = "asm" if asm_ok else static
+    name = mxfp4_autotune.pick_backend(
+        key,
+        candidates,
+        fallback=static,
+        incumbent=incumbent,
+        identities=identities,
+    )
+    mxfp4_autotune.record_shape(key, asm_available=asm_ok, backend=name)
+    if asm_snapshot.cacheable and mxfp4_autotune.cached(key) == name:
+        cache_key = _mxfp4_resolution_cache_key(key, a_fp4, shuffled_b)
+        validation_token = _mxfp4_resolution_validation_token(
+            name, asm_snapshot, asm_ok, shuf_ok, flydsl_names
+        )
+        _mxfp4_resolved_backend_cache[cache_key] = (validation_token, name)
+    return resolution._replace(name=name)
+
+
+def _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w):
+    """Compatibility helper returning only the selected backend name."""
+    return _mxfp4_resolve_backend(a_fp4, w_fp4, scale_a, scale_w).name
 
 
 _MXFP4_BACKEND_KIND = {
-    # Prebuilt ASM/CK kernels with a tuned kernel+splitK per shape: fastest path
-    # on gfx950, and the one TransformerEngine's MXFP4 linear lands on.
+    # Prebuilt ASM kernels with an explicit tuned kernel+splitK per shape: the
+    # protected incumbent against which FlyDSL configurations are profiled.
     "asm": Backend.ASM,
     "shuffled": Backend.TRITON,
     "plain": Backend.TRITON,
 }
+_MXFP4_BACKEND_KIND.update(
+    {name: Backend.FLYDSL for name in flydsl_mxfp4.backend_names()}
+)
 
 
 def gemm_mxfp4_dispatch(a_fp4, w_fp4, scale_a, scale_w):
-    """MXFP4 GEMM: Y = X @ W^T with E8M0 block scales. AITER first, dequant+BF16 fallback."""
+    """MXFP4 GEMM with explicit ASM/FlyDSL/Triton dispatch and BF16 fallback."""
     # A quantizer only stores the B operand pre-shuffled for a consumer that reads
     # that order, so the row-major kernels are not a legal fallback here -- they
     # would read the permuted bytes as if they were in place.
     shuffled_b = _is_mxfp4_data_shuffled(w_fp4)
     if _mxfp4_probe_backends():
-        name = _mxfp4_choose_backend(a_fp4, w_fp4, scale_a, scale_w)
+        resolution = _mxfp4_resolve_backend(
+            a_fp4, w_fp4, scale_a, scale_w, backends_probed=True
+        )
+        name = resolution.name
         if shuffled_b and name == "plain":
             raise AssertionError(
                 "MXFP4 B operand was stored pre-shuffled but this shape dispatches "
                 "to the row-major kernel; the quantizer and the dispatch disagree"
             )
         if _FAST_QUANT_DISPATCH:
+            if name == "asm":
+                return _gemm_mxfp4_aiter_asm(
+                    a_fp4,
+                    w_fp4,
+                    scale_a,
+                    scale_w,
+                    asm_config=resolution.asm_snapshot.config,
+                )
             return _MXFP4_BACKENDS[name](a_fp4, w_fp4, scale_a, scale_w)
         # Same choice, but keep the other kernels behind it so a backend that
         # rejects these operands at runtime degrades instead of raising.
-        legal = ("asm", "shuffled") if shuffled_b else ("asm", "shuffled", "plain")
+        asm_ok = resolution.asm_ok
+        shuf_ok = resolution.shuf_ok
+        legal = []
+        if asm_ok:
+            legal.append("asm")
+        # FlyDSL is admitted to execution only when this exact configuration
+        # won the correctness-gated profile. Other legal configurations are
+        # profile candidates, not runtime fallbacks.
+        if flydsl_mxfp4.is_backend_name(name):
+            legal.append(name)
+        if shuf_ok:
+            legal.append("shuffled")
+        if not shuffled_b and _fast_mxfp4_gemm_fn is not None:
+            legal.append("plain")
         order = [name] + [n for n in legal if n != name]
         backends = [
             (
                 _MXFP4_BACKEND_KIND[n],
-                (lambda fn=_MXFP4_BACKENDS[n]: fn(a_fp4, w_fp4, scale_a, scale_w)),
+                (
+                    lambda fn=_MXFP4_BACKENDS[n], backend_name=n: (
+                        _gemm_mxfp4_aiter_asm(
+                            a_fp4,
+                            w_fp4,
+                            scale_a,
+                            scale_w,
+                            asm_config=resolution.asm_snapshot.config,
+                        )
+                        if backend_name == "asm"
+                        else fn(a_fp4, w_fp4, scale_a, scale_w)
+                    )
+                ),
                 n,
             )
             for n in order
@@ -1830,6 +2182,16 @@ _MXFP4_MAX_OPERAND_ELEMS = 2 ** 31
 _mxfp4_int32_warned: Set[str] = set()
 
 
+def _mxfp4_shape_operands_fit_int32(
+    input: torch.Tensor,
+    n_out: int,
+    k_in: int,
+) -> bool:
+    """Whether all forward/backward operands fit AITER's 32-bit indexing."""
+    m = input.numel() // k_in if k_in else 0
+    return max(m * k_in, m * n_out, n_out * k_in) < _MXFP4_MAX_OPERAND_ELEMS
+
+
 def _mxfp4_operands_fit_int32(input: torch.Tensor, weight: torch.Tensor) -> bool:
     """Can every operand this layer's MXFP4 path builds be indexed in 32 bits?
 
@@ -1849,10 +2211,355 @@ def _mxfp4_operands_fit_int32(input: torch.Tensor, weight: torch.Tensor) -> bool
     Checks all three products because the operands differ per pass: forward
     reads M*K, dgrad reads M*N, wgrad reads both, and the weight is N*K.
     """
-    k = input.shape[-1]
-    m = input.numel() // k if k else 0
-    n = weight.shape[0]
-    return max(m * k, m * n, n * k) < _MXFP4_MAX_OPERAND_ELEMS
+    return _mxfp4_shape_operands_fit_int32(
+        input,
+        n_out=weight.shape[0],
+        k_in=input.shape[-1],
+    )
+
+
+def _mxfp4_forward_core(
+    ctx,
+    input: torch.Tensor,
+    weight_desc: FP8Descriptor,
+    *,
+    n_out: int,
+    k_in: int,
+    scaling_manager,
+    fp8_dtype: torch.dtype,
+    block_size: int,
+    tensor_id: str,
+    needs_wgrad: bool,
+    weight_for_hadamard: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Run MXFP4 forward and save only compact operands needed by backward."""
+    input_2d = _to_2d(input)
+    if input_2d.shape[1] != k_in:
+        raise ValueError(
+            f"MXFP4 input K mismatch: expected {k_in}, got {input_2d.shape[1]}"
+        )
+    if weight_desc.data.shape != (n_out, k_in // 2):
+        raise ValueError(
+            "MXFP4 packed weight shape mismatch: expected "
+            f"{(n_out, k_in // 2)}, got {tuple(weight_desc.data.shape)}"
+        )
+
+    fuse_input_swizzle = (
+        k_in % 32 == 0
+        and _mxfp4_can_fuse_scale_swizzle((input_2d.shape[0], k_in // 32))
+    )
+    input_wgrad_operand = _mxfp4_wgrad_activation_operand(
+        input_2d,
+        n_out,
+        "mxfp4",
+        fuse_input_swizzle,
+        needs_wgrad,
+    )
+    if input_wgrad_operand is not None:
+        input_desc, wgrad_fp4, wgrad_scale, wgrad_shuffled = input_wgrad_operand
+    else:
+        input_desc = quantize_input(
+            input_2d,
+            "mxfp4",
+            fp8_dtype,
+            block_size,
+            scaling_manager,
+            tensor_id.replace("weight", "activation"),
+            swizzle_scale=fuse_input_swizzle,
+        )
+        wgrad_fp4 = wgrad_scale = None
+        wgrad_shuffled = False
+
+    output = dispatch_gemm(input_desc, weight_desc, scaling_type="mxfp4")
+    output = output.view(*input.shape[:-1], n_out)
+
+    wt_cached = getattr(weight_desc.data, "_mxfp4_wt_cached", None)
+    if wt_cached is not None:
+        weight_t, weight_scale_t = wt_cached
+    else:
+        from lumen.ops.quantize.ops import transpose_packed_fp4
+
+        fuse_weight_t_shuffle = _mxfp4_can_fuse_b_shuffle(
+            (input_2d.shape[0], k_in, n_out), k_in, n_out // 2,
+        )
+        weight_t = transpose_packed_fp4(
+            weight_desc.data,
+            shuffle_data=fuse_weight_t_shuffle,
+            in_shuffled=_is_mxfp4_data_shuffled(weight_desc.data),
+        )
+        if fuse_weight_t_shuffle:
+            _mark_mxfp4_data_shuffled(weight_t)
+        weight_scale_t = weight_desc.scale.t().contiguous()
+
+    ctx.mxfp4_input_scale_swizzled = _is_mxfp4_scale_swizzled(input_desc.scale)
+    ctx.mxfp4_weight_t_shuffled = _is_mxfp4_data_shuffled(weight_t)
+    ctx.mxfp4_weight_t_scale_swizzled = _is_mxfp4_scale_swizzled(weight_scale_t)
+    ctx.mxfp4_wgrad_activation = input_wgrad_operand is not None
+    ctx.mxfp4_dgrad_hadamard = False
+
+    weight_had_fp4 = weight_had_scale = None
+    if _MXFP4_DGRAD_HADAMARD:
+        if weight_for_hadamard is None:
+            raise ValueError(
+                "MXFP4 packed gate/up does not support "
+                "LUMEN_MXFP4_DGRAD_HADAMARD=1"
+            )
+        from lumen.ops.quantize.ops import hadamard_quant_mxfp4
+
+        weight_bf16_t = weight_for_hadamard.detach().t().contiguous()
+        weight_had_fp4, weight_had_scale = hadamard_quant_mxfp4(
+            weight_bf16_t,
+            _get_mxfp4_rht_sign(weight_bf16_t.device),
+            block_size=32,
+            g=_MXFP4_RHT_G,
+            use_sr=False,
+        )
+        ctx.mxfp4_dgrad_hadamard = True
+
+    saved = [input_desc.data, input_desc.scale, weight_t, weight_scale_t]
+    if input_wgrad_operand is not None:
+        ctx.mxfp4_wgrad_activation_shuffled = wgrad_shuffled
+        ctx.mxfp4_wgrad_activation_swizzled = _is_mxfp4_scale_swizzled(
+            wgrad_scale
+        )
+        saved.extend([wgrad_fp4, wgrad_scale])
+    if ctx.mxfp4_dgrad_hadamard:
+        saved.extend([weight_had_fp4, weight_had_scale])
+    ctx.save_for_backward(*saved)
+    ctx.mxfp4_n_out = n_out
+    ctx.mxfp4_k_in = k_in
+    ctx.mxfp4_needs_wgrad = needs_wgrad
+    ctx.input_shape = input.shape
+    return output
+
+
+def _mxfp4_backward_core(ctx, grad_output: torch.Tensor):
+    """Return MXFP4 dgrad and a callable that computes the combined wgrad."""
+    wgrad_activation = None
+    dgrad_hadamard = getattr(ctx, "mxfp4_dgrad_hadamard", False)
+    weight_had_data = weight_had_scale = None
+    saved = ctx.saved_tensors
+    input_data, input_scale = saved[0], saved[1]
+    weight_data, weight_scale = saved[2], saved[3]
+    next_saved = 4
+    if getattr(ctx, "mxfp4_wgrad_activation", False):
+        wgrad_data, wgrad_scale = saved[next_saved], saved[next_saved + 1]
+        next_saved += 2
+        if ctx.mxfp4_wgrad_activation_swizzled:
+            _mark_mxfp4_scale_swizzled(wgrad_scale)
+        if ctx.mxfp4_wgrad_activation_shuffled:
+            _mark_mxfp4_data_shuffled(wgrad_data)
+        wgrad_activation = (wgrad_data, wgrad_scale)
+    if dgrad_hadamard:
+        weight_had_data, weight_had_scale = (
+            saved[next_saved],
+            saved[next_saved + 1],
+        )
+    if getattr(ctx, "mxfp4_input_scale_swizzled", False):
+        _mark_mxfp4_scale_swizzled(input_scale)
+    if getattr(ctx, "mxfp4_weight_t_shuffled", False):
+        _mark_mxfp4_data_shuffled(weight_data)
+    if getattr(ctx, "mxfp4_weight_t_scale_swizzled", False):
+        _mark_mxfp4_scale_swizzled(weight_scale)
+
+    from lumen.ops.quantize.ops import (
+        convert_from_mxfp4,
+        convert_to_mxfp4,
+        dequant_hadamard_quant_mxfp4,
+        dequant_transpose_mxfp4,
+        dual_layout_quant_mxfp4,
+        transpose_packed_fp4,
+    )
+
+    grad_flat = (
+        grad_output.reshape(-1, grad_output.shape[-1])
+        .to(torch.bfloat16)
+        .contiguous()
+    )
+    m, grad_n = grad_flat.shape
+    n_out = ctx.mxfp4_n_out
+    k_in = ctx.mxfp4_k_in
+    if grad_n != n_out:
+        raise ValueError(
+            f"MXFP4 grad N mismatch: expected {n_out}, got {grad_n}"
+        )
+    block = 32
+
+    m_unpadded = m
+    if m % block:
+        from lumen.ops.quantize.padding import pad_to_block
+
+        if _is_mxfp4_scale_swizzled(input_scale):
+            raise AssertionError(
+                "mxfp4 backward: ragged M with a swizzled activation scale"
+            )
+        grad_flat, _ = pad_to_block(grad_flat, block, dim=0)
+        input_data, _ = pad_to_block(
+            input_data.reshape(-1, input_data.shape[-1]), block, dim=0,
+        )
+        input_scale, _ = pad_to_block(
+            input_scale.reshape(-1, input_scale.shape[-1]), block, dim=0,
+        )
+        m = grad_flat.shape[0]
+
+    aligned = n_out % block == 0 and k_in % block == 0
+    if not aligned:
+        _warn_mxfp4_backward_fallback(
+            "N=%d and K=%d must both be multiples of %d"
+            % (n_out, k_in, block),
+            (m_unpadded, n_out, k_in),
+        )
+
+    if aligned:
+        try:
+            rht_g = _MXFP4_RHT_G
+            rht_ok = m % rht_g == 0
+            if rht_ok:
+                sign_m = _get_mxfp4_rht_sign(grad_flat.device)
+                fuse_swizzle = _mxfp4_can_fuse_scale_swizzle(
+                    (m, n_out // block), (n_out, m // block),
+                )
+                (
+                    grad_fp4,
+                    grad_scale,
+                    grad_t_fp4,
+                    grad_t_scale,
+                ) = dual_layout_quant_mxfp4(
+                    grad_flat,
+                    sign_m,
+                    block_size=block,
+                    g=rht_g,
+                    use_sr_row=True,
+                    use_sr_transposed=True,
+                    swizzle_scale=fuse_swizzle,
+                )
+                if fuse_swizzle:
+                    _mark_mxfp4_scale_swizzled(grad_scale)
+                    _mark_mxfp4_scale_swizzled(grad_t_scale)
+            else:
+                from lumen.ops.quantize.padding import pad_to_block
+
+                grad_padded, _ = pad_to_block(grad_flat, block, dim=0)
+                grad_padded, _ = pad_to_block(grad_padded, block, dim=-1)
+                grad_fp4, grad_scale = convert_to_mxfp4(
+                    grad_padded, block_size=block, axis=-1, use_sr=True,
+                )
+                grad_t_fp4, grad_t_scale = convert_to_mxfp4(
+                    grad_flat.t().contiguous(),
+                    block_size=block,
+                    axis=-1,
+                    use_sr=True,
+                )
+
+            if dgrad_hadamard and rht_ok and weight_had_data is not None:
+                from lumen.ops.quantize.ops import hadamard_quant_mxfp4
+
+                grad_had_fp4, grad_had_scale = hadamard_quant_mxfp4(
+                    grad_flat,
+                    sign_m,
+                    block_size=block,
+                    g=rht_g,
+                    use_sr=True,
+                )
+                grad_input = gemm_mxfp4_dispatch(
+                    grad_had_fp4,
+                    weight_had_data,
+                    grad_had_scale,
+                    weight_had_scale,
+                )
+            else:
+                grad_input = gemm_mxfp4_dispatch(
+                    grad_fp4, weight_data, grad_scale, weight_scale,
+                )
+
+            if wgrad_activation is not None:
+                input_t_fp4, input_t_scale = wgrad_activation
+            elif rht_ok:
+                fuse_act_swizzle = _mxfp4_can_fuse_scale_swizzle(
+                    (k_in, m // block),
+                )
+                fuse_act_shuffle = _mxfp4_can_fuse_b_shuffle(
+                    (n_out, k_in, m), k_in, m // 2,
+                )
+                input_t_fp4, input_t_scale = dequant_hadamard_quant_mxfp4(
+                    input_data.reshape(-1, input_data.shape[-1]),
+                    input_scale.reshape(-1, input_scale.shape[-1]),
+                    sign_m,
+                    block_size=block,
+                    g=rht_g,
+                    use_sr=False,
+                    swizzle_scale=fuse_act_swizzle,
+                    shuffle_data=fuse_act_shuffle,
+                    in_scale_swizzled=_is_mxfp4_scale_swizzled(input_scale),
+                )
+                if fuse_act_swizzle:
+                    _mark_mxfp4_scale_swizzled(input_t_scale)
+                if fuse_act_shuffle:
+                    _mark_mxfp4_data_shuffled(input_t_fp4)
+            else:
+                input_t = dequant_transpose_mxfp4(
+                    input_data,
+                    _unswizzle_mxfp4_scale(input_scale),
+                    block_size=block,
+                )
+                input_t_fp4, input_t_scale = convert_to_mxfp4(
+                    input_t, block_size=block, axis=-1, use_sr=False,
+                )
+
+            def compute_wgrad():
+                return gemm_mxfp4_dispatch(
+                    grad_t_fp4,
+                    input_t_fp4,
+                    grad_t_scale,
+                    input_t_scale,
+                )
+
+        except (AssertionError, RuntimeError) as error:
+            _logger.warning(
+                "mxfp4 backward: kernel rejected (%s); BF16 fallback", error
+            )
+            aligned = False
+
+    if not aligned:
+        input_bf16 = convert_from_mxfp4(
+            input_data,
+            _unswizzle_mxfp4_scale(input_scale),
+            output_dtype=torch.bfloat16,
+            block_size=block,
+        )
+        if _is_mxfp4_data_shuffled(weight_data):
+            weight_rowmajor = transpose_packed_fp4(
+                transpose_packed_fp4(weight_data, in_shuffled=True)
+            )
+        else:
+            weight_rowmajor = weight_data
+        weight_dgrad = convert_from_mxfp4(
+            weight_rowmajor,
+            _expand_2d_scale_to_1d(
+                _unswizzle_mxfp4_scale(weight_scale),
+                (weight_rowmajor.shape[0], weight_rowmajor.shape[1] * 2),
+                block,
+            ),
+            output_dtype=torch.bfloat16,
+            block_size=block,
+        )
+        grad_input = dispatch_gemm(
+            grad_flat, weight_dgrad, None, None, "none",
+        )
+
+        def compute_wgrad():
+            return dispatch_gemm(
+                grad_flat.t().contiguous(),
+                input_bf16.t().contiguous(),
+                None,
+                None,
+                "none",
+            )
+
+    if m_unpadded != m:
+        grad_input = grad_input[:m_unpadded].contiguous()
+    grad_input = grad_input.view(*grad_output.shape[:-1], k_in)
+    return grad_input, compute_wgrad
 
 
 class QuantizedLinearFunction(torch.autograd.Function):
@@ -1962,6 +2669,61 @@ class QuantizedLinearFunction(torch.autograd.Function):
             ctx.weight_ref = weight
             return output
 
+        if scaling_type == "mxfp4":
+            if fp8_weight_cache is not None and fp8_weight_scale is not None:
+                weight_desc = FP8Descriptor(
+                    data=(
+                        fp8_weight_cache
+                        if fp8_weight_cache.is_contiguous()
+                        else fp8_weight_cache.contiguous()
+                    ),
+                    scale=(
+                        fp8_weight_scale
+                        if fp8_weight_scale.device == fp8_weight_cache.device
+                        else fp8_weight_scale.to(fp8_weight_cache.device)
+                    ),
+                    fp8_dtype=None,
+                )
+            else:
+                weight_desc = quantize_input(
+                    weight.contiguous(),
+                    "mxfp4",
+                    fp8_dtype,
+                    block_size,
+                    scaling_manager,
+                    tensor_id,
+                    is_weight=True,
+                )
+            output = _mxfp4_forward_core(
+                ctx,
+                input,
+                weight_desc,
+                n_out=weight.shape[0],
+                k_in=weight.shape[1],
+                scaling_manager=scaling_manager,
+                fp8_dtype=fp8_dtype,
+                block_size=block_size,
+                tensor_id=tensor_id,
+                needs_wgrad=ctx.needs_input_grad[1],
+                weight_for_hadamard=weight,
+            )
+            if bias is not None:
+                output = output + bias
+            ctx.fp8_activation_store = False
+            ctx.scaling_manager = scaling_manager
+            ctx.scaling_type = "mxfp4"
+            ctx.fp8_dtype = fp8_dtype
+            ctx.block_size = block_size
+            ctx.has_bias = bias is not None
+            ctx.tensor_id = tensor_id
+            ctx.quantize_activation = True
+            ctx.fp8_wgrad = fp8_wgrad
+            ctx.gradient_accumulation_fusion = gradient_accumulation_fusion
+            ctx.delay_wgrad = delay_wgrad
+            ctx.deferred_wgrad = deferred_wgrad
+            ctx.weight_ref = weight
+            return output
+
         input_2d = _to_2d(input)
         input_wgrad_operand = None
 
@@ -1977,7 +2739,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
             elif scaling_type in ("mxfp4", "mxfp8"):
                 pre_quantized_input = None
         if pre_quantized_input is not None:
-            from lumen.quantize.descriptor import FP8Descriptor
             input_fp8, input_scale = pre_quantized_input
             input_desc = FP8Descriptor(
                 data=input_fp8,
@@ -2008,7 +2769,11 @@ class QuantizedLinearFunction(torch.autograd.Function):
             # does. Rebuilding it in backward off the stored FP4 instead costs a
             # second pass over the activation (measured 1.65x the fused form).
             input_wgrad_operand = _mxfp4_wgrad_activation_operand(
-                input_2d, weight, scaling_type, _fuse_in_swizzle, ctx.needs_input_grad[1],
+                input_2d,
+                weight.shape[0],
+                scaling_type,
+                _fuse_in_swizzle,
+                ctx.needs_input_grad[1],
             )
             if input_wgrad_operand is not None:
                 input_desc, _wg_fp4, _wg_scale, _wg_shuffled = input_wgrad_operand
@@ -2096,64 +2861,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
                 weight_desc.data,
                 weight_desc.scale,
             )
-        elif scaling_type == "mxfp4":
-            # Reuse pre-transposed weight from module cache if available.
-            _wt_cached = getattr(weight_desc.data, "_mxfp4_wt_cached", None)
-            if _wt_cached is not None:
-                w_fp4_t, w_scale_t = _wt_cached
-            else:
-                from lumen.ops.quantize.ops import transpose_packed_fp4
-                # This transpose exists only to be DGrad's B operand, so store it
-                # in that GEMM's order and skip the separate shuffling pass.
-                n_out, k_packed = weight_desc.data.shape
-                _fuse_wt_shuffle = _mxfp4_can_fuse_b_shuffle(
-                    (input_2d.shape[0], k_packed * 2, n_out), k_packed * 2, n_out // 2,
-                )
-                w_fp4_t = transpose_packed_fp4(
-                    weight_desc.data, shuffle_data=_fuse_wt_shuffle,
-                )
-                if _fuse_wt_shuffle:
-                    _mark_mxfp4_data_shuffled(w_fp4_t)
-                w_scale_t = weight_desc.scale.t().contiguous()
-            # The marker is a Python attribute, which save_for_backward is not
-            # obliged to carry to the tensor backward unpacks; the layout is a
-            # property of this call, so record it on ctx instead.
-            ctx.mxfp4_input_scale_swizzled = _is_mxfp4_scale_swizzled(input_desc.scale)
-            # DGrad's B operand and its scales need the same treatment, and not
-            # having it was the asymmetry: _mxfp4_cached_weight stores this
-            # weight already shuffled and its scales already swizzled, so a lost
-            # marker has _shuffle_mxfp4_weight re-shuffle shuffled data and
-            # _pad_and_swizzle_mxfp4_scale re-swizzle a swizzled scale. Neither
-            # changes shape, so nothing downstream can notice; DGrad is just
-            # wrong. Attribute resurrection covers it today, which is not a
-            # contract save_for_backward offers.
-            ctx.mxfp4_weight_t_shuffled = _is_mxfp4_data_shuffled(w_fp4_t)
-            ctx.mxfp4_weight_t_scale_swizzled = _is_mxfp4_scale_swizzled(w_scale_t)
-            ctx.mxfp4_wgrad_activation = input_wgrad_operand is not None
-            if input_wgrad_operand is not None:
-                # The row-major activation stays saved for the BF16 fallback,
-                # which is the one WGrad path that cannot read the rotated form.
-                ctx.mxfp4_wgrad_activation_shuffled = _wg_shuffled
-                # Read both layouts off the operand rather than assuming what
-                # the quantizer chose: backward marks the scale from this, so a
-                # future unswizzled fused form would otherwise be mislabelled
-                # and read in the wrong order with no shape to catch it.
-                ctx.mxfp4_wgrad_activation_swizzled = _is_mxfp4_scale_swizzled(_wg_scale)
-                ctx.save_for_backward(
-                    input_desc.data,
-                    input_desc.scale,
-                    w_fp4_t,
-                    w_scale_t,
-                    _wg_fp4,
-                    _wg_scale,
-                )
-            else:
-                ctx.save_for_backward(
-                    input_desc.data,
-                    input_desc.scale,
-                    w_fp4_t,
-                    w_scale_t,
-                )
         else:
             ctx.save_for_backward(
                 input_desc.data,
@@ -2306,27 +3013,62 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
 
         if scaling_type == "mxfp4":
-            # Saved: (input_fp4, input_scale, w_fp4_transposed, w_scale_transposed),
-            # plus WGrad's rotated activation operand when forward fused it.
-            wgrad_act = None
-            if getattr(ctx, "mxfp4_wgrad_activation", False):
-                (input_data, input_scale, weight_data, weight_scale,
-                 _wg_fp4, _wg_scale) = ctx.saved_tensors
-                # Markers are Python attributes; save_for_backward need not carry
-                # them, so restore the layout this call recorded on ctx.
-                if ctx.mxfp4_wgrad_activation_swizzled:
-                    _mark_mxfp4_scale_swizzled(_wg_scale)
-                if ctx.mxfp4_wgrad_activation_shuffled:
-                    _mark_mxfp4_data_shuffled(_wg_fp4)
-                wgrad_act = (_wg_fp4, _wg_scale)
+            grad_input, compute_wgrad = _mxfp4_backward_core(ctx, grad_output)
+            mgr = ctx.scaling_manager
+            if ctx.delay_wgrad and ctx.deferred_wgrad is not None:
+                weight_ref = ctx.weight_ref
+                accumulation_fusion = ctx.gradient_accumulation_fusion
+
+                def _wgrad_fn():
+                    grad_weight = compute_wgrad()
+                    if mgr is not None:
+                        grad_weight = mgr.quantize_grad(grad_weight)
+                    if accumulation_fusion and hasattr(weight_ref, "main_grad"):
+                        weight_ref.main_grad.add_(grad_weight)
+                    elif weight_ref.grad is not None:
+                        weight_ref.grad.add_(grad_weight)
+                    else:
+                        weight_ref.grad = grad_weight
+
+                ctx.deferred_wgrad.defer(_wgrad_fn)
+                grad_weight = None
             else:
-                input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
-            if getattr(ctx, "mxfp4_input_scale_swizzled", False):
-                _mark_mxfp4_scale_swizzled(input_scale)
-            if getattr(ctx, "mxfp4_weight_t_shuffled", False):
-                _mark_mxfp4_data_shuffled(weight_data)
-            if getattr(ctx, "mxfp4_weight_t_scale_swizzled", False):
-                _mark_mxfp4_scale_swizzled(weight_scale)
+                grad_weight = compute_wgrad()
+                if mgr is not None:
+                    grad_weight = mgr.quantize_grad(grad_weight)
+                if (
+                    ctx.gradient_accumulation_fusion
+                    and hasattr(ctx.weight_ref, "main_grad")
+                ):
+                    ctx.weight_ref.main_grad.add_(grad_weight)
+                    grad_weight = None
+
+            grad_bias = (
+                grad_output.sum(dim=tuple(range(grad_output.dim() - 1)))
+                if ctx.has_bias
+                else None
+            )
+            return (
+                grad_input,
+                grad_weight,
+                grad_bias,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
         else:
             input_data, input_scale, weight_data, weight_scale = ctx.saved_tensors
         fp8_dtype = ctx.fp8_dtype
@@ -2533,258 +3275,6 @@ class QuantizedLinearFunction(torch.autograd.Function):
             )
         # ----- end blockwise2d -----
 
-        # ----- MXFP4: FP4 DGrad + WGrad -----
-        # Against the NVFP4 paper §4 baseline: DGrad reuses the FP4 weight cached
-        # in forward (2D block scales are transpose-invariant); the gradient is
-        # quantized once into both layouts DGrad and WGrad need; and the
-        # activation's WGrad operand goes from stored FP4 straight to rotated,
-        # transposed FP4, never writing the BF16 form in between.
-        # Per layer: 3 quant, 3 FP4 GEMM, no dequant/Hadamard/transpose.
-        if scaling_type == "mxfp4":
-            from lumen.ops.quantize.ops import (
-                convert_from_mxfp4,
-                convert_to_mxfp4,
-                dequant_hadamard_quant_mxfp4,
-                dequant_transpose_mxfp4,
-                dual_layout_quant_mxfp4,
-                transpose_packed_fp4,
-            )
-
-            grad_flat = grad_output.reshape(-1, grad_output.shape[-1]).to(torch.bfloat16).contiguous()
-            M, N_out = grad_flat.shape
-            K_in = input_data.shape[-1] * 2  # input_data is packed (M, K//2)
-            mxfp4_block = 32
-
-            # Of the three axes only M is not a property of the model: it is
-            # seq x mbs, which a last batch, a variable-length run or a MoE
-            # expert's token count makes ragged. It is also the one that can be
-            # repaired rather than refused. M is WGrad's reduction axis, where a
-            # zero row contributes nothing to dY^T @ X, and DGrad's free axis,
-            # where the rows padding adds slice back off -- so pad it and keep
-            # both gradients in FP4.
-            #
-            # Folding M into a single _aligned flag sent the whole layer to
-            # BF16 instead, and that path took DGrad from the BF16 master while
-            # WGrad went through the dequantized activation: two gradient terms
-            # against two different versions of the forward, reachable by
-            # accident on a last batch.
-            m_unpadded = M
-            if M % mxfp4_block != 0:
-                from lumen.ops.quantize.padding import pad_to_block
-
-                if _is_mxfp4_scale_swizzled(input_scale):
-                    # Unreachable: fusing the swizzle needs rows % 256, which a
-                    # ragged M cannot meet. Padding rows of a swizzled scale
-                    # would mis-order it with no shape change to catch it, so
-                    # refuse rather than guess.
-                    raise AssertionError(
-                        "mxfp4 backward: ragged M with a swizzled activation scale"
-                    )
-                grad_flat, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
-                input_data, _ = pad_to_block(
-                    input_data.reshape(-1, input_data.shape[-1]), mxfp4_block, dim=0,
-                )
-                input_scale, _ = pad_to_block(
-                    input_scale.reshape(-1, input_scale.shape[-1]), mxfp4_block, dim=0,
-                )
-                M = grad_flat.shape[0]
-
-            # What is left are the layer's own dims, so reaching the fallback is
-            # a property of the model rather than of a batch.
-            _aligned = (N_out % mxfp4_block == 0 and K_in % mxfp4_block == 0)
-            if not _aligned:
-                _warn_mxfp4_backward_fallback(
-                    "N=%d and K=%d must both be multiples of %d"
-                    % (N_out, K_in, mxfp4_block),
-                    (m_unpadded, N_out, K_in),
-                )
-
-            if _aligned:
-                try:
-                    # --- DGrad: dX = dY @ W_cached^T ---
-                    # Reuse FP4 weight + pre-transposed weight from forward.
-                    # The FP4 tensors are independent allocations (not views of
-                    # the BF16 param), so they survive FSDP2 resharding.
-                    rht_g = _MXFP4_RHT_G
-                    _rht_ok = (M % rht_g == 0)
-
-                    if _rht_ok:
-                        # The gradient feeds both GEMMs: row-major for DGrad and
-                        # rotated + transposed for WGrad. Quantizing it once for
-                        # both keeps the read dense; taking dY^T as a view instead
-                        # costs 1.70x on the same shape (report §5.10).
-                        sign_m = _get_mxfp4_rht_sign(grad_flat.device)
-                        # Storing the scales already swizzled saves a permuting
-                        # pass over each on the way into the GEMM.
-                        _fuse_swizzle = _mxfp4_can_fuse_scale_swizzle(
-                            (M, N_out // mxfp4_block), (N_out, M // mxfp4_block),
-                        )
-                        g_fp4, g_scale, grad_t_fp4, grad_t_scale = dual_layout_quant_mxfp4(
-                            grad_flat, sign_m, block_size=mxfp4_block, g=rht_g,
-                            use_sr_row=True, use_sr_transposed=True,
-                            swizzle_scale=_fuse_swizzle,
-                        )
-                        if _fuse_swizzle:
-                            _mark_mxfp4_scale_swizzled(g_scale)
-                            _mark_mxfp4_scale_swizzled(grad_t_scale)
-                    else:
-                        from lumen.ops.quantize.padding import pad_to_block
-                        g_padded, _ = pad_to_block(grad_flat, mxfp4_block, dim=0)
-                        g_padded, _ = pad_to_block(g_padded, mxfp4_block, dim=-1)
-                        g_fp4, g_scale = convert_to_mxfp4(
-                            g_padded, block_size=mxfp4_block, axis=-1, use_sr=True,
-                        )
-                        # convert_to_mxfp4 can route to AITER's quant, which wants
-                        # a dense operand.
-                        grad_t_fp4, grad_t_scale = convert_to_mxfp4(
-                            grad_flat.t().contiguous(), block_size=mxfp4_block, axis=-1, use_sr=True,
-                        )
-
-                    # weight_data / weight_scale are already the pre-transposed
-                    # forms saved in forward (W^T packed, scales^T).
-                    grad_input = gemm_mxfp4_dispatch(g_fp4, weight_data, g_scale, weight_scale)
-
-                    # --- WGrad: dW = fused_HQ(dY^T) @ fused_HQ(X^T)^T ---
-                    # NVFP4 §4.4 / E.3: stochastic rounding belongs on the
-                    # gradient only. On activations it buys little and can
-                    # diverge, so the activation stays round-to-nearest.
-                    if wgrad_act is not None:
-                        # Forward already emitted this operand off its own read of
-                        # the activation (_mxfp4_wgrad_activation_operand).
-                        input_t_fp4, input_t_scale = wgrad_act
-                    elif _rht_ok:
-                        # Decode, transpose, rotate and requantize in one pass, so
-                        # the BF16 (K, M) form of the activation — four times the
-                        # bytes of either FP4 end — never reaches memory.
-                        _fuse_act_swizzle = _mxfp4_can_fuse_scale_swizzle(
-                            (K_in, M // mxfp4_block),
-                        )
-                        # This activation is the WGrad GEMM's B operand and is
-                        # never reused, so storing it already shuffled saves a
-                        # whole read+write pass over it per micro-batch.
-                        _fuse_act_shuffle = _mxfp4_can_fuse_b_shuffle(
-                            (N_out, K_in, M), K_in, M // 2,
-                        )
-                        input_t_fp4, input_t_scale = dequant_hadamard_quant_mxfp4(
-                            input_data.reshape(-1, input_data.shape[-1]),
-                            input_scale.reshape(-1, input_scale.shape[-1]),
-                            sign_m, block_size=mxfp4_block, g=rht_g, use_sr=False,
-                            swizzle_scale=_fuse_act_swizzle,
-                            shuffle_data=_fuse_act_shuffle,
-                            in_scale_swizzled=_is_mxfp4_scale_swizzled(input_scale),
-                        )
-                        if _fuse_act_swizzle:
-                            _mark_mxfp4_scale_swizzled(input_t_scale)
-                        if _fuse_act_shuffle:
-                            _mark_mxfp4_data_shuffled(input_t_fp4)
-                    else:
-                        # Without the rotation there is nothing to fuse into; the
-                        # transposing dequant still lands dense, which the
-                        # quantizer below needs.
-                        input_t = dequant_transpose_mxfp4(
-                            input_data, _unswizzle_mxfp4_scale(input_scale),
-                            block_size=mxfp4_block,
-                        )
-                        input_t_fp4, input_t_scale = convert_to_mxfp4(
-                            input_t, block_size=mxfp4_block, axis=-1, use_sr=False,
-                        )
-
-                    def _compute_wgrad():
-                        return gemm_mxfp4_dispatch(
-                            grad_t_fp4, input_t_fp4,
-                            grad_t_scale, input_t_scale,
-                        )
-
-                except (AssertionError, RuntimeError) as e:
-                    _logger.warning("mxfp4 backward: kernel rejected (%s); BF16 fallback", e)
-                    _aligned = False
-
-            if not _aligned:
-                input_bf16 = convert_from_mxfp4(
-                    input_data, _unswizzle_mxfp4_scale(input_scale),
-                    output_dtype=torch.bfloat16, block_size=mxfp4_block,
-                )
-                # Take DGrad against the weight the forward actually used.
-                # Reaching for ctx.weight_ref here was the precision split:
-                # WGrad reads the activation as the forward quantized it, so a
-                # DGrad against the unquantized master makes the two terms the
-                # gradient of two different forwards. The blockwise2d path in
-                # this same function already dequantizes its saved weight for
-                # exactly this reason.
-                if _is_mxfp4_data_shuffled(weight_data):
-                    # A runtime GEMM rejection can happen after the aligned
-                    # weight was deliberately cached in the backend's shuffled
-                    # B layout. The row-major dequantizer cannot read that
-                    # layout. Transpose twice: the first pass consumes the
-                    # shuffled W^T and writes row-major W; the second writes
-                    # row-major W^T. This is a slow emergency path, but it keeps
-                    # DGrad on the exact FP4 weight used by forward.
-                    weight_rowmajor = transpose_packed_fp4(
-                        transpose_packed_fp4(weight_data, in_shuffled=True)
-                    )
-                else:
-                    weight_rowmajor = weight_data
-                # weight_rowmajor is W^T, the (K_in, N_out) operand
-                # dispatch_gemm wants. Its scales are the 2D tile grid, so they
-                # need the same expansion as the row-major FP4 kernel.
-                w_dgrad = convert_from_mxfp4(
-                    weight_rowmajor,
-                    _expand_2d_scale_to_1d(
-                        _unswizzle_mxfp4_scale(weight_scale),
-                        (weight_rowmajor.shape[0], weight_rowmajor.shape[1] * 2),
-                        mxfp4_block,
-                    ),
-                    output_dtype=torch.bfloat16, block_size=mxfp4_block,
-                )
-                grad_input = dispatch_gemm(
-                    grad_flat, w_dgrad, None, None, "none",
-                )
-
-                def _compute_wgrad():
-                    return dispatch_gemm(
-                        grad_flat.t().contiguous(), input_bf16.t().contiguous(),
-                        None, None, "none",
-                    )
-
-            if m_unpadded != M:
-                # Drop the rows padding added. They exist only so WGrad's
-                # reduction axis tiles; DGrad computed them and nobody wants them.
-                grad_input = grad_input[:m_unpadded].contiguous()
-            grad_input = grad_input.view(*grad_output.shape[:-1], K_in)
-
-            mgr = ctx.scaling_manager
-            if ctx.delay_wgrad and ctx.deferred_wgrad is not None:
-                w_ref = ctx.weight_ref
-                gaf = ctx.gradient_accumulation_fusion
-                _mgr = mgr
-
-                def _wgrad_fn():
-                    gw = _compute_wgrad()
-                    if _mgr is not None:
-                        gw = _mgr.quantize_grad(gw)
-                    if gaf and hasattr(w_ref, "main_grad"):
-                        w_ref.main_grad.add_(gw)
-                    elif w_ref.grad is not None:
-                        w_ref.grad.add_(gw)
-                    else:
-                        w_ref.grad = gw
-
-                ctx.deferred_wgrad.defer(_wgrad_fn)
-                grad_weight = None
-            else:
-                grad_weight = _compute_wgrad()
-                if mgr is not None:
-                    grad_weight = mgr.quantize_grad(grad_weight)
-                if ctx.gradient_accumulation_fusion and hasattr(ctx.weight_ref, "main_grad"):
-                    ctx.weight_ref.main_grad.add_(grad_weight)
-                    grad_weight = None
-
-            grad_bias = grad_output.sum(dim=tuple(range(grad_output.dim() - 1))) if ctx.has_bias else None
-            return (
-                grad_input, grad_weight, grad_bias,
-                None, None, None, None, None, None, None, None, None, None, None, None, None, None, None,
-            )
-        # ----- end mxfp4 -----
 
         grad_flat = grad_output.reshape(-1, grad_output.shape[-1])
 
@@ -2959,6 +3449,268 @@ class QuantizedLinearFunction(torch.autograd.Function):
 
 
 _mark_allow_in_graph(QuantizedLinearFunction)
+
+
+class MXFP4GateUpFunction(torch.autograd.Function):
+    """MXFP4 projection backed by one compact gate/up weight operand."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        gate_weight: torch.Tensor,
+        up_weight: torch.Tensor,
+        packed_weight: torch.Tensor,
+        packed_scale: torch.Tensor,
+        scaling_manager,
+        fp8_dtype: torch.dtype,
+        block_size: int,
+        tensor_id: str,
+    ) -> torch.Tensor:
+        if gate_weight.shape != up_weight.shape:
+            raise ValueError(
+                "MXFP4 gate/up weights must have identical shapes, got "
+                f"{tuple(gate_weight.shape)} and {tuple(up_weight.shape)}"
+            )
+        n_each, k_in = gate_weight.shape
+        n_out = n_each * 2
+        if not _mxfp4_shape_operands_fit_int32(input, n_out, k_in):
+            raise ValueError(
+                "MXFP4 packed gate/up operands exceed AITER's 32-bit index limit"
+            )
+        if _MXFP4_DGRAD_HADAMARD:
+            raise ValueError(
+                "MXFP4 packed gate/up does not support "
+                "LUMEN_MXFP4_DGRAD_HADAMARD=1"
+            )
+
+        weight_desc = FP8Descriptor(
+            data=packed_weight,
+            scale=packed_scale,
+            fp8_dtype=None,
+        )
+        output = _mxfp4_forward_core(
+            ctx,
+            input,
+            weight_desc,
+            n_out=n_out,
+            k_in=k_in,
+            scaling_manager=scaling_manager,
+            fp8_dtype=fp8_dtype,
+            block_size=block_size,
+            tensor_id=tensor_id,
+            needs_wgrad=ctx.needs_input_grad[1] or ctx.needs_input_grad[2],
+        )
+        ctx.scaling_manager = scaling_manager
+        ctx.scaling_type = "mxfp4"
+        ctx.fp8_dtype = fp8_dtype
+        ctx.block_size = block_size
+        ctx.gate_rows = n_each
+        ctx.gate_needs_grad = ctx.needs_input_grad[1]
+        ctx.up_needs_grad = ctx.needs_input_grad[2]
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input, compute_wgrad = _mxfp4_backward_core(ctx, grad_output)
+        grad_gate = grad_up = None
+        if ctx.gate_needs_grad or ctx.up_needs_grad:
+            grad_weight = compute_wgrad()
+            grad_gate, grad_up = grad_weight.split(ctx.gate_rows, dim=0)
+            if ctx.scaling_manager is not None:
+                if ctx.gate_needs_grad:
+                    grad_gate = ctx.scaling_manager.quantize_grad(grad_gate)
+                if ctx.up_needs_grad:
+                    grad_up = ctx.scaling_manager.quantize_grad(grad_up)
+            if not ctx.gate_needs_grad:
+                grad_gate = None
+            if not ctx.up_needs_grad:
+                grad_up = None
+        return (
+            grad_input,
+            grad_gate,
+            grad_up,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+_mark_allow_in_graph(MXFP4GateUpFunction)
+
+
+def mxfp4_gate_up_linear(
+    input: torch.Tensor,
+    gate_weight: torch.Tensor,
+    up_weight: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_scale: torch.Tensor,
+    *,
+    scaling_manager=None,
+    fp8_dtype: Optional[torch.dtype] = None,
+    block_size: int = 32,
+    tensor_id: str = "gate_up.weight",
+) -> torch.Tensor:
+    """Project through two source Parameters using one compact MXFP4 operand."""
+    if fp8_dtype is None:
+        fp8_dtype = _get_float8_e4m3()
+    return MXFP4GateUpFunction.apply(
+        input,
+        gate_weight,
+        up_weight,
+        packed_weight,
+        packed_scale,
+        scaling_manager,
+        fp8_dtype,
+        block_size,
+        tensor_id,
+    )
+
+
+class MXFP4QKVFunction(torch.autograd.Function):
+    """MXFP4 projection backed by one compact, unequal-row Q/K/V operand."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: torch.Tensor,
+        q_weight: torch.Tensor,
+        k_weight: torch.Tensor,
+        v_weight: torch.Tensor,
+        packed_weight: torch.Tensor,
+        packed_scale: torch.Tensor,
+        scaling_manager,
+        fp8_dtype: torch.dtype,
+        block_size: int,
+        tensor_id: str,
+    ) -> torch.Tensor:
+        weights = (q_weight, k_weight, v_weight)
+        if block_size != 32:
+            raise ValueError(
+                f"MXFP4 packed QKV requires block_size=32, got {block_size}"
+            )
+        if any(weight.dim() != 2 for weight in weights):
+            raise ValueError("MXFP4 QKV weights must all be 2D")
+
+        k_in = q_weight.shape[1]
+        if any(weight.shape[1] != k_in for weight in weights[1:]):
+            raise ValueError(
+                "MXFP4 QKV weights must share one input width, got "
+                f"{tuple(weight.shape[1] for weight in weights)}"
+            )
+        if any(
+            weight.dtype != q_weight.dtype or weight.device != q_weight.device
+            for weight in weights[1:]
+        ):
+            raise ValueError("MXFP4 QKV weights must share dtype and device")
+
+        qkv_rows = tuple(weight.shape[0] for weight in weights)
+        n_out = sum(qkv_rows)
+        if not _mxfp4_shape_operands_fit_int32(input, n_out, k_in):
+            raise ValueError(
+                "MXFP4 packed QKV operands exceed AITER's 32-bit index limit"
+            )
+        if _MXFP4_DGRAD_HADAMARD:
+            raise ValueError(
+                "MXFP4 packed QKV does not support "
+                "LUMEN_MXFP4_DGRAD_HADAMARD=1"
+            )
+
+        weight_desc = FP8Descriptor(
+            data=packed_weight,
+            scale=packed_scale,
+            fp8_dtype=None,
+        )
+        output = _mxfp4_forward_core(
+            ctx,
+            input,
+            weight_desc,
+            n_out=n_out,
+            k_in=k_in,
+            scaling_manager=scaling_manager,
+            fp8_dtype=fp8_dtype,
+            block_size=block_size,
+            tensor_id=tensor_id,
+            needs_wgrad=any(ctx.needs_input_grad[1:4]),
+        )
+        ctx.scaling_manager = scaling_manager
+        ctx.scaling_type = "mxfp4"
+        ctx.fp8_dtype = fp8_dtype
+        ctx.block_size = block_size
+        ctx.qkv_rows = qkv_rows
+        ctx.qkv_needs_grad = tuple(ctx.needs_input_grad[1:4])
+        return output
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad_output: torch.Tensor):
+        grad_input, compute_wgrad = _mxfp4_backward_core(ctx, grad_output)
+        grad_q = grad_k = grad_v = None
+        if any(ctx.qkv_needs_grad):
+            grad_weight = compute_wgrad()
+            grad_parts = tuple(
+                part.contiguous()
+                for part in grad_weight.split(ctx.qkv_rows, dim=0)
+            )
+            output_grads = []
+            for needs_grad, grad_part in zip(ctx.qkv_needs_grad, grad_parts):
+                if not needs_grad:
+                    output_grads.append(None)
+                    continue
+                if ctx.scaling_manager is not None:
+                    grad_part = ctx.scaling_manager.quantize_grad(grad_part)
+                output_grads.append(grad_part.contiguous())
+            grad_q, grad_k, grad_v = output_grads
+
+        return (
+            grad_input,
+            grad_q,
+            grad_k,
+            grad_v,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+_mark_allow_in_graph(MXFP4QKVFunction)
+
+
+def mxfp4_qkv_linear(
+    input: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    v_weight: torch.Tensor,
+    packed_weight: torch.Tensor,
+    packed_scale: torch.Tensor,
+    *,
+    scaling_manager=None,
+    fp8_dtype: Optional[torch.dtype] = None,
+    block_size: int = 32,
+    tensor_id: str = "qkv.weight",
+) -> torch.Tensor:
+    """Project through separate Q/K/V Parameters using one compact operand."""
+    if fp8_dtype is None:
+        fp8_dtype = _get_float8_e4m3()
+    return MXFP4QKVFunction.apply(
+        input,
+        q_weight,
+        k_weight,
+        v_weight,
+        packed_weight,
+        packed_scale,
+        scaling_manager,
+        fp8_dtype,
+        block_size,
+        tensor_id,
+    )
 
 
 class FP8StoredLinearFunction(torch.autograd.Function):
@@ -3208,7 +3960,7 @@ def quantized_linear(
     activation_tensor_id: Optional[str] = None,
     pre_quantized_input: Optional[tuple] = None,
 ) -> torch.Tensor:
-    """Functional quantized linear with multi-backend fallback (all AITER).
+    """Functional quantized linear with explicit multi-backend fallback.
 
     Args:
         input: Input tensor ``[*, in_features]``.

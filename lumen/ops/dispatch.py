@@ -4,9 +4,8 @@
 # Licensed under the Apache License, Version 2.0
 ###############################################################################
 
-"""Backend dispatcher with automatic ASM → Triton fallback.
+"""Backend dispatcher with automatic ASM → FlyDSL → Triton fallback.
 
-All backends are AITER implementations. No torch.nn.functional fallbacks.
 Each operator registers its available backends via :func:`try_backends`.
 On each call the dispatcher walks the priority chain and returns the
 first successful result, logging fallbacks as warnings.
@@ -50,11 +49,12 @@ logger = logging.getLogger(__name__)
 
 class Backend(Enum):
     ASM = "asm"
+    FLYDSL = "flydsl"
     TRITON = "triton"
     HIPBLAS = "hipblas"
 
 
-FALLBACK_ORDER = [Backend.ASM, Backend.TRITON]
+FALLBACK_ORDER = [Backend.ASM, Backend.FLYDSL, Backend.TRITON]
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +138,17 @@ def _probe_aiter_triton_quant():
     """Check if AITER Triton quant ops are available."""
     try:
         from aiter.ops.quant import per_tensor_quant_triton as _  # noqa: F401
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_aiter_triton_quant_mxfp4_2way():
+    """Check if AITER's two-source MXFP4 weight quantizer is available."""
+    try:
+        from aiter.ops.triton.quant import dynamic_mxfp4_quant_2way as _  # noqa: F401
 
         return True
     except (ImportError, OSError):
@@ -252,19 +263,29 @@ def _probe_aiter_triton_gemm_mxfp4_preshuffle():
 
 @functools.lru_cache(maxsize=1)
 def _probe_aiter_gemm_mxfp4_asm():
-    """Check if AITER's prebuilt A4W4 ASM/CK MXFP4 GEMM is available.
+    """Check if AITER's prebuilt A4W4 ASM MXFP4 GEMM is available.
 
-    Needs the dispatcher, the tuned-config table it picks kernels from, and the
-    two layout helpers that build the operand layout those kernels read.
+    Needs the direct ASM entry point and the two layout helpers that build the
+    operand layout the kernels read. Lumen owns the filtered ASM metadata view.
     """
     try:
-        from aiter import gemm_a4w4 as _  # noqa: F401
-        from aiter.ops.gemm_op_a4w4 import get_GEMM_config as _c  # noqa: F401
+        from aiter.ops.gemm_op_a4w4 import gemm_a4w4_asm as _  # noqa: F401
         from aiter.ops.shuffle import shuffle_weight as _w  # noqa: F401
         from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm as _s  # noqa: F401
 
         return True
-    except (ImportError, OSError):
+    except (ImportError, OSError, RuntimeError, KeyError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_flydsl_gemm_mxfp4():
+    """Check whether Lumen's pinned gfx950 FlyDSL MXFP4 kernel is importable."""
+    try:
+        from lumen.ops.quantize.flydsl_mxfp4 import available
+
+        return available()
+    except (ImportError, OSError, RuntimeError):
         return False
 
 
@@ -438,7 +459,24 @@ def _probe_aiter_fused_ungated():
 def _probe_aiter_swiglu():
     """Check if AITER Triton fused SwiGLU fwd/bwd kernels are available."""
     try:
-        from aiter.ops.triton.activation import swiglu_fwd as _  # noqa: F401
+        from aiter.ops.triton.activation import (  # noqa: F401
+            swiglu_bwd as _swiglu_bwd,
+            swiglu_fwd as _swiglu_fwd,
+        )
+
+        return True
+    except (ImportError, OSError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _probe_aiter_swiglu_split():
+    """Check if AITER's eager-compatible split SwiGLU kernels are available."""
+    try:
+        from aiter.ops.triton.activation import (  # noqa: F401
+            swiglu_bwd_split as _swiglu_bwd_split,
+            swiglu_fwd_split as _swiglu_fwd_split,
+        )
 
         return True
     except (ImportError, OSError):
@@ -531,7 +569,14 @@ def try_backends(
     detection.  After warmup (or when ``LUMEN_SKIP_BACKEND_SYNC=1``),
     sync is skipped to reduce host-device round-trip overhead.
     """
-    _catchable = (RuntimeError, NotImplementedError, TypeError, ValueError, IndexError, KeyError)
+    _catchable = (
+        RuntimeError,
+        NotImplementedError,
+        TypeError,
+        ValueError,
+        IndexError,
+        KeyError,
+    )
     if _TritonCompilationError is not None:
         _catchable = _catchable + (_TritonCompilationError,)
     if _TritonOutOfResources is not None:
@@ -560,7 +605,8 @@ def try_backends(
 
     if _IN_GRAPH_CAPTURE:
         raise RuntimeError(
-            f"{op_name}: no cached backend during CUDA graph capture. " "Run warmup before graph capture."
+            f"{op_name}: no cached backend during CUDA graph capture. "
+            "Run warmup before graph capture."
         )
 
     last_exc = None
@@ -569,7 +615,11 @@ def try_backends(
         label = _entry_label(entry)
         try:
             result = fn(*args, **kwargs)
-            if torch.cuda.is_available() and not _SKIP_BACKEND_SYNC and not _IN_GRAPH_CAPTURE:
+            if (
+                torch.cuda.is_available()
+                and not _SKIP_BACKEND_SYNC
+                and not _IN_GRAPH_CAPTURE
+            ):
                 torch.cuda.synchronize()
 
             # Count consecutive wins for *this* backend. Reading the running
@@ -616,7 +666,9 @@ def try_backends(
             # is never first can never lock -- which left every call paying the
             # cost of a kernel known to reject these operands, plus a warning.
             last_exc = exc
-    raise RuntimeError(f"{op_name}: all AITER backends exhausted. Last error: {last_exc}") from last_exc
+    raise RuntimeError(
+        f"{op_name}: all backends exhausted. Last error: {last_exc}"
+    ) from last_exc
 
 
 def build_fallback_chain(

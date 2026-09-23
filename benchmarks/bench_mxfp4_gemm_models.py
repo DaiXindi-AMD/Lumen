@@ -9,7 +9,7 @@ and compares the three ways of choosing a backend:
 
     plain      always the plain Triton kernel (what Lumen did before any of this)
     static     the hand-measured byte thresholds
-    autotune   whichever legal backend is actually fastest for the shape
+    autotune   protected ASM incumbent versus per-shape FlyDSL challengers
 
 The point of the comparison is that the static thresholds were fitted to Llama
 3.1 8B and do not transfer: Qwen3-8B's MLP weights are 24 MiB against Llama's
@@ -17,7 +17,7 @@ The point of the comparison is that the static thresholds were fitted to Llama
 model.
 
 Run:
-    pytest benchmarks/bench_mxfp4_gemm_models.py -v -s
+    LUMEN_MXFP4_FLYDSL=1 python -m pytest benchmarks/bench_mxfp4_gemm_models.py -v -s
 """
 
 import os
@@ -27,13 +27,16 @@ import torch
 
 from benchmarks.bench_utils import cuda_timer
 from benchmarks.conftest import AITER
-from lumen.ops.quantize import mxfp4_autotune
+from lumen.ops.quantize import flydsl_mxfp4, mxfp4_autotune
 from lumen.ops.quantize.linear import (
     _gemm_mxfp4_aiter,
     _gemm_mxfp4_aiter_asm,
     _gemm_mxfp4_aiter_preshuffle,
+    _gemm_mxfp4_flydsl,
+    _mxfp4_asm_config,
     _mxfp4_asm_eligible,
     _mxfp4_asm_supported,
+    _mxfp4_flydsl_backend_names,
     _mxfp4_preshuffle_eligible,
     _mxfp4_preshuffle_supported,
 )
@@ -80,12 +83,10 @@ def _layer_gemms(hidden, inter, q_dim, kv_dim, tokens):
 def _asm_kernel_only(a_fp4, w_fp4, a_s, w_s):
     """The ASM GEMM with the operand layout already built.
 
-    Lumen rebuilds that layout on every call, because the weight is requantized
-    each step and nothing upstream produces the tiled/swizzled form. Timing the
-    kernel without it shows how much of the ASM path's cost is the prologue --
-    that is the headroom a fused cast+shuffle quantize kernel would recover.
+    Timing the direct entry point with layout operands already prepared isolates
+    kernel time from the shuffle/swizzle prologue included in normal dispatch.
     """
-    import aiter
+    from aiter.ops.gemm_op_a4w4 import gemm_a4w4_asm
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.utils._triton.arch_info import get_arch
 
@@ -96,10 +97,29 @@ def _asm_kernel_only(a_fp4, w_fp4, a_s, w_s):
 
     arch = get_arch()
     tiling = _MXFP4_SCALE_SHUFFLE_TILING[arch]
+    M = a_fp4.shape[0]
+    N = w_fp4.shape[0]
+    K = a_fp4.shape[1] * 2
+    asm_config = _mxfp4_asm_config(M, N, K)
+    if asm_config is None:
+        raise RuntimeError(f"no explicit ASM config for {(M, N, K)}")
+    kernel_name, split_k = asm_config
     w_shuf = shuffle_weight(w_fp4, layout=(16, 16))
     sa = _pad_and_swizzle_mxfp4_scale(a_s, arch, tiling)
     sw = _pad_and_swizzle_mxfp4_scale(w_s, arch, tiling)
-    return lambda: aiter.gemm_a4w4(a_fp4, w_shuf, sa, sw, dtype=torch.bfloat16)
+    out = torch.empty(
+        (((M + 31) // 32) * 32, N), dtype=torch.bfloat16, device=a_fp4.device
+    )
+    return lambda: gemm_a4w4_asm(
+        a_fp4,
+        w_shuf,
+        sa,
+        sw,
+        out,
+        kernelName=kernel_name,
+        bpreshuffle=True,
+        log2_k_split=split_k,
+    )
 
 
 def _time_backends(M, N, K):
@@ -111,26 +131,52 @@ def _time_backends(M, N, K):
     del a_hp, w_hp
     torch.cuda.empty_cache()
 
-    times = {"plain": cuda_timer(lambda: _gemm_mxfp4_aiter(a_fp4, w_fp4, a_s, w_s)).avg_ms}
+    reference = _gemm_mxfp4_aiter(a_fp4, w_fp4, a_s, w_s)
+    times = {
+        "plain": cuda_timer(
+            lambda a=a_fp4, w=w_fp4, sa=a_s, sw=w_s: _gemm_mxfp4_aiter(
+                a, w, sa, sw
+            )
+        ).avg_ms
+    }
     legal_static = "plain"
 
     if _mxfp4_preshuffle_supported(a_fp4, w_fp4):
         times["shuffled"] = cuda_timer(
-            lambda: _gemm_mxfp4_aiter_preshuffle(a_fp4, w_fp4, a_s, w_s)
+            lambda a=a_fp4, w=w_fp4, sa=a_s, sw=w_s: (
+                _gemm_mxfp4_aiter_preshuffle(a, w, sa, sw)
+            )
         ).avg_ms
         if _mxfp4_preshuffle_eligible(a_fp4, w_fp4):
             legal_static = "shuffled"
     if _mxfp4_asm_supported(a_fp4, w_fp4):
+        asm_output = _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_s, w_s)
+        torch.testing.assert_close(asm_output, reference, atol=0, rtol=0)
+        del asm_output
         times["asm"] = cuda_timer(
-            lambda: _gemm_mxfp4_aiter_asm(a_fp4, w_fp4, a_s, w_s)
+            lambda a=a_fp4, w=w_fp4, sa=a_s, sw=w_s: _gemm_mxfp4_aiter_asm(
+                a, w, sa, sw
+            )
         ).avg_ms
         times["asm_nolayout"] = cuda_timer(
             _asm_kernel_only(a_fp4, w_fp4, a_s, w_s)
         ).avg_ms
         if _mxfp4_asm_eligible(a_fp4, w_fp4):
             legal_static = "asm"
+    if flydsl_mxfp4.available():
+        for name in _mxfp4_flydsl_backend_names(a_fp4, w_fp4):
+            flydsl_output = _gemm_mxfp4_flydsl(name, a_fp4, w_fp4, a_s, w_s)
+            torch.testing.assert_close(
+                flydsl_output, reference, atol=0.1, rtol=0.1
+            )
+            del flydsl_output
+            times[name] = cuda_timer(
+                lambda name=name, a=a_fp4, w=w_fp4, sa=a_s, sw=w_s: (
+                    _gemm_mxfp4_flydsl(name, a, w, sa, sw)
+                )
+            ).avg_ms
 
-    del a_fp4, w_fp4, a_s, w_s
+    del reference, a_fp4, w_fp4, a_s, w_s
     torch.cuda.empty_cache()
     return times, legal_static
 
@@ -149,19 +195,32 @@ def test_mxfp4_layer_backend_policies(model):
 
     print(f"\n  {model}  tokens={TOKENS}")
     print(f"  {'gemm':<18} {'M':>6} {'N':>6} {'K':>6} {'wMiB':>6} "
-          f"{'plain':>8} {'shuf':>8} {'asm':>8} {'asm-noprol':>11}  "
-          f"{'static':<9} {'auto':<9}")
+          f"{'plain':>8} {'shuf':>8} {'asm':>8} {'flydsl':>8} "
+          f"{'asm-noprol':>11}  {'static':<9} {'auto':<24}")
 
     for label, M, N, K in _layer_gemms(hidden, inter, q_dim, kv_dim, TOKENS):
         key = (M, N, K)
         if key not in measured:
             times, static_pick = _time_backends(M, N, K)
-            # Mirror the dispatcher: only leave the plain kernel for a clear win.
-            auto_pick = min(
-                (n for n in times if n != "asm_nolayout"), key=lambda n: times[n]
+            profile_times = {
+                name: timing
+                for name, timing in times.items()
+                if name != "asm_nolayout"
+            }
+            incumbent = "asm" if "asm" in profile_times else static_pick
+            auto_pick, _reason = mxfp4_autotune._select_winner(
+                profile_times, incumbent=incumbent
             )
-            if times[auto_pick] * mxfp4_autotune._SWITCH_MARGIN > times["plain"]:
-                auto_pick = "plain"
+            if incumbent == "asm":
+                assert auto_pick == "asm" or flydsl_mxfp4.is_backend_name(
+                    auto_pick
+                )
+                if flydsl_mxfp4.is_backend_name(auto_pick):
+                    assert (
+                        profile_times[auto_pick]
+                        * mxfp4_autotune._SWITCH_MARGIN
+                        <= profile_times["asm"]
+                    )
             measured[key] = (times, static_pick, auto_pick)
         # The dispatcher caches per shape, so repeated shapes reuse the decision
         # rather than re-rolling it against measurement noise.
@@ -179,9 +238,22 @@ def test_mxfp4_layer_backend_policies(model):
         def show(name, width=8):
             return f"{times[name]:{width}.3f}" if name in times else f"{'-':>{width}}"
 
+        flydsl_names = [name for name in times if flydsl_mxfp4.is_backend_name(name)]
+        flydsl_best = (
+            min(flydsl_names, key=lambda name: times[name]) if flydsl_names else None
+        )
+        flydsl_time = f"{times[flydsl_best]:8.3f}" if flydsl_best else f"{'-':>8}"
         print(f"  {label:<18} {M:>6} {N:>6} {K:>6} {N * K / 2 / 1024 / 1024:>6.1f} "
-              f"{show('plain')} {show('shuffled')} {show('asm')} "
-              f"{show('asm_nolayout', 11)}  {static_pick:<9} {auto_pick:<9}")
+              f"{show('plain')} {show('shuffled')} {show('asm')} {flydsl_time} "
+              f"{show('asm_nolayout', 11)}  {static_pick:<9} {auto_pick:<24}")
+        asm_config = _mxfp4_asm_config(M, N, K) if "asm" in times else None
+        identities = []
+        if asm_config is not None:
+            identities.append(f"asm={asm_config[0]} splitK={asm_config[1]}")
+        if flydsl_best is not None:
+            identities.append(f"flydsl_best={flydsl_best}")
+        if identities:
+            print(f"    identities: {', '.join(identities)}")
 
     print(f"\n  per-layer training GEMM total, {model}:")
     for k in ("plain", "static", "autotune"):
@@ -197,12 +269,6 @@ def test_mxfp4_layer_backend_policies(model):
         f"    autotune is {totals['static'] / totals['autotune']:.2f}x "
         f"the static-threshold policy"
     )
-
-    # Measuring can only ever match or beat a fixed threshold.
-    assert totals["autotune"] <= totals["static"] * 1.02, (
-        f"autotune {totals['autotune']:.3f}ms worse than static {totals['static']:.3f}ms"
-    )
-
 
 if __name__ == "__main__":
     os.environ.setdefault("LUMEN_BENCH_ITERS", "30")

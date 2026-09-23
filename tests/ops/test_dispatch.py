@@ -48,12 +48,13 @@ def _cold_backend_cache():
 
 def test_backend_values():
     assert Backend.ASM.value == "asm"
+    assert Backend.FLYDSL.value == "flydsl"
     assert Backend.HIPBLAS.value == "hipblas"
     assert Backend.TRITON.value == "triton"
 
 
 def test_fallback_order():
-    assert FALLBACK_ORDER == [Backend.ASM, Backend.TRITON]
+    assert FALLBACK_ORDER == [Backend.ASM, Backend.FLYDSL, Backend.TRITON]
 
 
 # ===================================================================
@@ -153,7 +154,7 @@ def test_try_backends_all_fail():
         (Backend.HIPBLAS, fail),
         (Backend.TRITON, fail),
     ]
-    with pytest.raises(RuntimeError, match="all AITER backends exhausted"):
+    with pytest.raises(RuntimeError, match="all backends exhausted"):
         try_backends(chain, op_name="test")
 
 

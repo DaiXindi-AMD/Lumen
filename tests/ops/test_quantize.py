@@ -44,7 +44,7 @@ from lumen.ops.quantize import (
     swizzle_mxfp4_scale,
     transpose_packed_fp4,
 )
-from lumen.ops.quantize import mxfp4_autotune
+from lumen.ops.quantize import flydsl_mxfp4, mxfp4_asm, mxfp4_autotune
 from lumen.ops.quantize.linear import (
     _MXFP4_ASM_ARCHS,
     _MXFP4_SCALE_SHUFFLE_TILING,
@@ -52,6 +52,7 @@ from lumen.ops.quantize.linear import (
     _gemm_mxfp4_aiter,
     _gemm_mxfp4_aiter_asm,
     _gemm_mxfp4_aiter_preshuffle,
+    _gemm_mxfp4_flydsl,
     _mxfp4_asm_eligible,
     _mxfp4_asm_supported,
     _mxfp4_asm_tuned,
@@ -1522,7 +1523,7 @@ def test_mxfp4_preshuffle_eligibility():
     ids=["gate_up", "down_proj", "qkv_proj"],
 )
 def test_mxfp4_asm_gemm_matches_plain(M, N, K):
-    """The A4W4 ASM/CK kernels must agree with the plain Triton MXFP4 GEMM.
+    """The A4W4 ASM kernels must agree with the plain Triton MXFP4 GEMM.
 
     Lumen only rewrites the operand layout for these kernels -- the B tiling and
     the padded, swizzled scales -- so both paths consume the same values. A wrong
@@ -1591,7 +1592,9 @@ def test_mxfp4_asm_weight_operand_cache_follows_the_scales():
     except (AssertionError, RuntimeError, NotImplementedError) as e:
         pytest.skip(f"AITER A4W4 MXFP4 GEMM unavailable: {e}")
 
-    assert hasattr(w_fp4, "_mxfp4_asm_operands"), "weight operands were not cached"
+    assert hasattr(
+        w_fp4, "_mxfp4_preshuffled_operands"
+    ), "shared ASM/FlyDSL weight operands were not cached"
 
     # A second call on the same weight must hit the cache and change nothing.
     torch.testing.assert_close(
@@ -1634,10 +1637,617 @@ def test_mxfp4_asm_eligibility():
     assert not _mxfp4_asm_eligible(*_operands(2048, 28680, 4096))
     assert not _mxfp4_asm_eligible(*_operands(2048, 28672, 4080))
 
-    # Untuned shapes must not reach the ASM path: aiter's default kernel choice
-    # returns garbage there (see _mxfp4_asm_tuned).
+    # Untuned shapes must not reach the direct ASM launch.
     assert not _mxfp4_asm_tuned(64, 64, 128)
     assert not _mxfp4_asm_eligible(*_operands(64, 64, 128))
+
+
+@pytest.mark.parametrize(
+    "entry,k,expected",
+    [
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": 0,
+            },
+            128,
+            (
+                "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                0,
+            ),
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+                "splitK": "3",
+            },
+            2048,
+            (
+                "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+                3,
+            ),
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": 2,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": 0,
+                "libtype": "other",
+            },
+            128,
+            None,
+        ),
+        ({"kernelName": "_ZN5aiter17generic_dispatchE", "splitK": 1}, 128, None),
+        (
+            {
+                "kernelName": "_ZN5aiter44f4gemm_bf16_per1x32Fp4_noBpreShuffle_128x256E",
+                "splitK": 1,
+            },
+            128,
+            None,
+        ),
+        ({"kernelName": "", "splitK": 0}, 128, None),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E"
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": None,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": float("nan"),
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": float("inf"),
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": True,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": 1.5,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": -1,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+                "splitK": 4,
+            },
+            128,
+            None,
+        ),
+        (
+            {
+                "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+                "splitK": 2,
+            },
+            130,
+            None,
+        ),
+        (None, 128, None),
+        (["malformed"], 128, None),
+    ],
+)
+def test_mxfp4_asm_config_accepts_only_explicit_asm_symbols(entry, k, expected):
+    """The ASM backend accepts only entries with an explicit ASM identity."""
+    assert mxfp4_asm.validate_tuned_entry(entry, k, "gfx950") == expected
+
+
+def test_mxfp4_asm_config_uses_runtime_registry(monkeypatch):
+    """Linear dispatch gets both arch and CU identity from the ASM registry."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    expected = (
+        "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+        0,
+    )
+    calls = []
+
+    def _lookup(M, N, K):
+        calls.append((M, N, K))
+        return expected
+
+    monkeypatch.setattr(mxfp4_asm, "lookup_runtime", _lookup)
+    assert linear_mod._mxfp4_asm_config(64, 128, 256) == expected
+    assert calls == [(64, 128, 256)]
+
+
+def test_mxfp4_asm_runtime_lookup_uses_aiter_device_identity(monkeypatch):
+    """The table key follows AITER's runtime arch/CU overrides exactly."""
+    from aiter.jit.utils import chip_info
+
+    calls = []
+
+    def _lookup(M, N, K, *, arch, cu_num, paths=None):
+        calls.append((M, N, K, arch, cu_num, paths))
+        return ("asm-symbol", 0)
+
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
+    monkeypatch.setattr(mxfp4_asm, "lookup", _lookup)
+    assert mxfp4_asm.lookup_runtime(64, 128, 256) == ("asm-symbol", 0)
+    assert calls == [(64, 128, 256, "gfx950", 304, None)]
+
+
+def _write_mxfp4_asm_table(path, rows, *, include_gfx=True, include_libtype=False):
+    fields = (["gfx"] if include_gfx else []) + [
+        "cu_num",
+        "M",
+        "N",
+        "K",
+        "kernelName",
+        "splitK",
+    ]
+    if include_libtype:
+        fields.append("libtype")
+    with path.open("w", newline="") as output:
+        writer = csv.DictWriter(output, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+@pytest.fixture
+def isolated_mxfp4_asm_artifact_baselines():
+    """Model a fresh process for tests of AITER's process-lifetime loader state."""
+    with mxfp4_asm._runtime_artifact_lock:
+        baselines = dict(mxfp4_asm._runtime_artifact_baselines)
+        warnings = set(mxfp4_asm._runtime_artifact_warnings)
+        mxfp4_asm._runtime_artifact_baselines.clear()
+        mxfp4_asm._runtime_artifact_warnings.clear()
+    try:
+        yield
+    finally:
+        with mxfp4_asm._runtime_artifact_lock:
+            mxfp4_asm._runtime_artifact_baselines.clear()
+            mxfp4_asm._runtime_artifact_baselines.update(baselines)
+            mxfp4_asm._runtime_artifact_warnings.clear()
+            mxfp4_asm._runtime_artifact_warnings.update(warnings)
+
+
+def test_mxfp4_asm_table_filters_before_applying_path_priority(tmp_path):
+    """An unrelated high-priority row cannot hide a lower-priority ASM row."""
+    high = tmp_path / "high.csv"
+    low = tmp_path / "low.csv"
+    shape = {"gfx": "gfx950", "cu_num": 256, "M": 64, "N": 128, "K": 256}
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    _write_mxfp4_asm_table(
+        high,
+        [{**shape, "kernelName": "unapproved_implementation", "splitK": 0}],
+    )
+    _write_mxfp4_asm_table(
+        low,
+        [{**shape, "kernelName": symbol, "splitK": 0}],
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx950", cu_num=256, paths=[str(high), str(low)]
+    ) == (symbol, 0)
+
+    faster_looking = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E"
+    _write_mxfp4_asm_table(
+        high,
+        [{**shape, "kernelName": faster_looking, "splitK": 0}],
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx950", cu_num=256, paths=[str(high), str(low)]
+    ) == (faster_looking, 0)
+
+
+def test_mxfp4_asm_table_prefers_exact_then_fine_then_coarse_m(tmp_path):
+    table = tmp_path / "padded.csv"
+    exact = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E"
+    fine = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    coarse = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_96x128E"
+    base = {"gfx": "gfx950", "cu_num": 256, "N": 128, "K": 256, "splitK": 0}
+    _write_mxfp4_asm_table(
+        table,
+        [
+            {**base, "M": 257, "kernelName": exact},
+            {**base, "M": 288, "kernelName": fine},
+            {**base, "M": 512, "kernelName": coarse},
+        ],
+    )
+    mxfp4_asm.clear_caches()
+    paths = [str(table)]
+    assert mxfp4_asm.lookup(
+        257, 128, 256, arch="gfx950", cu_num=256, paths=paths
+    ) == (exact, 0)
+
+    _write_mxfp4_asm_table(
+        table,
+        [
+            {**base, "M": 288, "kernelName": fine},
+            {**base, "M": 512, "kernelName": coarse},
+        ],
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        257, 128, 256, arch="gfx950", cu_num=256, paths=paths
+    ) == (fine, 0)
+
+    _write_mxfp4_asm_table(
+        table,
+        [{**base, "M": 512, "kernelName": coarse}],
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        257, 128, 256, arch="gfx950", cu_num=256, paths=paths
+    ) == (coarse, 0)
+
+
+@pytest.mark.parametrize(
+    "m,n,level,expected",
+    [
+        (256, 4096, 0, 256),
+        (257, 4096, 0, 288),
+        (1024, 4096, 0, 1024),
+        (1025, 4096, 0, 1088),
+        (4096, 4096, 0, 4096),
+        (4097, 4096, 0, 4224),
+        (8193, 4096, 1, 16384),
+        (8193, 4097, 1, 8192),
+    ],
+)
+def test_mxfp4_asm_padded_m_matches_tuned_lookup(m, n, level, expected):
+    assert mxfp4_asm.padded_m(m, n, level) == expected
+
+
+def test_mxfp4_asm_table_rejects_ambiguous_key_and_wrong_libtype(tmp_path):
+    duplicate = tmp_path / "duplicate.csv"
+    tagged = tmp_path / "tagged.csv"
+    shape = {"gfx": "gfx950", "cu_num": 256, "M": 64, "N": 128, "K": 256}
+    first = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_32x128E"
+    second = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    _write_mxfp4_asm_table(
+        duplicate,
+        [
+            {**shape, "kernelName": first, "splitK": 0},
+            {**shape, "kernelName": second, "splitK": 0},
+        ],
+    )
+    _write_mxfp4_asm_table(
+        tagged,
+        [{**shape, "kernelName": first, "splitK": 0, "libtype": "other"}],
+        include_libtype=True,
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx950", cu_num=256, paths=[str(duplicate)]
+    ) is None
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx950", cu_num=256, paths=[str(tagged)]
+    ) is None
+
+
+def test_mxfp4_asm_legacy_table_is_gfx950_only(tmp_path):
+    table = tmp_path / "legacy.csv"
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    _write_mxfp4_asm_table(
+        table,
+        [
+            {
+                "cu_num": 256,
+                "M": 64,
+                "N": 128,
+                "K": 256,
+                "kernelName": symbol,
+                "splitK": 0,
+            }
+        ],
+        include_gfx=False,
+    )
+    mxfp4_asm.clear_caches()
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx950", cu_num=256, paths=[str(table)]
+    ) == (symbol, 0)
+    assert mxfp4_asm.lookup(
+        64, 128, 256, arch="gfx942", cu_num=256, paths=[str(table)]
+    ) is None
+
+
+def test_mxfp4_asm_artifact_identity_tracks_code_object_changes(
+    tmp_path, monkeypatch
+):
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    manifest = tmp_path / "f4gemm_bf16_per1x32Fp4.csv"
+    code_object = tmp_path / "kernel.co"
+    manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"64,128,0,1,{symbol},{code_object.name}\n"
+    )
+    code_object.write_bytes(b"first-build")
+    monkeypatch.setattr(mxfp4_asm, "_manifest_path", lambda _arch: manifest)
+    mxfp4_asm.clear_caches()
+    first = mxfp4_asm.kernel_artifact(symbol, "gfx950")
+    assert first is not None
+
+    code_object.write_bytes(b"second-build-with-a-different-size")
+    second = mxfp4_asm.kernel_artifact(symbol, "gfx950")
+    assert second is not None
+    assert second["code_object_sha256"] != first["code_object_sha256"]
+
+
+def test_mxfp4_asm_runtime_snapshot_tracks_all_live_files(
+    tmp_path, monkeypatch, caplog, isolated_mxfp4_asm_artifact_baselines
+):
+    """Table changes reload, while changed loaded artifacts require restart."""
+    from aiter.jit.utils import chip_info
+
+    first_symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    second_symbol = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E"
+    table = tmp_path / "tuned.csv"
+    manifest = tmp_path / "f4gemm_bf16_per1x32Fp4.csv"
+    first_code = tmp_path / "first.co"
+    second_code = tmp_path / "second.co"
+    replacement_code = tmp_path / "replacement-longer-name.co"
+    first_code.write_bytes(b"first")
+    second_code.write_bytes(b"second")
+    replacement_code.write_bytes(b"replacement")
+    manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"64,128,1,1,{first_symbol},{first_code.name}\n"
+        f"128,256,1,1,{second_symbol},{second_code.name}\n"
+    )
+    shape = {"gfx": "gfx950", "cu_num": 256, "M": 64, "N": 128, "K": 256}
+    _write_mxfp4_asm_table(
+        table,
+        [{**shape, "kernelName": first_symbol, "splitK": 0}],
+    )
+    monkeypatch.setenv(mxfp4_asm.TUNED_CONFIG_ENV, str(table))
+    manifest_lookups = 0
+
+    def _manifest_path(_arch):
+        nonlocal manifest_lookups
+        manifest_lookups += 1
+        return manifest
+
+    monkeypatch.setattr(mxfp4_asm, "_manifest_path", _manifest_path)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    mxfp4_asm.clear_caches()
+
+    first = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert first.config == (first_symbol, 0)
+    assert mxfp4_asm.snapshot_identity(first)["code_object"] == first_code.name
+
+    # A hot dispatch must reuse the manifest captured for the registry token
+    # when it validates the selected code object. It still stats the manifest
+    # and code object on every call, but must not rediscover the search path.
+    manifest_lookups = 0
+    unchanged = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert unchanged.validation_token == first.validation_token
+    assert manifest_lookups == 1
+
+    _write_mxfp4_asm_table(
+        table,
+        [{**shape, "kernelName": second_symbol, "splitK": 0}],
+    )
+    second = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert second.config == (second_symbol, 0)
+    assert second.validation_token != first.validation_token
+
+    _write_mxfp4_asm_table(
+        table,
+        [{**shape, "kernelName": second_symbol, "splitK": 1}],
+    )
+    # Ensure the filesystem signature changes even on filesystems whose
+    # sub-second timestamp granularity cannot distinguish the two rewrites.
+    with table.open("a") as output:
+        output.write("\n")
+    split_changed = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert split_changed.config == (second_symbol, 1)
+    assert split_changed.validation_token != second.validation_token
+
+    manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"128,256,1,1,{second_symbol},{replacement_code.name}\n"
+    )
+    with caplog.at_level("WARNING", logger=mxfp4_asm.__name__):
+        third = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert third.config is None
+    assert mxfp4_asm.snapshot_identity(third) is None
+    assert third.validation_token != split_changed.validation_token
+    assert "until process restart" in caplog.text
+
+    replacement_code.write_bytes(b"replacement-with-different-size")
+    fourth = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert fourth.config is None
+    assert fourth.validation_token != third.validation_token
+    assert mxfp4_asm.snapshot_identity(fourth) is None
+
+    mxfp4_asm.clear_caches()
+    after_clear = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert after_clear.config is None
+    assert mxfp4_asm.snapshot_identity(after_clear) is None
+
+
+def test_mxfp4_asm_runtime_snapshot_uses_one_manifest_generation(
+    tmp_path, monkeypatch, isolated_mxfp4_asm_artifact_baselines
+):
+    """Table admission and launch identity use the same captured manifest."""
+    from aiter.jit.utils import chip_info
+
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    table = tmp_path / "tuned.csv"
+    first_dir = tmp_path / "first"
+    second_dir = tmp_path / "second"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    first_manifest = first_dir / "f4gemm_bf16_per1x32Fp4.csv"
+    second_manifest = second_dir / first_manifest.name
+    first_code = first_dir / "kernel.co"
+    second_code = second_dir / "kernel.co"
+    first_code.write_bytes(b"no-split-k")
+    second_code.write_bytes(b"split-k-capable")
+    first_manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"64,128,0,1,{symbol},{first_code.name}\n"
+    )
+    second_manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"64,128,1,1,{symbol},{second_code.name}\n"
+    )
+    _write_mxfp4_asm_table(
+        table,
+        [
+            {
+                "gfx": "gfx950",
+                "cu_num": 256,
+                "M": 64,
+                "N": 128,
+                "K": 256,
+                "kernelName": symbol,
+                "splitK": 1,
+            }
+        ],
+    )
+    manifest_calls = 0
+
+    def _changing_manifest(_arch):
+        nonlocal manifest_calls
+        manifest_calls += 1
+        return first_manifest if manifest_calls == 1 else second_manifest
+
+    monkeypatch.setenv(mxfp4_asm.TUNED_CONFIG_ENV, str(table))
+    monkeypatch.setattr(mxfp4_asm, "_manifest_path", _changing_manifest)
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    mxfp4_asm.clear_caches()
+
+    snapshot = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert snapshot.config is None
+    assert snapshot.identity_items is None
+    assert manifest_calls == 1
+
+    mxfp4_asm.clear_caches()
+    manifest_calls = 0
+    assert len(mxfp4_asm.table_fingerprint()) == 16
+    assert manifest_calls == 1
+
+
+def test_mxfp4_asm_runtime_snapshot_retries_initially_missing_artifact(
+    tmp_path, monkeypatch, isolated_mxfp4_asm_artifact_baselines
+):
+    """Installing an artifact before its first valid use refreshes the table view."""
+    from aiter.jit.utils import chip_info
+
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    table = tmp_path / "tuned.csv"
+    manifest = tmp_path / "f4gemm_bf16_per1x32Fp4.csv"
+    code_object = tmp_path / "kernel.co"
+    shape = {"gfx": "gfx950", "cu_num": 256, "M": 64, "N": 128, "K": 256}
+    _write_mxfp4_asm_table(
+        table,
+        [{**shape, "kernelName": symbol, "splitK": 0}],
+    )
+    monkeypatch.setenv(mxfp4_asm.TUNED_CONFIG_ENV, str(table))
+    monkeypatch.setattr(
+        mxfp4_asm,
+        "_manifest_path",
+        lambda _arch: manifest if manifest.is_file() else None,
+    )
+    monkeypatch.setattr(chip_info, "get_gfx_runtime", lambda: "gfx950")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    mxfp4_asm.clear_caches()
+
+    missing = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert missing.config is None
+
+    code_object.write_bytes(b"installed-before-first-use")
+    manifest.write_text(
+        "tile_M,tile_N,splitK,bpreshuffle,knl_name,co_name\n"
+        f"64,128,1,1,{symbol},{code_object.name}\n"
+    )
+    available = mxfp4_asm.runtime_snapshot(64, 128, 256)
+    assert available.config == (symbol, 0)
+    assert mxfp4_asm.snapshot_identity(available)["code_object"] == code_object.name
+    assert available.validation_token != missing.validation_token
+
+
+def test_mxfp4_asm_launch_uses_direct_api(monkeypatch):
+    """The named ASM backend must call the direct ASM API with its exact config."""
+    from aiter.ops import gemm_op_a4w4
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    M, N, K = 33, 16, 128
+    a = torch.empty((M, K // 2), dtype=torch.uint8)
+    w = torch.empty((N, K // 2), dtype=torch.uint8)
+    scale_a = torch.empty((M, K // 32), dtype=torch.uint8)
+    scale_w = torch.empty((N, K // 32), dtype=torch.uint8)
+    calls = []
+
+    def _direct_asm(a_arg, w_arg, sa_arg, sw_arg, out, **kwargs):
+        calls.append((a_arg, w_arg, sa_arg, sw_arg, out, kwargs))
+
+    def _generic_dispatch(*_args, **_kwargs):
+        pytest.fail("MXFP4 ASM path called AITER's generic A4W4 dispatcher")
+
+    asm_symbol = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E"
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_asm_config",
+        lambda *_shape: pytest.fail("re-read ASM config after dispatch validation"),
+    )
+    monkeypatch.setattr(quantize_ops, "triton_arch", lambda: "gfx950")
+    monkeypatch.setattr(linear_mod, "_shuffle_mxfp4_weight", lambda x, arch=None: x)
+    monkeypatch.setattr(linear_mod, "_pad_and_swizzle_mxfp4_scale", lambda x, *_args: x)
+    monkeypatch.setattr(gemm_op_a4w4, "gemm_a4w4_asm", _direct_asm)
+    monkeypatch.setattr(gemm_op_a4w4, "gemm_a4w4", _generic_dispatch)
+    result = _gemm_mxfp4_aiter_asm(
+        a, w, scale_a, scale_w, asm_config=(asm_symbol, 3)
+    )
+
+    assert result.shape == (M, N)
+    assert len(calls) == 1
+    assert calls[0][4].shape == (64, N)
+    assert calls[0][5] == {
+        "kernelName": asm_symbol,
+        "bpreshuffle": True,
+        "log2_k_split": 3,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1678,12 +2288,7 @@ def test_mxfp4_asm_scale_pad_and_swizzle_roundtrip(rows, cols):
 
 
 def test_mxfp4_backends_are_interchangeable():
-    """Every available backend must be bit-identical, or autotune is unsafe.
-
-    Autotune picks a backend from a timing measurement, so if two backends
-    disagreed by even one ULP the numerics of a run would depend on which one
-    happened to be faster that day.
-    """
+    """Every backend admitted to autotune must agree with the existing path."""
     _require_mxfp4_dtype()
     torch.manual_seed(19)
     torch.cuda.manual_seed(19)
@@ -1713,6 +2318,17 @@ def test_mxfp4_backends_are_interchangeable():
             ref, atol=0, rtol=0,
         )
         checked += 1
+    if flydsl_mxfp4.available():
+        for config in flydsl_mxfp4.supported_configs(M, N, K):
+            torch.testing.assert_close(
+                _gemm_mxfp4_flydsl(
+                    config.name, a_fp4, w_fp4, a_scales, w_scales
+                ),
+                ref,
+                atol=0.1,
+                rtol=0.1,
+            )
+            checked += 1
     assert checked, "no alternative backend was available to compare against"
 
 
@@ -2024,6 +2640,480 @@ def test_mxfp4_aligned_scale_swizzle_does_not_alias_input():
     torch.testing.assert_close(scale, before, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "timings,expected",
+    [
+        (
+            {"asm": 1.0, "flydsl_64x128x256": 1.0 / 1.05},
+            "flydsl_64x128x256",
+        ),
+        ({"asm": 100.0, "flydsl_64x128x256": 97.0}, "asm"),
+        ({"asm": 100.0, "flydsl_64x128x256": 94.0}, "flydsl_64x128x256"),
+        (
+            {
+                "asm": 100.0,
+                "shuffled": 90.0,
+                "flydsl_64x128x256": 94.0,
+            },
+            "flydsl_64x128x256",
+        ),
+        ({"shuffled": 90.0, "flydsl_64x128x256": 94.0}, "shuffled"),
+        ({"flydsl_64x128x256": 94.0}, "asm"),
+        ({"asm": 100.0, "unknown_challenger": 50.0}, "asm"),
+    ],
+)
+def test_mxfp4_autotune_protects_asm_incumbent(timings, expected):
+    """Only a FlyDSL result at least 5% faster may replace working ASM."""
+    winner, _reason = mxfp4_autotune._select_winner(timings, incumbent="asm")
+    assert winner == expected
+
+
+def test_mxfp4_autotune_winner_is_independent_of_candidate_order():
+    """Persisted per-shape decisions must not depend on registration order."""
+    timings = [
+        ("asm", 100.0),
+        ("shuffled", 90.0),
+        ("flydsl_64x128x256", 94.0),
+        ("flydsl_64x256x256", 96.0),
+    ]
+    forward = mxfp4_autotune._select_winner(dict(timings), incumbent="asm")
+    reverse = mxfp4_autotune._select_winner(
+        dict(reversed(timings)), incumbent="asm"
+    )
+    assert forward[0] == reverse[0] == "flydsl_64x128x256"
+
+
+def test_mxfp4_autotune_validates_flydsl_before_timing():
+    """A numerically bad FlyDSL configuration never enters the performance race."""
+    reference = torch.arange(64, dtype=torch.float32).reshape(8, 8)
+    candidates = [
+        ("asm", lambda: reference),
+        ("flydsl_64x128x256", lambda: reference.clone()),
+        ("flydsl_64x256x256", lambda: reference + 10),
+    ]
+    admitted, validation = mxfp4_autotune._validate_flydsl_candidates(
+        (8, 8, 256), candidates, incumbent="asm"
+    )
+    assert [name for name, _fn in admitted] == ["asm", "flydsl_64x128x256"]
+    assert validation["flydsl_64x128x256"].startswith("passed")
+    assert validation["flydsl_64x256x256"].startswith("rejected")
+
+
+def test_mxfp4_autotune_validates_every_output_element():
+    """A bad interior value omitted by the former sample is still rejected."""
+    reference = torch.zeros((64, 64), dtype=torch.float32)
+    bad = reference.clone()
+    # Row/column 8 was not part of the former edge-and-17-point-grid sample.
+    bad[8, 8] = 10
+    admitted, validation = mxfp4_autotune._validate_flydsl_candidates(
+        (64, 64, 256),
+        [
+            ("asm", lambda: reference),
+            ("flydsl_64x128x256", lambda: bad),
+        ],
+        incumbent="asm",
+    )
+    assert [name for name, _fn in admitted] == ["asm"]
+    assert validation["flydsl_64x128x256"].startswith("rejected")
+
+
+def test_mxfp4_autotune_never_selects_flydsl_without_a_reference(monkeypatch):
+    """A sole FlyDSL candidate cannot enter dispatch without profile evidence."""
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+    monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+    mxfp4_autotune.clear()
+    try:
+        with pytest.raises(RuntimeError, match="cannot be selected"):
+            mxfp4_autotune.pick_backend(
+                key,
+                [(name, lambda: torch.zeros((2, 2)))],
+                fallback=name,
+                incumbent=name,
+            )
+        with pytest.raises(RuntimeError, match="no existing backend"):
+            mxfp4_autotune._measure(
+                key,
+                [
+                    (name, lambda: torch.zeros((2, 2))),
+                    (
+                        "flydsl_64x256x256",
+                        lambda: torch.zeros((2, 2)),
+                    ),
+                ],
+                incumbent=name,
+            )
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_does_not_cache_when_asm_measurement_fails(monkeypatch):
+    """A missing ASM timing cannot permanently promote FlyDSL or a fallback."""
+    key = (64, 128, 256)
+    monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+    monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+    monkeypatch.setattr(
+        mxfp4_autotune,
+        "_measure",
+        lambda *_args, **_kwargs: (
+            "shuffled",
+            {"shuffled": 1.0, "flydsl_64x128x256": 0.9},
+            "ASM measurement failed",
+            {"flydsl_64x128x256": "passed against shuffled"},
+        ),
+    )
+    mxfp4_autotune.clear()
+    try:
+        assert (
+            mxfp4_autotune.pick_backend(
+                key,
+                [
+                    ("asm", lambda: None),
+                    ("flydsl_64x128x256", lambda: None),
+                    ("shuffled", lambda: None),
+                ],
+                fallback="asm",
+                incumbent="asm",
+            )
+            == "shuffled"
+        )
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_rejects_when_every_profile_candidate_fails(monkeypatch):
+    """A failed label must not be returned as though measurement succeeded."""
+    key = (64, 128, 256)
+
+    def fail():
+        raise RuntimeError("injected profile failure")
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 1)
+    with pytest.raises(RuntimeError, match="no backend survived profile warmup"):
+        mxfp4_autotune._measure(
+            key,
+            [("asm", fail), ("plain", fail)],
+            incumbent="asm",
+        )
+
+
+def test_mxfp4_autotune_profile_records_exact_backend_identities(monkeypatch):
+    """The cache keeps the concrete ASM symbol and FlyDSL tile behind labels."""
+    key = (64, 128, 256)
+    flydsl_name = "flydsl_64x128x256"
+    asm_symbol = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E"
+    asm_identity = mxfp4_asm.identity((asm_symbol, 0), "gfx950")
+    assert asm_identity is not None
+    identities = {
+        "asm": asm_identity,
+        flydsl_name: flydsl_mxfp4.config_identity(
+            flydsl_mxfp4.get_config(flydsl_name)
+        ),
+    }
+    monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+    monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+    monkeypatch.setattr(
+        mxfp4_autotune,
+        "_measure",
+        lambda *_args, **_kwargs: (
+            "asm",
+            {"asm": 1.0, flydsl_name: 0.97},
+            "FlyDSL challenger did not clear margin",
+            {flydsl_name: "passed against asm"},
+        ),
+    )
+    mxfp4_autotune.clear()
+    try:
+        chosen = mxfp4_autotune.pick_backend(
+            key,
+            [("asm", lambda: None), (flydsl_name, lambda: None)],
+            fallback="asm",
+            incumbent="asm",
+            identities=identities,
+        )
+        assert chosen == "asm"
+        assert mxfp4_autotune._profiles[key]["identities"] == identities
+        assert mxfp4_autotune._profiles[key]["validation"] == {
+            flydsl_name: "passed against asm"
+        }
+        assert mxfp4_autotune.cached_profile_supports(
+            key,
+            "asm",
+            expected_identities={"asm": identities["asm"]},
+            required_incumbent="asm",
+        )
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_flydsl_shape_gate_matches_scale_layout_contract(monkeypatch):
+    """The vendored scale reader requires complete 256-value K chunks."""
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    assert not flydsl_mxfp4.supported_configs(64, 128, 128)
+    assert not flydsl_mxfp4.supported_configs(64, 128, 384)
+    assert {
+        config.name for config in flydsl_mxfp4.supported_configs(64, 128, 256)
+    } == {
+        "flydsl_32x128x256",
+        "flydsl_64x128x128",
+        "flydsl_64x128x256",
+    }
+
+
+def test_mxfp4_flydsl_profiles_every_legal_upstream_config(monkeypatch):
+    """M heuristics must not remove a legal contender before measurement."""
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "0.3.2")
+    four_wave = "flydsl_4wave_256x256x256"
+    expected = set(flydsl_mxfp4.backend_names()) - {four_wave}
+    for M in (1, 32, 64, 128, 511, 512, 5133, 8192):
+        actual = {
+            config.name
+            for config in flydsl_mxfp4.supported_configs(M, 8192, 8192)
+        }
+        assert actual == (expected | {four_wave} if M % 256 == 0 else expected)
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ((256, 256, 512), False),
+        ((256, 256, 768), False),
+        ((256, 256, 1024), True),
+        ((256, 256, 1280), False),
+        ((256, 256, 1536), True),
+        ((255, 256, 1024), False),
+        ((256, 255, 1024), False),
+        ((256, 256, 1152), False),
+    ],
+)
+def test_mxfp4_4wave_legality_is_fail_closed(monkeypatch, shape, expected):
+    """The fixed 256x256 kernel only admits shapes its pipeline can execute."""
+    name = "flydsl_4wave_256x256x256"
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "0.3.2")
+    names = {config.name for config in flydsl_mxfp4.supported_configs(*shape)}
+    assert (name in names) is expected
+
+
+def test_mxfp4_4wave_rejects_old_flydsl_runtime(monkeypatch):
+    """FlyDSL 0.2.4 lacks APIs required by the 4-wave source."""
+    name = "flydsl_4wave_256x256x256"
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "0.2.4")
+
+    names = {
+        config.name
+        for config in flydsl_mxfp4.supported_configs(256, 256, 1024)
+    }
+    assert name not in names
+    assert "flydsl_64x128x256" in names
+
+
+@pytest.mark.parametrize(
+    "version,expected",
+    [
+        ("0.3.1", False),
+        ("0.3.2", True),
+        ("0.3.2+local", True),
+        ("0.4.0.dev1", True),
+        ("unavailable", False),
+        ("0.3", False),
+    ],
+)
+def test_mxfp4_4wave_runtime_version_helper(version, expected):
+    assert flydsl_mxfp4.four_wave_runtime_supported(version) is expected
+
+
+def test_mxfp4_4wave_has_independent_identity_and_registration(monkeypatch):
+    """The 4-wave candidate cannot reuse another FlyDSL kernel's profile."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "0.3.2")
+    generic = flydsl_mxfp4.get_config("flydsl_64x256x256")
+    four_wave = flydsl_mxfp4.get_config("flydsl_4wave_256x256x256")
+    generic_identity = flydsl_mxfp4.config_identity(generic)
+    four_wave_identity = flydsl_mxfp4.config_identity(four_wave)
+
+    assert four_wave.name in flydsl_mxfp4.backend_names()
+    assert four_wave.name in linear_mod._MXFP4_BACKENDS
+    assert linear_mod._MXFP4_BACKEND_KIND[four_wave.name].value == "flydsl"
+    assert four_wave_identity["kernel_family"] == "mxfp4_4wave"
+    assert four_wave_identity["source_revision"] == flydsl_mxfp4.FLYDSL_KERNEL_REVISION
+    assert four_wave_identity["source_sha256"] != generic_identity["source_sha256"]
+    assert four_wave_identity["runtime_version"] == "0.3.2"
+    assert four_wave_identity["waves_per_eu"] == 1
+    assert four_wave_identity["use_xcd_remap"] is True
+
+
+def test_mxfp4_4wave_uses_shared_preshuffled_operands(monkeypatch):
+    """The new candidate consumes the same B/scale layout as strict ASM."""
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    name = "flydsl_4wave_256x256x256"
+    a = torch.empty((256, 512), dtype=torch.uint8)
+    w = torch.empty((256, 512), dtype=torch.uint8)
+    sa = torch.empty((256, 32), dtype=torch.uint8)
+    sw = torch.empty((256, 32), dtype=torch.uint8)
+    w_shuffled = torch.empty_like(w)
+    sa_shuffled = torch.empty_like(sa)
+    sw_shuffled = torch.empty_like(sw)
+    seen = {}
+
+    monkeypatch.setattr(quantize_ops, "triton_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        linear_mod, "_expand_2d_scale_to_1d", lambda scale, _shape: scale
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_preshuffled_operands",
+        lambda weight, scale, arch, tiling: (w_shuffled, sw_shuffled),
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_pad_and_swizzle_mxfp4_scale",
+        lambda scale, arch, tiling: sa_shuffled,
+    )
+
+    def _run(config, actual_a, actual_w, actual_sa, actual_sw):
+        seen.update(
+            config=config,
+            a=actual_a,
+            w=actual_w,
+            sa=actual_sa,
+            sw=actual_sw,
+        )
+        return "output"
+
+    monkeypatch.setattr(flydsl_mxfp4, "run", _run)
+    assert linear_mod._gemm_mxfp4_flydsl(name, a, w, sa, sw) == "output"
+    assert seen["config"] == flydsl_mxfp4.get_config(name)
+    assert seen["a"] is a
+    assert seen["w"] is w_shuffled
+    assert seen["sa"] is sa_shuffled
+    assert seen["sw"] is sw_shuffled
+
+
+def test_mxfp4_4wave_must_clear_protected_asm_margin():
+    """Registration never statically promotes the measured 4-wave kernel."""
+    name = "flydsl_4wave_256x256x256"
+    assert mxfp4_autotune._select_winner(
+        {"asm": 100.0, name: 96.0}, incumbent="asm"
+    )[0] == "asm"
+    assert mxfp4_autotune._select_winner(
+        {"asm": 100.0, name: 100.0 / 1.05}, incumbent="asm"
+    )[0] == name
+
+
+def test_mxfp4_flydsl_identity_tracks_runtime_version(monkeypatch):
+    """A compiler/runtime change must invalidate shape-profile evidence."""
+    config = flydsl_mxfp4.get_config("flydsl_64x128x256")
+    before_identity = flydsl_mxfp4.config_identity(config)
+    before_fingerprint = flydsl_mxfp4.backend_fingerprint()
+
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "test-new-runtime")
+
+    assert flydsl_mxfp4.config_identity(config) != before_identity
+    assert flydsl_mxfp4.backend_fingerprint() != before_fingerprint
+    assert flydsl_mxfp4.config_identity(config)["runtime_version"] == "test-new-runtime"
+
+
+def test_mxfp4_flydsl_source_identity_is_cached():
+    """The replay guard must not reread kernel source on every GEMM hot-path call."""
+    flydsl_mxfp4._kernel_source_sha256.cache_clear()
+    flydsl_mxfp4._wrapper_source_sha256.cache_clear()
+    try:
+        first = flydsl_mxfp4._kernel_source_sha256()
+        second = flydsl_mxfp4._kernel_source_sha256()
+        assert first == second
+        assert flydsl_mxfp4._kernel_source_sha256.cache_info().hits == 1
+        wrapper_first = flydsl_mxfp4._wrapper_source_sha256()
+        wrapper_second = flydsl_mxfp4._wrapper_source_sha256()
+        assert wrapper_first == wrapper_second
+        assert flydsl_mxfp4._wrapper_source_sha256.cache_info().hits == 1
+    finally:
+        flydsl_mxfp4._kernel_source_sha256.cache_clear()
+        flydsl_mxfp4._wrapper_source_sha256.cache_clear()
+
+
+def test_mxfp4_flydsl_identity_tracks_wrapper_source(monkeypatch):
+    """A wrapper-overhead change must invalidate measured shape winners."""
+    config = flydsl_mxfp4.get_config("flydsl_4wave_256x256x256")
+    before_identity = flydsl_mxfp4.config_identity(config)
+    before_fingerprint = flydsl_mxfp4.backend_fingerprint()
+
+    monkeypatch.setattr(
+        flydsl_mxfp4, "_wrapper_source_sha256", lambda: "changed-wrapper"
+    )
+
+    assert flydsl_mxfp4.config_identity(config) != before_identity
+    assert flydsl_mxfp4.backend_fingerprint() != before_fingerprint
+    assert (
+        flydsl_mxfp4.config_identity(config)["wrapper_source_sha256"]
+        == "changed-wrapper"
+    )
+
+
+def test_mxfp4_4wave_identity_tracks_dma_intrinsic_env(monkeypatch):
+    """Switching the generated DMA path must invalidate shape profiles."""
+    four_wave = flydsl_mxfp4.get_config("flydsl_4wave_256x256x256")
+    preshuffle = flydsl_mxfp4.get_config("flydsl_64x256x256")
+
+    monkeypatch.setenv("FP4_DMA_INTRINSIC", "0")
+    identity_0 = flydsl_mxfp4.config_identity(four_wave)
+    fingerprint_0 = flydsl_mxfp4.backend_fingerprint()
+    preshuffle_0 = flydsl_mxfp4.config_identity(preshuffle)
+
+    monkeypatch.setenv("FP4_DMA_INTRINSIC", "1")
+    identity_1 = flydsl_mxfp4.config_identity(four_wave)
+    fingerprint_1 = flydsl_mxfp4.backend_fingerprint()
+    preshuffle_1 = flydsl_mxfp4.config_identity(preshuffle)
+
+    assert identity_0["fp4_dma_intrinsic"] == 0
+    assert identity_1["fp4_dma_intrinsic"] == 1
+    assert identity_0 != identity_1
+    assert fingerprint_0 != fingerprint_1
+    assert preshuffle_0["fp4_dma_intrinsic"] == "not_applicable"
+    assert preshuffle_1 == preshuffle_0
+
+
+def test_mxfp4_flydsl_missing_runtime_metadata_fails_closed(monkeypatch):
+    """An unidentifiable FlyDSL compiler must never enter profiling or replay."""
+    def _missing(_distribution):
+        raise flydsl_mxfp4.importlib.metadata.PackageNotFoundError
+
+    monkeypatch.setattr(flydsl_mxfp4.importlib.metadata, "version", _missing)
+    assert flydsl_mxfp4._installed_runtime_version() == "unavailable"
+
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "unavailable")
+    flydsl_mxfp4.available.cache_clear()
+    try:
+        assert not flydsl_mxfp4.available()
+    finally:
+        flydsl_mxfp4.available.cache_clear()
+
+
+def test_mxfp4_flydsl_missing_rocm_linker_fails_closed(monkeypatch, tmp_path):
+    """Direct callers must not discover failure only after JIT compilation."""
+    missing_root = tmp_path / "missing-rocm"
+    monkeypatch.setattr(flydsl_mxfp4, "_ENABLED", True)
+    monkeypatch.setattr(flydsl_mxfp4, "FLYDSL_RUNTIME_VERSION", "0.3.2")
+    monkeypatch.setattr(
+        flydsl_mxfp4, "_configured_rocm_root", lambda: str(missing_root)
+    )
+    flydsl_mxfp4._rocm_toolchain_identity.cache_clear()
+    flydsl_mxfp4.available.cache_clear()
+    try:
+        assert not flydsl_mxfp4.available()
+    finally:
+        flydsl_mxfp4.available.cache_clear()
+        flydsl_mxfp4._rocm_toolchain_identity.cache_clear()
+
+
 def test_mxfp4_autotune_picks_and_caches():
     """Autotune must return a legal backend and reuse it on later calls."""
     _require_mxfp4_dtype()
@@ -2046,11 +3136,70 @@ def test_mxfp4_autotune_picks_and_caches():
     except (AssertionError, RuntimeError) as e:
         pytest.skip(f"AITER MXFP4 GEMM unavailable: {e}")
 
-    assert chosen in ("asm", "shuffled", "plain")
+    assert chosen in ("asm", "shuffled", "plain", *flydsl_mxfp4.backend_names())
     assert mxfp4_autotune.cached(key) == chosen
     # Second call must not re-measure.
     assert _mxfp4_choose_backend(a_fp4, w_fp4, a_scales, w_scales) == chosen
     mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_decision_epoch_tracks_all_mutations(monkeypatch):
+    """Resolved dispatch entries can invalidate on every choice/profile change."""
+    original_path = mxfp4_autotune._CACHE_PATH
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._CACHE_PATH = ""
+        before = mxfp4_autotune.decision_epoch()
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.decision_epoch() == before + 1
+
+        protected_key = (1, 2, 3)
+        before = mxfp4_autotune.decision_epoch()
+        assert (
+            mxfp4_autotune._remember_protected_asm(
+                protected_key, {"asm": {"implementation": "asm"}}
+            )
+            == "asm"
+        )
+        assert mxfp4_autotune.decision_epoch() == before + 1
+
+        before = mxfp4_autotune.decision_epoch()
+        mxfp4_autotune.forget(protected_key)
+        assert mxfp4_autotune.decision_epoch() == before + 1
+
+        measured_key = (4, 5, 6)
+        monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+        monkeypatch.setattr(mxfp4_autotune, "_consensus_required", lambda: False)
+        monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+        monkeypatch.setattr(
+            mxfp4_autotune,
+            "_measure",
+            lambda *_args, **_kwargs: (
+                "plain",
+                {"plain": 1.0, "shuffled": 2.0},
+                "test",
+                {},
+            ),
+        )
+        before = mxfp4_autotune.decision_epoch()
+        assert (
+            mxfp4_autotune.pick_backend(
+                measured_key,
+                [("plain", lambda: None), ("shuffled", lambda: None)],
+                fallback="plain",
+                incumbent="plain",
+                identities={"plain": {"implementation": "triton"}},
+            )
+            == "plain"
+        )
+        assert mxfp4_autotune.decision_epoch() == before + 1
+
+        before = mxfp4_autotune.decision_epoch()
+        mxfp4_autotune.clear()
+        assert mxfp4_autotune.decision_epoch() == before + 1
+    finally:
+        mxfp4_autotune._CACHE_PATH = original_path
+        mxfp4_autotune.clear()
 
 
 def test_mxfp4_autotune_cache_roundtrip(tmp_path):
@@ -2063,7 +3212,9 @@ def test_mxfp4_autotune_cache_roundtrip(tmp_path):
     mxfp4_autotune._CACHE_PATH = str(cache)
     try:
         cache.write_text(json.dumps({
+            "schema": mxfp4_autotune._CACHE_SCHEMA,
             "arch": mxfp4_autotune._arch(),
+            "backends": mxfp4_autotune._backend_fingerprint(),
             "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
             "choices": {"8192,12288,4096": "asm"},
         }))
@@ -2073,7 +3224,9 @@ def test_mxfp4_autotune_cache_roundtrip(tmp_path):
         # A cache measured elsewhere says nothing about this GPU.
         mxfp4_autotune.clear()
         cache.write_text(json.dumps({
+            "schema": mxfp4_autotune._CACHE_SCHEMA,
             "arch": "gfx000-not-a-real-arch",
+            "backends": mxfp4_autotune._backend_fingerprint(),
             "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
             "choices": {"8192,12288,4096": "asm"},
         }))
@@ -2084,18 +3237,106 @@ def test_mxfp4_autotune_cache_roundtrip(tmp_path):
         mxfp4_autotune.clear()
 
 
+def test_mxfp4_autotune_cache_rejects_old_schema_and_unknown_backend(tmp_path):
+    """Only current, explicitly registered backend identities may be replayed."""
+    cache = tmp_path / "autotune.json"
+    key = (8192, 12288, 4096)
+    original_path = mxfp4_autotune._CACHE_PATH
+    mxfp4_autotune._CACHE_PATH = str(cache)
+    try:
+        common = {
+            "arch": mxfp4_autotune._arch(),
+            "backends": mxfp4_autotune._backend_fingerprint(),
+            "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
+        }
+
+        cache.write_text(
+            json.dumps(
+                {
+                    **common,
+                    "schema": mxfp4_autotune._CACHE_SCHEMA - 1,
+                    "choices": {"8192,12288,4096": "asm"},
+                }
+            )
+        )
+        mxfp4_autotune.clear()
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) is None
+
+        cache.write_text(
+            json.dumps(
+                {
+                    **common,
+                    "schema": mxfp4_autotune._CACHE_SCHEMA,
+                    "choices": {"8192,12288,4096": "unregistered_backend"},
+                }
+            )
+        )
+        mxfp4_autotune.clear()
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune._CACHE_PATH = original_path
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_cache_tracks_flydsl_revision(tmp_path, monkeypatch):
+    """A FlyDSL source/config change invalidates earlier shape measurements."""
+    cache = tmp_path / "autotune.json"
+    key = (8192, 12288, 4096)
+    original_path = mxfp4_autotune._CACHE_PATH
+    mxfp4_autotune._CACHE_PATH = str(cache)
+    try:
+        cache.write_text(
+            json.dumps(
+                {
+                    "schema": mxfp4_autotune._CACHE_SCHEMA,
+                    "arch": mxfp4_autotune._arch(),
+                    "backends": mxfp4_autotune._backend_fingerprint(),
+                    "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
+                    "choices": {"8192,12288,4096": "asm"},
+                }
+            )
+        )
+        monkeypatch.setattr(
+            flydsl_mxfp4,
+            "FLYDSL_KERNEL_REVISION",
+            flydsl_mxfp4.FLYDSL_KERNEL_REVISION + "-changed",
+        )
+        mxfp4_autotune.clear()
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune._CACHE_PATH = original_path
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_fingerprint_tracks_asm_registry_policy(monkeypatch):
+    """Changing ASM admission/lookup code invalidates prior profile evidence."""
+    before = mxfp4_autotune._backend_fingerprint()
+    monkeypatch.setattr(
+        mxfp4_asm,
+        "registry_fingerprint",
+        lambda: "asm-only-test-policy-change",
+    )
+    assert mxfp4_autotune._backend_fingerprint() != before
+
+
 def test_mxfp4_autotune_cache_rejects_a_different_tuned_table(tmp_path):
     """``asm`` is only meaningful against the table it was measured with.
 
     The cache persists on a shared results directory and outlives the run that
-    earned it. Replaying an ``asm`` decision with a different (or absent) A4W4
-    table dispatches the ASM kernel to a shape AITER has no config for, where
-    it picks an unvalidated default kernel and returns garbage -- 0.6 dB, no
-    error. ``arch`` cannot catch this: the GPU has not changed.
+    earned it. Replaying a decision with a changed ASM-only map could compare a
+    FlyDSL tile with a different symbol/split policy. ``arch`` cannot catch
+    this: the GPU has not changed.
     """
     cache = tmp_path / "autotune.json"
     table = tmp_path / "tuned.csv"
-    table.write_text("gfx,cu_num,M,N,K,kernelId,splitK,us\ngfx950,256,8192,12288,4096,7,1,42\n")
+    table.write_text(
+        "gfx,cu_num,M,N,K,kernelName,splitK\n"
+        "gfx950,256,8192,12288,4096,"
+        "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E,0\n"
+    )
     key = (8192, 12288, 4096)
 
     original_path = mxfp4_autotune._CACHE_PATH
@@ -2105,7 +3346,9 @@ def test_mxfp4_autotune_cache_rejects_a_different_tuned_table(tmp_path):
     try:
         os.environ[mxfp4_autotune.AITER_TUNED_CONFIG_ENV] = str(table)
         cache.write_text(json.dumps({
+            "schema": mxfp4_autotune._CACHE_SCHEMA,
             "arch": mxfp4_autotune._arch(),
+            "backends": mxfp4_autotune._backend_fingerprint(),
             "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
             "choices": {"8192,12288,4096": "asm"},
         }))
@@ -2114,7 +3357,11 @@ def test_mxfp4_autotune_cache_rejects_a_different_tuned_table(tmp_path):
 
         # Same file, different rows: a table tuned for another model.
         mxfp4_autotune.clear()
-        table.write_text("gfx,cu_num,M,N,K,kernelId,splitK,us\ngfx950,256,64,64,128,3,1,9\n")
+        table.write_text(
+            "gfx,cu_num,M,N,K,kernelName,splitK\n"
+            "gfx950,256,64,64,128,"
+            "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E,0\n"
+        )
         mxfp4_autotune._load_cache()
         assert mxfp4_autotune.cached(key) is None, "replayed asm against a different table"
 
@@ -2128,7 +3375,9 @@ def test_mxfp4_autotune_cache_rejects_a_different_tuned_table(tmp_path):
         mxfp4_autotune.clear()
         os.environ[mxfp4_autotune.AITER_TUNED_CONFIG_ENV] = str(table)
         cache.write_text(json.dumps({
+            "schema": mxfp4_autotune._CACHE_SCHEMA,
             "arch": mxfp4_autotune._arch(),
+            "backends": mxfp4_autotune._backend_fingerprint(),
             "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
             "choices": {"8192,12288,4096": "asm"},
         }))
@@ -2151,7 +3400,9 @@ def test_mxfp4_autotune_cache_write_cannot_tear_the_file(tmp_path, monkeypatch):
     """Every rank writes this path at exit, so a failed write must not destroy it."""
     cache = tmp_path / "autotune.json"
     good = json.dumps({
+        "schema": mxfp4_autotune._CACHE_SCHEMA,
         "arch": mxfp4_autotune._arch(),
+        "backends": mxfp4_autotune._backend_fingerprint(),
         "tuned_tables": mxfp4_autotune._tuned_table_fingerprint(),
         "choices": {"1,2,3": "plain"},
     })
@@ -2177,6 +3428,8 @@ def test_mxfp4_autotune_cache_write_cannot_tear_the_file(tmp_path, monkeypatch):
         mxfp4_autotune._save_cache()
         written = json.loads(cache.read_text())
         assert written["choices"]["4,5,6"] == "asm"
+        assert written["decision_scope"] == mxfp4_autotune._SINGLE_DEVICE_SCOPE
+        assert written["profile_device_count"] == 1
         assert written["tuned_tables"] == mxfp4_autotune._tuned_table_fingerprint()
         assert not list(tmp_path.glob("*.tmp"))
     finally:
@@ -2202,9 +3455,15 @@ def test_mxfp4_choose_backend_rechecks_a_cached_decision(monkeypatch):
     try:
         # Measured when the ASM kernels were reachable; they no longer are.
         mxfp4_autotune._choice[key] = "asm"
-        monkeypatch.setattr(linear_mod, "_mxfp4_backend_legality", lambda k, x, y: (False, False))
         monkeypatch.setattr(
-            linear_mod.mxfp4_autotune, "pick_backend", lambda k, c, fallback=None: "plain"
+            linear_mod,
+            "_mxfp4_backend_legality",
+            lambda k, x, y, *_rest: (False, False, ()),
+        )
+        monkeypatch.setattr(
+            linear_mod.mxfp4_autotune,
+            "pick_backend",
+            lambda k, c, fallback=None, incumbent=None, identities=None: "plain",
         )
 
         assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "plain"
@@ -2215,9 +3474,632 @@ def test_mxfp4_choose_backend_rechecks_a_cached_decision(monkeypatch):
         monkeypatch.setattr(
             linear_mod.mxfp4_autotune,
             "pick_backend",
-            lambda k, c, fallback=None: pytest.fail("re-measured a legal cached decision"),
+            lambda k, c, fallback=None, incumbent=None, identities=None: pytest.fail(
+                "re-measured a legal cached decision"
+            ),
         )
         assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "plain"
+    finally:
+        mxfp4_autotune.clear()
+        linear_mod._mxfp4_legality_cache.clear()
+
+
+def test_mxfp4_resolved_backend_cache_revalidates_live_tokens(monkeypatch):
+    """Hot replay skips deep profile checks but not file or decision changes."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    key = (32, 64, 256)
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    state = {
+        "epoch": 7,
+        "snapshot": mxfp4_asm.RuntimeSnapshot(
+            "gfx950",
+            256,
+            (symbol, 0),
+            ("files", 1),
+            (
+                ("implementation", "asm"),
+                ("kernel_name", symbol),
+                ("log2_k_split", 0),
+                ("code_object_sha256", "first"),
+            ),
+            True,
+        ),
+    }
+    profile_checks = []
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    linear_mod._mxfp4_resolved_backend_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", None)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_asm_ok", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_preshuffle_ok", False)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_flydsl_ok", False)
+    monkeypatch.setattr(
+        mxfp4_asm, "runtime_snapshot", lambda *_shape: state["snapshot"]
+    )
+    monkeypatch.setattr(mxfp4_autotune, "cached", lambda _key: "asm")
+    monkeypatch.setattr(
+        mxfp4_autotune, "decision_epoch", lambda: state["epoch"]
+    )
+    monkeypatch.setattr(mxfp4_autotune, "record_shape", lambda *_args, **_kwargs: None)
+
+    def _supports(_key, name, **kwargs):
+        profile_checks.append((name, kwargs["expected_identities"]))
+        return True
+
+    monkeypatch.setattr(mxfp4_autotune, "cached_profile_supports", _supports)
+
+    first = linear_mod._mxfp4_resolve_backend(a, w, None, None)
+    second = linear_mod._mxfp4_resolve_backend(a, w, None, None)
+    assert first.name == second.name == "asm"
+    assert first.asm_snapshot.config == second.asm_snapshot.config == (symbol, 0)
+    assert len(profile_checks) == 1
+
+    state["snapshot"] = mxfp4_asm.RuntimeSnapshot(
+        "gfx950",
+        256,
+        (symbol, 1),
+        ("files", 2),
+        (
+            ("implementation", "asm"),
+            ("kernel_name", symbol),
+            ("log2_k_split", 1),
+            ("code_object_sha256", "second"),
+        ),
+        True,
+    )
+    changed_files = linear_mod._mxfp4_resolve_backend(a, w, None, None)
+    assert changed_files.asm_snapshot.config == (symbol, 1)
+    assert len(profile_checks) == 2
+
+    state["epoch"] += 1
+    linear_mod._mxfp4_resolve_backend(a, w, None, None)
+    assert len(profile_checks) == 3
+    linear_mod._mxfp4_resolved_backend_cache.clear()
+    mxfp4_autotune.clear()
+
+
+def test_mxfp4_resolution_cache_key_supports_shape_only_validation():
+    """Offline cache generation need not allocate real model-sized tensors."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    class _ShapeOnly:
+        def __init__(self, shape):
+            self.shape = shape
+
+    key = (16384, 4096, 4096)
+    shape_only = _ShapeOnly((key[0], key[2] // 2))
+    assert linear_mod._mxfp4_resolution_cache_key(key, shape_only, False) == (
+        "shape-only",
+        None,
+        key,
+        False,
+    )
+
+    real_tensor = torch.empty((1, 1))
+    assert linear_mod._mxfp4_resolution_cache_key(key, real_tensor, True) == (
+        "cpu",
+        None,
+        key,
+        True,
+    )
+
+
+def test_mxfp4_resolver_does_not_offer_unavailable_plain_backend(monkeypatch):
+    """A successful optional probe must not imply that plain Triton exists."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    key = (32, 64, 256)
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+    symbol = "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E"
+    snapshot = mxfp4_asm.RuntimeSnapshot(
+        "gfx950",
+        256,
+        (symbol, 0),
+        ("test",),
+        (("implementation", "asm"), ("kernel_name", symbol)),
+        True,
+    )
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    linear_mod._mxfp4_resolved_backend_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", None)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_asm_ok", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_preshuffle_ok", False)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_flydsl_ok", False)
+    monkeypatch.setattr(mxfp4_asm, "runtime_snapshot", lambda *_shape: snapshot)
+
+    def _pick(_key, candidates, fallback=None, incumbent=None, identities=None):
+        assert [name for name, _fn in candidates] == ["asm"]
+        assert fallback == incumbent == "asm"
+        assert set(identities) == {"asm"}
+        return "asm"
+
+    monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
+    try:
+        assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "asm"
+    finally:
+        mxfp4_autotune.clear()
+        linear_mod._mxfp4_legality_cache.clear()
+        linear_mod._mxfp4_resolved_backend_cache.clear()
+
+
+def test_mxfp4_cached_asm_is_dropped_when_tuned_row_changes(monkeypatch):
+    """A later non-ASM tuned row cannot inherit an earlier ``asm`` decision."""
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    key = (32, 64, 256)
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+    row = {
+        "kernelName": "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+        "splitK": 0,
+    }
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", lambda *_args: None)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_asm_ok", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_preshuffle_ok", False)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_flydsl_ok", False)
+    monkeypatch.setattr(quantize_ops, "triton_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_asm_config",
+        lambda *_shape: mxfp4_asm.validate_tuned_entry(row, key[2], "gfx950"),
+    )
+    def _snapshot(*shape):
+        config = linear_mod._mxfp4_asm_config(*shape)
+        identity = linear_mod._mxfp4_asm_identity(config) if config else None
+        return mxfp4_asm.RuntimeSnapshot(
+            "gfx950",
+            256,
+            config,
+            ("test-row", repr(row)),
+            tuple(identity.items()) if identity is not None else None,
+            True,
+        )
+
+    monkeypatch.setattr(mxfp4_asm, "runtime_snapshot", _snapshot)
+    try:
+        assert linear_mod._mxfp4_backend_legality(key, a, w)[0]
+        mxfp4_autotune._choice[key] = "asm"
+        mxfp4_autotune._profiles[key] = {
+            "winner": "asm",
+            "incumbent": "asm",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {"asm": 1.0},
+            "identities": {"asm": linear_mod._mxfp4_asm_identity((row["kernelName"], 0))},
+        }
+        assert mxfp4_autotune.cached_profile_supports(
+            key,
+            "asm",
+            expected_identities={
+                "asm": linear_mod._mxfp4_asm_identity((row["kernelName"], 0))
+            },
+            required_incumbent="asm",
+        )
+
+        row = {"kernelName": "unapproved_implementation", "splitK": 0}
+
+        def _pick(
+            _key, candidates, fallback=None, incumbent=None, identities=None
+        ):
+            assert [name for name, _fn in candidates] == ["plain"]
+            assert fallback == incumbent == "plain"
+            assert identities["plain"]["implementation"] == "triton"
+            return "plain"
+
+        monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
+        assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "plain"
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune.clear()
+        linear_mod._mxfp4_legality_cache.clear()
+
+
+def test_mxfp4_cached_flydsl_requires_profile_evidence(monkeypatch):
+    """A backend label alone cannot opt a shape into an unprofiled FlyDSL kernel."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", lambda *_args: None)
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_backend_legality",
+        lambda *_args: (False, False, (name,)),
+    )
+    try:
+        mxfp4_autotune._choice[key] = name
+
+        def _pick(
+            _key, candidates, fallback=None, incumbent=None, identities=None
+        ):
+            assert [candidate for candidate, _fn in candidates] == [name, "plain"]
+            assert fallback == incumbent == "plain"
+            return "plain"
+
+        monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
+        assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "plain"
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune.clear()
+        linear_mod._mxfp4_legality_cache.clear()
+
+
+@pytest.mark.parametrize(
+    "old_symbol,old_split,new_symbol",
+    [
+        (
+            "_ZN5aiter41f4gemm_bf16_per1x32Fp4_BpreShuffle_64x128E",
+            0,
+            "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E",
+        ),
+        (
+            "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+            1,
+            "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_256x256E",
+        ),
+    ],
+    ids=["symbol", "split_k"],
+)
+def test_mxfp4_cached_asm_is_reprofiled_when_identity_changes(
+    monkeypatch, old_symbol, old_split, new_symbol
+):
+    """The ASM symbol and split-K are both part of its performance identity."""
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    key = (32, 64, 256)
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+    config = (new_symbol, 0)
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", lambda *_args: None)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_asm_ok", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_preshuffle_ok", False)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_flydsl_ok", False)
+    monkeypatch.setattr(quantize_ops, "triton_arch", lambda: "gfx950")
+    monkeypatch.setattr(linear_mod, "_mxfp4_asm_config", lambda *_shape: config)
+    identity = mxfp4_asm.identity(config, "gfx950")
+    monkeypatch.setattr(
+        mxfp4_asm,
+        "runtime_snapshot",
+        lambda *_shape: mxfp4_asm.RuntimeSnapshot(
+            "gfx950",
+            256,
+            config,
+            ("test-config", config),
+            tuple(identity.items()) if identity is not None else None,
+            True,
+        ),
+    )
+    try:
+        mxfp4_autotune._choice[key] = "asm"
+        mxfp4_autotune._profiles[key] = {
+            "winner": "asm",
+            "incumbent": "asm",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {"asm": 1.0},
+            "identities": {
+                "asm": mxfp4_asm.identity(
+                    (old_symbol, old_split), "gfx950"
+                )
+            },
+        }
+
+        def _pick(
+            _key, candidates, fallback=None, incumbent=None, identities=None
+        ):
+            assert [name for name, _fn in candidates] == ["asm", "plain"]
+            assert incumbent == "asm"
+            assert identities["asm"]["kernel_name"] == new_symbol
+            return "asm"
+
+        monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
+        assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "asm"
+        assert mxfp4_autotune.cached(key) is None
+    finally:
+        mxfp4_autotune.clear()
+        linear_mod._mxfp4_legality_cache.clear()
+
+
+def test_mxfp4_cached_flydsl_requires_exact_identity_and_asm_race():
+    """A FlyDSL replay proves both its tile and the ASM incumbent it beat."""
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    flydsl_identity = flydsl_mxfp4.config_identity(flydsl_mxfp4.get_config(name))
+    asm_symbol = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E"
+    asm_identity = mxfp4_asm.identity((asm_symbol, 0), "gfx950")
+    assert asm_identity is not None
+    profile = {
+        "winner": name,
+        "incumbent": "asm",
+        "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+        "timings_ms": {"asm": 1.0, name: 0.94},
+        "validation": {name: "passed against asm"},
+        "identities": {"asm": asm_identity, name: flydsl_identity},
+        "confirmation": {
+            "challenger": name,
+            "status": "passed",
+            "winner": name,
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timed_rounds": mxfp4_autotune._balanced_round_count(
+                mxfp4_autotune._TIMED_ITERS
+            ),
+            "timed_sample_counts": {
+                "asm": mxfp4_autotune._balanced_round_count(
+                    mxfp4_autotune._TIMED_ITERS
+                ),
+                name: mxfp4_autotune._balanced_round_count(
+                    mxfp4_autotune._TIMED_ITERS
+                ),
+            },
+            "timings_ms": {"asm": 1.0, name: 0.94},
+        },
+    }
+
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._choice[key] = name
+        mxfp4_autotune._profiles[key] = profile
+        expected = {"asm": asm_identity, name: flydsl_identity}
+        assert mxfp4_autotune.cached_profile_supports(
+            key,
+            name,
+            expected_identities=expected,
+            required_incumbent="asm",
+        )
+
+        profile["identities"][name] = {**flydsl_identity, "tile_k": 128}
+        assert not mxfp4_autotune.cached_profile_supports(
+            key,
+            name,
+            expected_identities=expected,
+            required_incumbent="asm",
+        )
+
+        profile["identities"][name] = flydsl_identity
+        profile["incumbent"] = "plain"
+        assert not mxfp4_autotune.cached_profile_supports(
+            key,
+            name,
+            expected_identities=expected,
+            required_incumbent="asm",
+        )
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_fused_b_shuffle_requires_replayable_profile(monkeypatch):
+    """A cached label alone must never change the quantizer's B layout."""
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    key = (64, 128, 256)
+    flydsl_name = "flydsl_64x128x256"
+    asm_identity = {"implementation": "asm", "kernel_name": "approved"}
+    flydsl_identity = {
+        "implementation": "flydsl",
+        "source_revision": "tested",
+        "tile_m": 64,
+        "tile_n": 128,
+        "tile_k": 256,
+    }
+    snapshot_state = {
+        "value": mxfp4_asm.RuntimeSnapshot(
+            "gfx950",
+            256,
+            ("approved", 0),
+            ("registry", 1),
+            tuple(asm_identity.items()),
+            True,
+        )
+    }
+    monkeypatch.setattr(
+        quantize_ops, "mxfp4_data_shuffle_supported", lambda *_shape: True
+    )
+    monkeypatch.setattr(
+        mxfp4_asm, "runtime_snapshot", lambda *_shape: snapshot_state["value"]
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_asm_config",
+        lambda *_shape: pytest.fail("performed an independent ASM config read"),
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_asm_identity",
+        lambda _config: pytest.fail("performed an independent ASM identity read"),
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_flydsl_identity",
+        lambda name: flydsl_identity if name == flydsl_name else None,
+    )
+
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._choice[key] = "asm"
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        mxfp4_autotune._profiles[key] = {
+            "winner": "asm",
+            "incumbent": "asm",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {"asm": 1.0},
+            "identities": {"asm": asm_identity},
+        }
+        assert linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        mxfp4_autotune._choice[key] = flydsl_name
+        mxfp4_autotune._profiles.pop(key)
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        # Exact 5% boundary: 1 / 1.05 is sufficient, anything slower is not.
+        mxfp4_autotune._profiles[key] = {
+            "winner": flydsl_name,
+            "incumbent": "asm",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {
+                "asm": 1.0,
+                flydsl_name: 1.0 / mxfp4_autotune._SWITCH_MARGIN,
+            },
+            "validation": {flydsl_name: "passed against asm"},
+            "identities": {
+                "asm": asm_identity,
+                flydsl_name: flydsl_identity,
+            },
+            "confirmation": {
+                "challenger": flydsl_name,
+                "status": "passed",
+                "winner": flydsl_name,
+                "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+                "timed_rounds": mxfp4_autotune._balanced_round_count(
+                    mxfp4_autotune._TIMED_ITERS
+                ),
+                "timed_sample_counts": {
+                    "asm": mxfp4_autotune._balanced_round_count(
+                        mxfp4_autotune._TIMED_ITERS
+                    ),
+                    flydsl_name: mxfp4_autotune._balanced_round_count(
+                        mxfp4_autotune._TIMED_ITERS
+                    ),
+                },
+                "timings_ms": {
+                    "asm": 1.0,
+                    flydsl_name: 1.0 / mxfp4_autotune._SWITCH_MARGIN,
+                },
+            },
+        }
+        assert linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        mxfp4_autotune._profiles[key]["timings_ms"][flydsl_name] = 0.96
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        # The Triton preshuffle layout is equally irreversible. A cached label
+        # alone is insufficient, and an exact measured identity is required.
+        snapshot_state["value"] = mxfp4_asm.RuntimeSnapshot(
+            "gfx950", 256, None, ("registry", 2), None, True
+        )
+        mxfp4_autotune._choice[key] = "shuffled"
+        mxfp4_autotune._profiles.pop(key)
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        shuffled_identity = linear_mod._mxfp4_triton_identity("shuffled")
+        mxfp4_autotune._profiles[key] = {
+            "winner": "shuffled",
+            "incumbent": "shuffled",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {"shuffled": 1.0},
+            "identities": {"shuffled": shuffled_identity},
+        }
+        assert linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        mxfp4_autotune._profiles[key]["identities"]["shuffled"] = {
+            "implementation": "triton",
+            "entrypoint": "different_kernel",
+        }
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+
+        snapshot_state["value"] = mxfp4_asm.RuntimeSnapshot(
+            "unknown", 0, None, ("discovery-failed",), None, False
+        )
+        assert not linear_mod._mxfp4_can_fuse_b_shuffle(key, 128, 128)
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_cached_flydsl_is_reprofiled_when_asm_appears(monkeypatch):
+    """A FlyDSL-vs-Triton result cannot bypass a newly available ASM entry."""
+    from lumen.ops.quantize import linear as linear_mod
+    from lumen.ops.quantize import ops as quantize_ops
+
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    a = torch.empty((key[0], key[2] // 2), dtype=torch.uint8)
+    w = torch.empty((key[1], key[2] // 2), dtype=torch.uint8)
+    asm_symbol = "_ZN5aiter42f4gemm_bf16_per1x32Fp4_BpreShuffle_128x256E"
+
+    mxfp4_autotune.clear()
+    linear_mod._mxfp4_legality_cache.clear()
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_probed", True)
+    monkeypatch.setattr(linear_mod, "_fast_mxfp4_gemm_fn", lambda *_args: None)
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_backend_legality",
+        lambda *_args: (True, False, (name,)),
+    )
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_asm_config",
+        lambda *_shape: (asm_symbol, 0),
+    )
+    monkeypatch.setattr(quantize_ops, "triton_arch", lambda: "gfx950")
+    asm_identity = mxfp4_asm.identity((asm_symbol, 0), "gfx950")
+    monkeypatch.setattr(
+        mxfp4_asm,
+        "runtime_snapshot",
+        lambda *_shape: mxfp4_asm.RuntimeSnapshot(
+            "gfx950",
+            256,
+            (asm_symbol, 0),
+            ("test-config", asm_symbol, 0),
+            tuple(asm_identity.items()) if asm_identity is not None else None,
+            True,
+        ),
+    )
+    try:
+        mxfp4_autotune._choice[key] = name
+        mxfp4_autotune._profiles[key] = {
+            "winner": name,
+            "incumbent": "plain",
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timings_ms": {"plain": 1.0, name: 0.9},
+            "validation": {name: "passed against plain"},
+            "identities": {
+                "plain": {
+                    "implementation": "triton",
+                    "entrypoint": "gemm_afp4wfp4",
+                },
+                name: linear_mod._mxfp4_flydsl_identity(name),
+            },
+        }
+
+        def _pick(
+            _key, candidates, fallback=None, incumbent=None, identities=None
+        ):
+            assert [candidate for candidate, _fn in candidates] == [
+                "asm",
+                name,
+                "plain",
+            ]
+            assert incumbent == "asm"
+            assert identities["asm"]["kernel_name"] == asm_symbol
+            return "asm"
+
+        monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
+        assert linear_mod._mxfp4_choose_backend(a, w, None, None) == "asm"
+        assert mxfp4_autotune.cached(key) is None
     finally:
         mxfp4_autotune.clear()
         linear_mod._mxfp4_legality_cache.clear()
@@ -2236,12 +4118,20 @@ def test_mxfp4_remeasure_excludes_plain_for_shuffled_weight(monkeypatch):
     linear_mod._mxfp4_legality_cache.clear()
     try:
         mxfp4_autotune._choice[key] = "asm"
-        monkeypatch.setattr(linear_mod, "_mxfp4_backend_legality", lambda k, x, y: (False, True))
+        monkeypatch.setattr(
+            linear_mod,
+            "_mxfp4_backend_legality",
+            lambda k, x, y, *_rest: (False, True, ()),
+        )
         monkeypatch.setattr(linear_mod, "_mxfp4_preshuffle_eligible", lambda x, y: False)
 
-        def _pick(_key, candidates, fallback=None):
+        def _pick(
+            _key, candidates, fallback=None, incumbent=None, identities=None
+        ):
             assert [name for name, _fn in candidates] == ["shuffled"]
             assert fallback == "shuffled"
+            assert incumbent == "shuffled"
+            assert identities["shuffled"]["implementation"] == "triton"
             return "shuffled"
 
         monkeypatch.setattr(linear_mod.mxfp4_autotune, "pick_backend", _pick)
@@ -2249,6 +4139,40 @@ def test_mxfp4_remeasure_excludes_plain_for_shuffled_weight(monkeypatch):
     finally:
         mxfp4_autotune.clear()
         linear_mod._mxfp4_legality_cache.clear()
+
+
+def test_mxfp4_dispatch_launches_the_validated_asm_snapshot(monkeypatch):
+    """The direct launch cannot re-read a different tuned-table config."""
+    from lumen.ops.quantize import linear as linear_mod
+
+    M, N, K = 32, 64, 256
+    a = torch.empty((M, K // 2), dtype=torch.uint8)
+    w = torch.empty((N, K // 2), dtype=torch.uint8)
+    scale_a = torch.empty((M, K // 32), dtype=torch.uint8)
+    scale_w = torch.empty((N, K // 32), dtype=torch.uint8)
+    config = ("validated-symbol", 2)
+    snapshot = mxfp4_asm.RuntimeSnapshot(
+        "gfx950", 256, config, ("files", 1), None, True
+    )
+    resolution = linear_mod._MXFP4BackendResolution(
+        "asm", snapshot, True, False, ()
+    )
+    launched = []
+    output = object()
+
+    monkeypatch.setattr(linear_mod, "_FAST_QUANT_DISPATCH", True)
+    monkeypatch.setattr(linear_mod, "_mxfp4_probe_backends", lambda: True)
+    monkeypatch.setattr(
+        linear_mod, "_mxfp4_resolve_backend", lambda *_args, **_kwargs: resolution
+    )
+
+    def _launch(*_args, asm_config=None):
+        launched.append(asm_config)
+        return output
+
+    monkeypatch.setattr(linear_mod, "_gemm_mxfp4_aiter_asm", _launch)
+    assert linear_mod.gemm_mxfp4_dispatch(a, w, scale_a, scale_w) is output
+    assert launched == [config]
 
 
 def test_mxfp4_dispatch_fallback_lock_is_scoped_to_shape(monkeypatch):
@@ -2260,7 +4184,19 @@ def test_mxfp4_dispatch_fallback_lock_is_scoped_to_shape(monkeypatch):
     monkeypatch.setattr(dispatch_mod, "_SKIP_BACKEND_SYNC", True)
     monkeypatch.setattr(linear_mod, "_FAST_QUANT_DISPATCH", False)
     monkeypatch.setattr(linear_mod, "_mxfp4_probe_backends", lambda: True)
-    monkeypatch.setattr(linear_mod, "_mxfp4_choose_backend", lambda *_args: "plain")
+    monkeypatch.setattr(
+        linear_mod,
+        "_mxfp4_resolve_backend",
+        lambda *_args, **_kwargs: linear_mod._MXFP4BackendResolution(
+            "plain",
+            mxfp4_asm.RuntimeSnapshot(
+                "gfx950", 256, None, ("test",), None, True
+            ),
+            False,
+            False,
+            (),
+        ),
+    )
 
     bad_m, good_m, n, k = 32, 64, 64, 128
     bad_a = torch.empty((bad_m, k // 2), dtype=torch.uint8)
@@ -2506,3 +4442,731 @@ def test_mxfp4_roundtrip_quant_dequant_vs_torchao_roundtrip(shape):
     x_deq_torchao = mx_ref.dequantize(torch.float32)
 
     torch.testing.assert_close(x_deq_lumen.cpu(), x_deq_torchao, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "rank,should_write",
+    [(None, True), ("0", True), ("1", False), ("not-a-rank", True)],
+    ids=["no-rank", "rank-zero", "rank-one", "invalid-rank"],
+)
+def test_mxfp4_autotune_cache_has_one_distributed_writer(
+    tmp_path, monkeypatch, rank, should_write
+):
+    """Only parseable nonzero global ranks skip the shared cache write."""
+    cache = tmp_path / "autotune.json"
+    original_path = mxfp4_autotune._CACHE_PATH
+    mxfp4_autotune.clear()
+    mxfp4_autotune._CACHE_PATH = str(cache)
+    if rank is None:
+        monkeypatch.delenv("RANK", raising=False)
+    else:
+        monkeypatch.setenv("RANK", rank)
+    monkeypatch.setattr(mxfp4_autotune, "_arch", lambda: "gfx950")
+    monkeypatch.setattr(mxfp4_autotune, "_backend_fingerprint", lambda: "backends")
+    monkeypatch.setattr(mxfp4_autotune, "_runtime_metadata", lambda: {})
+    monkeypatch.setattr(
+        mxfp4_autotune, "_tuned_table_fingerprint", lambda: "tables"
+    )
+    try:
+        mxfp4_autotune._choice[(64, 128, 256)] = "asm"
+        mxfp4_autotune._cache_dirty = True
+        mxfp4_autotune._save_cache()
+        assert cache.exists() is should_write
+        if should_write:
+            assert json.loads(cache.read_text())["choices"] == {
+                "64,128,256": "asm"
+            }
+    finally:
+        mxfp4_autotune._CACHE_PATH = original_path
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_fingerprint_tracks_lumen_wrapper_sources(monkeypatch):
+    """Wrapper or selection-policy edits must invalidate old timing evidence."""
+    hashes = {
+        "mxfp4_autotune.py": "autotune-v1",
+        "linear.py": "linear-v1",
+    }
+    monkeypatch.setattr(mxfp4_autotune, "_runtime_metadata", lambda: {})
+    monkeypatch.setattr(mxfp4_asm, "registry_fingerprint", lambda: "asm-registry")
+    monkeypatch.setattr(
+        flydsl_mxfp4, "backend_fingerprint", lambda: "flydsl-backend"
+    )
+    monkeypatch.setattr(
+        mxfp4_autotune,
+        "_file_sha256",
+        lambda path: hashes[os.path.basename(path)],
+    )
+
+    original = mxfp4_autotune._backend_fingerprint()
+    hashes["linear.py"] = "linear-v2"
+    assert mxfp4_autotune._backend_fingerprint() != original
+
+    hashes["linear.py"] = "linear-v1"
+    hashes["mxfp4_autotune.py"] = "autotune-v2"
+    assert mxfp4_autotune._backend_fingerprint() != original
+
+
+@pytest.mark.parametrize(
+    "iterations,expected",
+    [
+        (3, ["a", "b", "c", "c", "b", "a", "a", "b", "c"]),
+        (
+            4,
+            [
+                "a",
+                "b",
+                "c",
+                "c",
+                "b",
+                "a",
+                "a",
+                "b",
+                "c",
+                "c",
+                "b",
+                "a",
+            ],
+        ),
+    ],
+    ids=["odd-iterations", "even-iterations"],
+)
+def test_mxfp4_autotune_alternates_timed_candidate_order(
+    monkeypatch, iterations, expected
+):
+    """Timed rounds alternate canonical/reverse order without changing ties."""
+    calls = []
+
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            return 1.0
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 0)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", iterations)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", lambda: None)
+
+    candidates = [
+        (name, lambda name=name: calls.append(name)) for name in ("a", "b", "c")
+    ]
+    winner, timings, _reason, _validation = mxfp4_autotune._measure(
+        (1, 1, 1), candidates
+    )
+    assert calls == expected
+    assert winner == "a"
+    assert list(timings) == ["a", "b", "c"]
+
+
+def test_mxfp4_autotune_timed_failure_preserves_canonical_live_order(monkeypatch):
+    """A reverse-round failure must not reverse the next round's live list."""
+    calls = []
+    counts = {name: 0 for name in ("a", "b", "c")}
+
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            return 1.0
+
+    def candidate(name):
+        def run():
+            calls.append(name)
+            counts[name] += 1
+            if name == "b" and counts[name] == 2:
+                raise RuntimeError("timed failure")
+
+        return run
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 0)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", 4)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", lambda: None)
+
+    candidates = [(name, candidate(name)) for name in ("a", "b", "c")]
+    winner, timings, _reason, _validation = mxfp4_autotune._measure(
+        (1, 1, 1), candidates
+    )
+    assert calls == ["a", "b", "c", "c", "b", "a", "a", "c", "c", "a"]
+    assert winner == "a"
+    assert list(timings) == ["a", "c"]
+
+
+def test_mxfp4_autotune_alternates_warmup_and_removes_failures(monkeypatch):
+    """Warmup alternates order and keeps a canonical list after a failure."""
+    calls = []
+    counts = {name: 0 for name in ("a", "b", "c")}
+    synchronizations = 0
+
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            return 1.0
+
+    def candidate(name):
+        def run():
+            calls.append(name)
+            counts[name] += 1
+            if name == "b" and counts[name] == 2:
+                raise RuntimeError("warmup failure")
+
+        return run
+
+    def synchronize():
+        nonlocal synchronizations
+        synchronizations += 1
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 3)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", 1)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", synchronize)
+
+    candidates = [(name, candidate(name)) for name in ("a", "b", "c")]
+    winner, timings, _reason, _validation = mxfp4_autotune._measure(
+        (1, 1, 1), candidates
+    )
+    assert calls == ["a", "b", "c", "c", "b", "a", "a", "c", "a", "c"]
+    assert synchronizations == len(calls) - 1
+    assert winner == "a"
+    assert list(timings) == ["a", "c"]
+
+
+def _run_mxfp4_pairwise_gate_stub(monkeypatch, confirmation_fly_time):
+    flydsl_name = "flydsl_64x128x256"
+    calls = []
+    current = {"name": None}
+    timed_counts = {"asm": 0, flydsl_name: 0}
+
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            name = current["name"]
+            timed_counts[name] += 1
+            if timed_counts[name] <= 3:
+                return 100.0 if name == "asm" else 94.0
+            return 100.0 if name == "asm" else confirmation_fly_time
+
+    def candidate(name):
+        def run():
+            current["name"] = name
+            calls.append(name)
+
+        return run
+
+    monkeypatch.setattr(
+        mxfp4_autotune,
+        "_validate_flydsl_candidates",
+        lambda _key, candidates, _incumbent: (
+            list(candidates),
+            {flydsl_name: "passed against asm"},
+        ),
+    )
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 0)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", 3)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", lambda: None)
+    evidence = {}
+    result = mxfp4_autotune._measure(
+        (64, 128, 256),
+        [("asm", candidate("asm")), (flydsl_name, candidate(flydsl_name))],
+        incumbent="asm",
+        profile_evidence=evidence,
+    )
+    return flydsl_name, calls, evidence, result
+
+
+def test_mxfp4_autotune_pairwise_rejects_boundary_initial_win(monkeypatch):
+    """A noisy full-list win cannot replace ASM when balanced ABBA disagrees."""
+    flydsl_name, calls, evidence, result = _run_mxfp4_pairwise_gate_stub(
+        monkeypatch, confirmation_fly_time=97.0
+    )
+    winner, timings, reason, _validation = result
+    confirmation = evidence["confirmation"]
+
+    assert timings == {"asm": 100.0, flydsl_name: 94.0}
+    assert winner == "asm"
+    assert "did not clear" in reason
+    assert confirmation["status"] == "rejected"
+    assert confirmation["timings_ms"] == {"asm": 100.0, flydsl_name: 97.0}
+    assert confirmation["timed_rounds"] == 4
+    assert confirmation["timed_sample_counts"] == {"asm": 4, flydsl_name: 4}
+    assert calls[-8:] == [
+        "asm",
+        flydsl_name,
+        flydsl_name,
+        "asm",
+        "asm",
+        flydsl_name,
+        flydsl_name,
+        "asm",
+    ]
+
+
+def test_mxfp4_autotune_pairwise_accepts_confirmed_win(monkeypatch):
+    """A FlyDSL challenger replaces ASM only when balanced ABBA confirms it."""
+    flydsl_name, _calls, evidence, result = _run_mxfp4_pairwise_gate_stub(
+        monkeypatch, confirmation_fly_time=94.0
+    )
+    winner, _timings, reason, _validation = result
+    confirmation = evidence["confirmation"]
+
+    assert winner == flydsl_name
+    assert "cleared" in reason
+    assert confirmation["status"] == "passed"
+    assert confirmation["winner"] == flydsl_name
+
+
+def test_mxfp4_autotune_pairwise_odd_count_has_position_neutral_median(
+    monkeypatch,
+):
+    """An 81-iteration request becomes 82 balanced samples with a true median."""
+    flydsl_name = "flydsl_64x128x256"
+    calls = []
+    current = {"name": None, "position": None}
+
+    class FakeEvent:
+        def __init__(self, enable_timing=False):
+            assert enable_timing
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, _end):
+            if current["name"] == "asm":
+                return 90.0 if current["position"] == 0 else 110.0
+            return 80.0 if current["position"] == 0 else 100.0
+
+    def candidate(name):
+        def run():
+            current["name"] = name
+            current["position"] = len(calls) % 2
+            calls.append(name)
+
+        return run
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 0)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", 81)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "Event", FakeEvent)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", lambda: None)
+
+    winner, confirmation = mxfp4_autotune._confirm_asm_flydsl(
+        (64, 128, 256),
+        ("asm", candidate("asm")),
+        (flydsl_name, candidate(flydsl_name)),
+    )
+    assert winner == flydsl_name
+    assert confirmation["timed_rounds"] == 82
+    assert confirmation["timed_sample_counts"] == {"asm": 82, flydsl_name: 82}
+    assert confirmation["timings_ms"] == {"asm": 100.0, flydsl_name: 90.0}
+    for name in ("asm", flydsl_name):
+        positions = [index % 2 for index, call in enumerate(calls) if call == name]
+        assert positions.count(0) == positions.count(1) == 41
+
+
+def test_mxfp4_autotune_profile_persists_pairwise_evidence(monkeypatch):
+    """The cached profile retains the independent timings and decision reason."""
+    key = (64, 128, 256)
+    flydsl_name = "flydsl_64x128x256"
+    confirmation = {
+        "challenger": flydsl_name,
+        "status": "passed",
+        "winner": flydsl_name,
+        "reason": "pairwise confirmation cleared 1.050x margin",
+        "timings_ms": {"asm": 100.0, flydsl_name: 94.0},
+        "timed_sample_counts": {"asm": 4, flydsl_name: 4},
+    }
+
+    def measure(_key, _candidates, incumbent=None, profile_evidence=None):
+        assert incumbent == "asm"
+        profile_evidence["confirmation"] = confirmation
+        return (
+            flydsl_name,
+            {"asm": 100.0, flydsl_name: 94.0},
+            confirmation["reason"],
+            {flydsl_name: "passed against asm"},
+        )
+
+    monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+    monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+    monkeypatch.setattr(mxfp4_autotune, "_measure", measure)
+    mxfp4_autotune.clear()
+    mxfp4_autotune._cache_loaded = True
+    try:
+        chosen = mxfp4_autotune.pick_backend(
+            key,
+            [("asm", lambda: None), (flydsl_name, lambda: None)],
+            fallback="asm",
+            incumbent="asm",
+        )
+        assert chosen == flydsl_name
+        assert mxfp4_autotune._profiles[key]["confirmation"] == confirmation
+        assert mxfp4_autotune._profiles[key]["reason"] == confirmation["reason"]
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_autotune_pairwise_failure_is_fail_closed(monkeypatch):
+    """Any failure during the independent race retains the ASM incumbent."""
+    flydsl_name = "flydsl_64x128x256"
+    calls = []
+    flydsl_calls = 0
+
+    def asm():
+        calls.append("asm")
+
+    def flydsl():
+        nonlocal flydsl_calls
+        flydsl_calls += 1
+        calls.append(flydsl_name)
+        if flydsl_calls == 2:
+            raise RuntimeError("injected confirmation failure")
+
+    monkeypatch.setattr(mxfp4_autotune, "_WARMUP_ITERS", 1)
+    monkeypatch.setattr(mxfp4_autotune, "_TIMED_ITERS", 3)
+    monkeypatch.setattr(mxfp4_autotune.torch.cuda, "synchronize", lambda: None)
+
+    winner, confirmation = mxfp4_autotune._confirm_asm_flydsl(
+        (64, 128, 256),
+        ("asm", asm),
+        (flydsl_name, flydsl),
+    )
+    assert calls == ["asm", flydsl_name, flydsl_name]
+    assert winner == "asm"
+    assert confirmation["status"] == "failed"
+    assert confirmation["failed_backend"] == flydsl_name
+    assert confirmation["failed_phase"] == "warmup"
+    assert confirmation["winner"] == "asm"
+
+
+def _mxfp4_unanimous_consensus_profile(
+    name="flydsl_64x128x256", device_count=8, worst_ratio=0.94
+):
+    samples = mxfp4_autotune._balanced_round_count(
+        mxfp4_autotune._TIMED_ITERS
+    )
+    identities = {
+        "asm": {"implementation": "asm", "kernel_name": "approved"},
+        name: {"implementation": "flydsl", "config": name},
+    }
+    return {
+        "winner": name,
+        "incumbent": "asm",
+        "identities": identities,
+        "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+        "timings_ms": {"asm": 1.0, name: 0.94},
+        "validation": {name: "passed against asm"},
+        "confirmation": {
+            "challenger": name,
+            "status": "passed",
+            "winner": name,
+            "switch_margin": mxfp4_autotune._SWITCH_MARGIN,
+            "timed_rounds": samples,
+            "timed_sample_counts": {"asm": samples, name: samples},
+            "timings_ms": {"asm": 1.0, name: 0.94},
+        },
+        "decision_scope": mxfp4_autotune._CONSENSUS_SCOPE,
+        "profile_device_count": device_count,
+        "consensus": {
+            "policy": "unanimous",
+            "backend": name,
+            "arch": "gfx950",
+            "device_count": device_count,
+            "correctness": {"passed": device_count, "total": device_count},
+            "gate": {"passed": device_count, "total": device_count},
+            "worst_ratio": worst_ratio,
+        },
+    }
+
+
+def _write_mxfp4_consensus_cache(cache, profile, key=(64, 128, 256)):
+    cache.write_text(
+        json.dumps(
+            {
+                "schema": mxfp4_autotune._CACHE_SCHEMA,
+                "arch": "gfx950",
+                "decision_scope": mxfp4_autotune._CONSENSUS_SCOPE,
+                "profile_device_count": 8,
+                "backends": "backends",
+                "tuned_tables": "tables",
+                "choices": {mxfp4_autotune._cache_key(key): profile["winner"]},
+                "profiles": {mxfp4_autotune._cache_key(key): profile},
+            }
+        )
+    )
+
+
+def test_mxfp4_multigpu_cold_cache_keeps_and_caches_protected_asm(monkeypatch):
+    """Ranks do not independently profile a FlyDSL promotion without consensus."""
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    identities = {
+        "asm": {"implementation": "asm", "kernel_name": "approved"},
+        name: {"implementation": "flydsl", "config": name},
+    }
+    calls = []
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", raising=False)
+    monkeypatch.setattr(mxfp4_autotune, "_CACHE_PATH", "")
+    monkeypatch.setattr(
+        mxfp4_autotune,
+        "_measure",
+        lambda *_args, **_kwargs: pytest.fail("multi-GPU cold path profiled"),
+    )
+    mxfp4_autotune.clear()
+    mxfp4_autotune._cache_loaded = True
+    try:
+        candidates = [
+            ("asm", lambda: calls.append("asm")),
+            (name, lambda: calls.append(name)),
+        ]
+        assert mxfp4_autotune.pick_backend(
+            key,
+            candidates,
+            fallback="asm",
+            incumbent="asm",
+            identities=identities,
+        ) == "asm"
+        assert calls == []
+        assert mxfp4_autotune.cached(key) == "asm"
+        assert mxfp4_autotune.cached_profile_supports(
+            key,
+            "asm",
+            expected_identities={"asm": identities["asm"]},
+            required_incumbent="asm",
+        )
+        # The second call is a true cached hit, not a forget/recreate loop.
+        assert mxfp4_autotune.pick_backend(
+            key,
+            candidates,
+            fallback="asm",
+            incumbent="asm",
+            identities=identities,
+        ) == "asm"
+        assert calls == []
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_multigpu_loads_unanimous_flydsl_consensus(tmp_path, monkeypatch):
+    """A complete 8/8 cache can replay one job-wide FlyDSL decision."""
+    cache = tmp_path / "autotune.json"
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+    profile = _mxfp4_unanimous_consensus_profile(name)
+    _write_mxfp4_consensus_cache(cache, profile, key)
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", raising=False)
+    monkeypatch.setattr(mxfp4_autotune, "_CACHE_PATH", str(cache))
+    monkeypatch.setattr(mxfp4_autotune, "_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        mxfp4_autotune, "_backend_fingerprint", lambda: "backends"
+    )
+    monkeypatch.setattr(
+        mxfp4_autotune, "_tuned_table_fingerprint", lambda: "tables"
+    )
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) == name
+        assert mxfp4_autotune.cached_profile_supports(
+            key,
+            name,
+            expected_identities=profile["identities"],
+            required_incumbent="asm",
+        )
+    finally:
+        mxfp4_autotune.clear()
+
+
+@pytest.mark.parametrize(
+    "invalid",
+    [
+        "missing",
+        "top_scope",
+        "top_device_count",
+        "backend",
+        "arch",
+        "device_count",
+        "entry_device_count",
+        "correctness",
+        "gate",
+        "worst_ratio",
+    ],
+)
+def test_mxfp4_multigpu_rejects_incomplete_flydsl_consensus(
+    tmp_path, monkeypatch, invalid
+):
+    """Missing, partial, or below-margin evidence fails closed before replay."""
+    cache = tmp_path / f"autotune-{invalid}.json"
+    key = (64, 128, 256)
+    profile = _mxfp4_unanimous_consensus_profile()
+    evidence = profile["consensus"]
+    if invalid == "missing":
+        profile.pop("consensus")
+    elif invalid == "backend":
+        evidence["backend"] = "flydsl_wrong_config"
+    elif invalid == "arch":
+        evidence["arch"] = "gfx942"
+    elif invalid == "device_count":
+        evidence["device_count"] = 7
+    elif invalid == "entry_device_count":
+        profile["profile_device_count"] = 7
+    elif invalid == "correctness":
+        evidence["correctness"]["passed"] = 7
+    elif invalid == "gate":
+        evidence["gate"]["passed"] = 7
+    elif invalid == "worst_ratio":
+        evidence["worst_ratio"] = 1.0 / mxfp4_autotune._SWITCH_MARGIN + 1e-6
+    elif invalid not in ("top_scope", "top_device_count"):
+        raise AssertionError(f"unhandled invalid consensus case: {invalid}")
+    _write_mxfp4_consensus_cache(cache, profile, key)
+    if invalid in ("top_scope", "top_device_count"):
+        blob = json.loads(cache.read_text())
+        if invalid == "top_scope":
+            blob["decision_scope"] = mxfp4_autotune._SINGLE_DEVICE_SCOPE
+        else:
+            blob["profile_device_count"] = 7
+        cache.write_text(json.dumps(blob))
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", raising=False)
+    monkeypatch.setattr(mxfp4_autotune, "_CACHE_PATH", str(cache))
+    monkeypatch.setattr(mxfp4_autotune, "_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        mxfp4_autotune, "_backend_fingerprint", lambda: "backends"
+    )
+    monkeypatch.setattr(
+        mxfp4_autotune, "_tuned_table_fingerprint", lambda: "tables"
+    )
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune.cached(key) is None
+        assert mxfp4_autotune.cached_profile(key) is None
+    finally:
+        mxfp4_autotune.clear()
+
+
+def test_mxfp4_multigpu_consensus_survives_local_asm_fallback(
+    tmp_path, monkeypatch
+):
+    """Adding a missing-shape ASM choice cannot invalidate loaded consensus."""
+    cache = tmp_path / "autotune.json"
+    consensus_key = (64, 128, 256)
+    fallback_key = (128, 256, 512)
+    name = "flydsl_64x128x256"
+    profile = _mxfp4_unanimous_consensus_profile(name)
+    _write_mxfp4_consensus_cache(cache, profile, consensus_key)
+
+    monkeypatch.setenv("WORLD_SIZE", "8")
+    monkeypatch.delenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", raising=False)
+    monkeypatch.setattr(mxfp4_autotune, "_CACHE_PATH", str(cache))
+    monkeypatch.setattr(mxfp4_autotune, "_arch", lambda: "gfx950")
+    monkeypatch.setattr(
+        mxfp4_autotune, "_backend_fingerprint", lambda: "backends"
+    )
+    monkeypatch.setattr(
+        mxfp4_autotune, "_tuned_table_fingerprint", lambda: "tables"
+    )
+    monkeypatch.setattr(mxfp4_autotune, "_runtime_metadata", lambda: {})
+    mxfp4_autotune.clear()
+    try:
+        mxfp4_autotune._load_cache()
+        assert mxfp4_autotune._remember_protected_asm(
+            fallback_key, {"asm": {"implementation": "asm"}}
+        ) == "asm"
+        assert mxfp4_autotune._cache_decision_scope == (
+            mxfp4_autotune._CONSENSUS_SCOPE
+        )
+        assert mxfp4_autotune._cache_profile_device_count == 8
+        assert mxfp4_autotune.cached_profile_supports(
+            consensus_key,
+            name,
+            expected_identities=profile["identities"],
+            required_incumbent="asm",
+        )
+        mxfp4_autotune._save_cache()
+        persisted = json.loads(cache.read_text())
+        assert persisted["decision_scope"] == mxfp4_autotune._CONSENSUS_SCOPE
+        assert persisted["profile_device_count"] == 8
+        assert persisted["choices"] == {
+            mxfp4_autotune._cache_key(consensus_key): name,
+            mxfp4_autotune._cache_key(fallback_key): "asm",
+        }
+    finally:
+        mxfp4_autotune.clear()
+        assert mxfp4_autotune._cache_decision_scope == (
+            mxfp4_autotune._SINGLE_DEVICE_SCOPE
+        )
+        assert mxfp4_autotune._cache_profile_device_count == 1
+
+
+@pytest.mark.parametrize(
+    "world_size,override",
+    [("1", None), ("8", "0")],
+    ids=["single-device", "explicit-multigpu-override"],
+)
+def test_mxfp4_online_autotune_behavior_is_preserved_when_consensus_not_required(
+    monkeypatch, world_size, override
+):
+    """Single-device profiling and the explicit escape hatch keep old behavior."""
+    key = (64, 128, 256)
+    name = "flydsl_64x128x256"
+
+    def measure(_key, _candidates, incumbent=None, profile_evidence=None):
+        assert incumbent == "asm"
+        profile_evidence["confirmation"] = {
+            "status": "passed",
+            "winner": name,
+        }
+        return (
+            name,
+            {"asm": 1.0, name: 0.9},
+            "pairwise confirmation cleared 1.050x margin",
+            {name: "passed against asm"},
+        )
+
+    monkeypatch.setenv("WORLD_SIZE", world_size)
+    if override is None:
+        monkeypatch.delenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", raising=False)
+    else:
+        monkeypatch.setenv("LUMEN_MXFP4_REQUIRE_CONSENSUS", override)
+    monkeypatch.setattr(mxfp4_autotune, "_CACHE_PATH", "")
+    monkeypatch.setattr(mxfp4_autotune, "AUTOTUNE_ENABLED", True)
+    monkeypatch.setattr(mxfp4_autotune, "_capturing", lambda: False)
+    monkeypatch.setattr(mxfp4_autotune, "_measure", measure)
+    mxfp4_autotune.clear()
+    mxfp4_autotune._cache_loaded = True
+    try:
+        assert mxfp4_autotune.pick_backend(
+            key,
+            [("asm", lambda: None), (name, lambda: None)],
+            fallback="asm",
+            incumbent="asm",
+        ) == name
+        profile = mxfp4_autotune.cached_profile(key)
+        assert profile["decision_scope"] == mxfp4_autotune._SINGLE_DEVICE_SCOPE
+        assert profile["profile_device_count"] == 1
+    finally:
+        mxfp4_autotune.clear()
