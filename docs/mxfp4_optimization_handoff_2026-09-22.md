@@ -57,6 +57,14 @@ commit: 5d7178517e5f3947b7496fa5994696aa2fb9c50d
 和恢复说明。不要把旧的 `35e796da...` 整提交 cherry-pick 到 `e35bb17f4`；两者
 历史并不线性。
 
+`split/gc-freeze-hook` 的 `8badcb9e...` 只包装 Megatron `train_step`，不会作用
+于当前 Qwen FSDP2 训练循环；它还与现有 weight-cache hook 文件发生冲突，不能
+直接合并。若后续测试 GC freeze，应为 FSDP 增加独立 default-off 开关，对 BF16
+和 MXFP4 在相同 completed-step 边界对称执行 `gc.collect(); gc.freeze();
+dist.barrier()`，并把完整计时窗口放在 freeze 之后。测试必须 mock 全局 GC
+调用，并记录 GC pause、freeze count 与 host RSS。历史性能数字不能用于当前
+源码的接受判断。
+
 ## 0. 一分钟结论
 
 本轮目标是让同一训练配置下的 MXFP4 达到 BF16 step 速度的至少
