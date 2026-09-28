@@ -2,6 +2,61 @@
 
 更新时间：2026-09-22（US/Central）
 
+## 2026-09-28 补充：当前阻塞与下一次 fresh campaign
+
+当前本机运行树重新核验为：
+
+```text
+Lumen: /home/xdai/Lumen
+branch: dev/mxfp4
+HEAD: 6b9aee1569247eca20937c14319ba6adcd69e0cb
+tracked diff SHA256: 346860766945762e587bff65b1cbf9486e73ab0f5bd884a86f7fb9fe9527021a
+
+AITER runtime: /home/xdai/aiter
+branch: bench/ecfff3f-lumen
+HEAD: e35bb17f4f815903bf73598facedbb321e15af28
+tracked diff SHA256: a5476078484e426e951c2a5e62233cb20f26c103f93656e02a690e294e9f9aa0
+```
+
+正式 runner 中 BF16/MXFP4 两臂均开启 `--aiter-attn`；当前没有
+`gc.freeze()` 或对应环境开关。Megatron 入口使用 `aiter_csrc` attention，FSDP
+convenience launcher 默认不启用 `--aiter-attn`，但本轮 formal harness 明确启用。
+
+新的 projection-guard campaign 已在 CPU 侧修复并冻结，备份位于本分支：
+
+```text
+recovery/projection_guard_harness_2026-09-28/
+```
+
+正式实验顺序是：
+
+```text
+tail1_a1 -> guard_o_down_b1 -> guard_down_c -> guard_o_down_b2 -> tail1_a2
+```
+
+每臂 50 step，统计 step 11--50。A 是完整最后一层 BF16；B 只保护最后一层
+`o_proj + down_proj`；C 只保护最后一层 `down_proj`；三者均保留 BF16
+`lm_head`。harness 已通过 `bash -n`、analyzer self-test、9/9 unittest、Ruff
+lint/format 和从 `/tmp` 发起的 no-GPU dry-run。它没有产生任何新的速度或 loss
+结果，不能作为性能证据。
+
+2026-09-28 的宿主只读检查显示八张 MI350X 仍被 root-owned vLLM 占用，每卡约
+94--95% VRAM；没有终止这些进程，也没有启动训练。新机器或 GPU 空闲后，先按
+recovery README 恢复精确路径与源码，再运行 `dry-run`，随后只运行 `phase1`。
+必须先审计新 smoke/cache 和 A1/B1/C，才允许执行 `phase2`。
+
+AITER 当前 dirty WIP 的更新 portable backup 已远端核验：
+
+```text
+repository: https://github.com/DaiXindi-AMD/aiter.git
+branch: backup/2026-09-28/ecfff3f-lumen-portable-wip
+commit: 5d7178517e5f3947b7496fa5994696aa2fb9c50d
+```
+
+该分支携带基于精确 `e35bb17f4` 的 Git bundle、17 文件 hash manifest、patch
+和恢复说明。不要把旧的 `35e796da...` 整提交 cherry-pick 到 `e35bb17f4`；两者
+历史并不线性。
+
 ## 0. 一分钟结论
 
 本轮目标是让同一训练配置下的 MXFP4 达到 BF16 step 速度的至少
