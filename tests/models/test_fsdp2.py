@@ -699,6 +699,63 @@ class TestApplyFSDP2:
                 mesh_arg = call.kwargs.get("mesh")
                 assert mesh_arg is mock_mesh.return_value
 
+    @pytest.mark.parametrize(
+        ("linear_fp8", "linear_fp4", "requested", "expected"),
+        [
+            (False, False, None, torch.bfloat16),
+            (False, False, "auto", torch.bfloat16),
+            (False, False, "fp32", torch.float32),
+            (False, True, "auto", torch.float32),
+            (False, True, "bf16", torch.bfloat16),
+            (True, False, "auto", torch.float32),
+        ],
+    )
+    def test_reduce_dtype_policy(
+        self, linear_fp8, linear_fp4, requested, expected
+    ):
+        from lumen.models.fsdp import apply_fsdp2
+
+        model = nn.Sequential(nn.Linear(8, 4))
+        args = argparse.Namespace(
+            linear_fp8=linear_fp8,
+            linear_fp4=linear_fp4,
+            sharding_strategy="full_shard",
+        )
+        if requested is not None:
+            args.fsdp_reduce_dtype = requested
+
+        with patch("torch.distributed.fsdp.fully_shard") as mock_fs, patch(
+            "torch.distributed.device_mesh.init_device_mesh"
+        ) as mock_mesh, patch("lumen.models.fsdp.dist") as mock_dist:
+            mock_dist.get_world_size.return_value = 1
+            mock_mesh.return_value = MagicMock()
+            mock_fs.side_effect = lambda m, **kw: m
+            apply_fsdp2(model, args)
+
+        for call in mock_fs.call_args_list:
+            policy = call.kwargs["mp_policy"]
+            assert policy.param_dtype == torch.bfloat16
+            assert policy.reduce_dtype == expected
+
+    def test_invalid_reduce_dtype_is_rejected(self):
+        from lumen.models.fsdp import apply_fsdp2
+
+        model = nn.Sequential(nn.Linear(8, 4))
+        args = argparse.Namespace(
+            linear_fp8=False,
+            linear_fp4=False,
+            sharding_strategy="full_shard",
+            fsdp_reduce_dtype="fp16",
+        )
+
+        with patch("torch.distributed.fsdp.fully_shard"), patch(
+            "torch.distributed.device_mesh.init_device_mesh"
+        ) as mock_mesh, patch("lumen.models.fsdp.dist") as mock_dist:
+            mock_dist.get_world_size.return_value = 1
+            mock_mesh.return_value = MagicMock()
+            with pytest.raises(ValueError, match="--fsdp-reduce-dtype"):
+                apply_fsdp2(model, args)
+
     def test_no_shard_raises_with_fsdp2(self):
         from lumen.models.fsdp import apply_fsdp2
 

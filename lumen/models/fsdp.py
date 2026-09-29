@@ -625,6 +625,18 @@ def _wrap_params_as_mxfp4_comm(
     return count
 
 
+def _resolve_fsdp_reduce_dtype(args, auto_dtype: torch.dtype) -> torch.dtype:
+    """Resolve the FSDP2 gradient reduction dtype without changing old callers."""
+    value = getattr(args, "fsdp_reduce_dtype", "auto")
+    if value == "auto":
+        return auto_dtype
+    if value == "bf16":
+        return torch.bfloat16
+    if value == "fp32":
+        return torch.float32
+    raise ValueError("--fsdp-reduce-dtype must be one of: auto, bf16, fp32")
+
+
 def apply_fsdp2(
     model: nn.Module,
     args,
@@ -637,7 +649,8 @@ def apply_fsdp2(
 
     Args:
         model: The model to shard.
-        args: CLI arguments (needs ``linear_fp8``, ``sharding_strategy``).
+        args: CLI arguments (needs ``linear_fp8``, ``sharding_strategy``;
+            optionally ``fsdp_reduce_dtype``).
         dp_group: Data-parallel process group (used to derive DeviceMesh size).
 
     Returns:
@@ -675,16 +688,19 @@ def apply_fsdp2(
         # BF16 DTensor and bypasses its all-gather extension. With param_dtype=None
         # each param keeps its own dtype — FP8/FP4 wrappers stay as themselves,
         # LoRA adapters stay BF16.
-        mp_policy = MixedPrecisionPolicy(param_dtype=None, reduce_dtype=torch.float32)
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=None,
+            reduce_dtype=_resolve_fsdp_reduce_dtype(args, torch.float32),
+        )
     elif getattr(args, "linear_fp8", False) or getattr(args, "linear_fp4", False):
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.float32,
+            reduce_dtype=_resolve_fsdp_reduce_dtype(args, torch.float32),
         )
     else:
         mp_policy = MixedPrecisionPolicy(
             param_dtype=torch.bfloat16,
-            reduce_dtype=torch.bfloat16,
+            reduce_dtype=_resolve_fsdp_reduce_dtype(args, torch.bfloat16),
         )
 
     if getattr(args, "lumen_fp8_param_gather", False):

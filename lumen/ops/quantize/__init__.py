@@ -7,7 +7,11 @@
 """Quantization ops — functional API and autograd-aware quantized linear."""
 
 from lumen.ops.quantize.linear import (
+    MXFP4GateUpFunction,
+    MXFP4QKVFunction,
     QuantizedLinearFunction,
+    mxfp4_gate_up_linear,
+    mxfp4_qkv_linear,
     quantized_linear,
 )
 from lumen.ops.quantize.ops import (
@@ -55,6 +59,10 @@ __all__ = [
     "hadamard_quant_mxfp4",
     "swizzle_mxfp4_scale",
     # Quantized linear (autograd)
+    "MXFP4GateUpFunction",
+    "MXFP4QKVFunction",
     "QuantizedLinearFunction",
+    "mxfp4_gate_up_linear",
+    "mxfp4_qkv_linear",
     "quantized_linear",
 ]
