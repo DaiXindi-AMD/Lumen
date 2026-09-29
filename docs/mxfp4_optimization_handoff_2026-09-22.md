@@ -1,42 +1,43 @@
 # Lumen Qwen3-8B MXFP4 训练优化交接
 
-更新时间：2026-09-22（US/Central）
+更新时间：2026-09-29（US/Central；文件名为保持已有链接而保留）
 
 ## 0. 一分钟结论
 
-本轮目标是让同一训练配置下的 MXFP4 达到 BF16 step 速度的至少
-`1.6x`，同时把训练精度损失控制在可接受范围内。
+本轮目标是在相同 Qwen3-8B 训练配置下，让 MXFP4 达到 BF16 step 速度的
+`1.6x`，同时把 validation NLL 回归控制在 `+0.01` 以内。
 
-截至交接时，**目标尚未完成**。不得把任何局部 kernel 加速、profiler
-比例、跨 campaign 点估计或仅 median 达标解释成最终达标。
+截至 2026-09-29，**短程精度门通过，但 1.6x 速度门仍未达到**。当前选定工作策略
+是 Policy A：最后一个完整 Transformer layer 与 `lm_head` 保持 BF16，启用
+packed QKV、split SwiGLU、AITER attention、FSDP2 full-shard、retained
+accumulated parameters、无 activation checkpointing、BF16 reduction。
 
-最强的同 campaign 正式结果来自 MXFP4 `tail0`：
+Fresh `BF16 A1 -> MXFP4 Policy A -> BF16 A2` 正式结果：
 
 | 指标 | 结果 | 门槛 | 判定 |
 |---|---:|---:|:---:|
-| BF16 midpoint mean | `8078.3525 ms` | — | reference |
-| MXFP4 tail0 mean | `5079.4900 ms` | `<=5048.9703 ms` | FAIL |
-| Mean speedup | `1.590387x` | `>=1.6x` | FAIL |
-| Median speedup | `1.607303x` | `>=1.6x` | PASS |
-| Block-4 bootstrap 95% CI | `[1.576344x,1.603899x]` | lower `>=1.6x` | FAIL |
-| BF16 midpoint validation NLL | `7.8817` | — | reference |
-| MXFP4 tail0 validation NLL | `8.0262` | — | FAIL |
-| Delta NLL | `+0.1445` | `<=+0.01` | FAIL |
-| Perplexity delta | about `+15.55%` | — | materially worse |
+| BF16 midpoint mean / median | `8077.2050 / 8062.7750 ms` | — | reference |
+| MXFP4 Policy A mean / median | `5182.0975 / 5114.5500 ms` | — | measured |
+| Mean / median speedup | `1.558675x / 1.576439x` | 两者 `>=1.6x` | FAIL |
+| Block-4 bootstrap 95% CI | `[1.542335x,1.573744x]` | lower `>=1.6x` | FAIL |
+| Paired wins | `40/40` | `>=28/40` | PASS |
+| BF16 midpoint validation NLL | `7.8540` | — | reference |
+| MXFP4 validation NLL | `7.8619` | — | measured |
+| Delta NLL | `+0.00790` | `<=+0.01` | PASS |
 
-因此：
+Policy A 距离 1.6x 的 mean/median 时间目标仍约差 `133.844/75.316 ms/step`；
+长期 `3 seeds x >=200 steps` convergence 尚未运行。`--aiter-attn` 在最终正式
+实验中开启；`gc.freeze()` 没有实现或开启，不能获得任何速度或精度 credit。
 
-- `tail0` 明确否决，不能作为默认精度策略。
-- `tail1` 是当前速度/短程数值表现最好的 whole-layer 候选，但还没有完成
-  同一 fresh campaign 的 BF16/tail1/BF16 最终确认，不能声称达到 `1.6x`。
-- 保守工作策略仍是 `tail2`；但 tail2 同样没有 current-source、同 campaign 的
-  BF16/tail2/BF16 最终确认。“保守”只表示比 tail1/tail0 多保留 BF16 层，不是
-  已证明达到最终速度或长期精度门。`lm_head` 和 input embedding 均保持 BF16。
-- 最后启动的 projection-guard campaign 在 smoke 后因 analyzer 的 shape
-  count 预期错误 fail-closed，未进入正式 A/B/C arms。
-- 用户已要求停止继续优化；本交接只记录状态，不代表恢复实验。
+Projection Policy B/C、full backward fusion 和直接替换为当前 AITER
+standalone dual-layout wrapper 均已正式拒绝。Forward fused SwiGLU 只有约
+`1.037x--1.062x` 的局部 microbenchmark 收益，尚无 E2E/NLL 证据。唯一仍值得
+继续的结构方向是 two-stage backward/row-quant + joint-column redesign。
 
-## 1. 最重要的迁移警告
+本文第 1--19 节保留了 9 月 22 日之前的实验历史；其中“projection formal 未跑”、
+“tail2/tail1 尚待确认”等旧状态已过期。**恢复与继续开发应以第 20 节和本节为准。**
+
+## 1. 9 月 22 日历史迁移快照（最终 Git 交付见 20.1/20.8）
 
 ### 1.1 已建立的远端 recovery snapshots
 
@@ -532,7 +533,7 @@ Stage-1 palindrome：
 artifact：
 `/home/xdai/profile-results/lumen-mxfp4-tail-reduction-fresh-20260921-xxgdel/`
 
-## 7. 最新 fresh profiler 诊断
+## 7. 9 月 22 日历史 profiler 诊断（最新 Policy A profiler 见 20.5）
 
 tail2 profiler campaign 使用 packed QKV、split SwiGLU、BF16 reduction、
 retained accumulated params、no checkpoint 和 BF16 `lm_head`。
@@ -780,7 +781,7 @@ artifacts：
 - 保留 microbenchmark -> route smoke -> unprofiled E2E -> quality 的验证阶梯；
 - 用逐项消融和对称 control，不能把多个局部收益直接相加。
 
-## 12. 最后一个未完成实验：projection guard
+## 12. 9 月 22 日 projection guard 历史状态（9 月 28 日已完成，见 20.4）
 
 ### 12.1 目的
 
@@ -877,7 +878,7 @@ MXFP4 调用数理应下降，但 analyzer 仍要求 tail0 count。
 7. smoke 全部通过后再运行完整 A1/B1/C/B2/A2。
 8. 不得把此次 smoke 的 `5243.2/5082.9 ms` 加入正式统计。
 
-## 13. AITER fused SwiGLU dual-layout MXFP4：当前状态
+## 13. 9 月 22 日 AITER fused SwiGLU 状态（最终筛选见 20.6）
 
 外部 AITER dirty checkout 已有公共 wrapper：
 
@@ -933,7 +934,7 @@ Lumen 只负责 probe、dispatch、参数传递、autograd/context 和 fallback�
 5. fresh unprofiled A/B/A；
 6. 若有性能收益，再做 BF16 final bracket 与多 seed quality。
 
-## 14. 当前 dirty worktree 清单
+## 14. 9 月 22 日 dirty worktree 历史清单（最终交付见 20.2）
 
 ### 14.1 Lumen tracked modifications
 
@@ -1010,7 +1011,7 @@ untracked and relevant:
 
 因此，AITER 的 fused kernel 也不会因本次 Lumen 文档 push 自动出现在新机器。
 
-## 15. 新机器接手步骤
+## 15. 9 月 22 日旧接手步骤（请改用 20.8）
 
 ### 15.1 先恢复源码，不要先跑 GPU
 
@@ -1140,7 +1141,9 @@ tokenizer:  aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
   每个 arm 不允许原地 resume。
 - NUMA balancing 曾显著扩大 step 方差；正式 runner 应固定 NUMA policy 并记录。
 - AITER cache 和 Lumen MXFP4 autotune cache 是不同层级，都必须冻结。
-- 当前 raw results 和 dirty source 不在远端；远端文档不是可执行快照。
+- 迁机交付只保存了可审查的小型 evidence；多 GB raw profiler trace、编译缓存和
+  完整训练目录仍不在远端。可执行源码以 `6da1a42...` 及 20.1 的两条恢复分支
+  为准，不要假设新机器能访问本节中的旧本机绝对路径。
 
 ## 17. 全部优化尝试的速度与 loss 总账
 
@@ -1180,8 +1183,15 @@ tokenizer:  aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4
 | 16 | 50-step high-power tail2 -> tail0 | `1.037183x / 1.034082x` | `+0.00880` | tail-relative screen 通过，不替代 BF16 reference |
 | 17 | final tail0 MXFP4 / same-policy BF16 | `1.590387x / 1.607303x` | `+0.1445` | mean、CI lower 与精度门都失败；tail0 拒绝 |
 | 18 | tail2 profiler / BF16 profiler | profiler-only `1.507x` | profile-only `+0.3910` (`12.7741-12.3831`) | 只作热点诊断，不作速度或精度接受 |
-| 19 | final-layer `o_proj+down_proj` BF16 guard / tail1、down-only | `--` | `--` | route smoke 成功；正式 A/B/C arms 未运行 |
-| 20 | AITER fused SwiGLU + dual-layout MXFP4 / unfused chain | `--` | `--` | correctness `14 passed, 1 skipped`；未接 Lumen、无 E2E |
+| 19 | 9/22 final-layer projection guard smoke | `--` | `--` | 历史 smoke；9/28 已由正式 A/B/C campaign 取代 |
+| 20 | Policy A -> B：完整最后层 BF16 -> 仅 `o_proj+down_proj` BF16 | `1.007188x / 1.006809x` | `+0.17025` | CI `[1.002001x,1.012199x]`，速度小幅通过但精度严重失败；拒绝 B |
+| 21 | Policy B -> C：`o_proj+down_proj` -> 仅 `down_proj` BF16 | `0.995823x / 1.000533x` | `-0.16070`，非 gating | mean 变慢，CI `[0.991713x,0.999893x]`；拒绝 |
+| 22 | Policy A -> C：完整最后层 BF16 -> 仅 `down_proj` BF16 | `1.002980x / 1.007345x` | `+0.00955` | 精度过门，但 CI `[0.997648x,1.008260x]` 穿过 1；拒绝 C |
+| 23 | final Policy A MXFP4 / same-policy BF16 | `1.558675x / 1.576439x` | `+0.00790` | `40/40` wins，CI `[1.542335x,1.573744x]`；精度 PASS、1.6x 速度 FAIL |
+| 24 | Policy A profiler / BF16 profiler | profiler-only `1.565287x` | profile-only `+0.3933` | gap `112.888 ms/step`；只作热点诊断 |
+| 25 | AITER full backward fusion / unfused chain | micro-only BM256 `0.9746x`；BM32 `0.7398x` | `--` | correctness `23 passed, 1 skipped`，但两配置均更慢；拒绝 |
+| 26 | AITER standalone dual-layout / Lumen production | micro-only `0.812757x / 0.813045x`；完整 chain `0.890169x / 0.895709x` | `--` | bitwise equal，但 wrapper 更慢；拒绝直接替换 |
+| 27 | AITER fused forward / matching two-stage | 三进程 median `1.061991x / 1.036917x / 1.045134x` | `--` | positive micro only；约省 `5.15--8.43 ms/update`，无 E2E/NLL |
 
 上表中的 tail loss 差值使用同一 campaign 的相邻或明确 endpoint reference。
 其中最容易误读的是 tail0：它在 tail2-relative screen 中只有 `+0.00880`，但在
@@ -1250,11 +1260,12 @@ AITER best dW 只有约 `1.003x`，dX 反而更慢，且没有 E2E/NLL 对照，
 | old SwiGLU tile retune | forward `0.989883x`，backward `1.001505x` | elementwise / ULP correctness；无 NLL | forward 更慢、backward 不稳定，未进 E2E |
 | old separate-input SwiGLU exact autograd | forward `1.553787x`，fwd+bwd `1.633841x` | dgate SNR >=`108.951 dB` after ULP audit；无 NLL | 后续 E2E 精度失败，见 17.2 |
 | packed QKV full-chain | fwd+bwd `2.365498x`；one-layer GA8 `2.610883x` | packed/control SNR regression最多 `0.006645 dB`；无 NLL | 后续 E2E 只有 `1.035011x`，不得乘 31 层 |
+| Hadamard outlier/WGrad/DGrad diagnostics | `--`，未测 kernel 或 E2E 速度 | layer-5 down/gate WGrad SNR 从 `14.672/14.734` 提到 `16.474/15.893 dB`；DGrad 仅约 `+0.139/+0.171 dB`；无 NLL | 只证明部分离群值被摊平；没有训练质量或速度收益，保持诊断/default-off |
 | packed gate/up smoke | post-startup `6206.3/5994.5 ms`，无 matched ratio | absolute validation `12.7892` | smoke 后正式 A/B/A 拒绝 |
 | packed QKV smoke | post-startup `5760.0/5579.1 ms`，无 matched ratio | absolute validation `12.7888` | route/correctness only；正式结果见 17.1 |
 | packed QKV + split SwiGLU smoke/probe | `5946.2/5455.7` 与 `5703.8/5448.9 ms`，无 matched ratio | absolute validation `12.7845/12.7853` | 正式结果见 17.1 |
-| projection guard `o_proj+down_proj` smoke | post-JIT `5243.2/5082.9 ms`，无 matched ratio | absolute validation `12.7908` | formal 未启动，不得从 smoke 选策略 |
-| AITER fused SwiGLU dual-layout | 无可引用 production-shape timing | bitwise parity pass，targeted suite `14 passed, 1 skipped` | 未接 Lumen、未测训练 loss/E2E |
+| 9/22 projection guard `o_proj+down_proj` smoke | post-JIT `5243.2/5082.9 ms`，无 matched ratio | absolute validation `12.7908` | 当时 formal 未启动；后续正式结果见 17.1 的 Policy A/B/C |
+| 9/22 AITER fused SwiGLU dual-layout prototype | 无可引用 production-shape timing | bitwise parity pass，targeted suite `14 passed, 1 skipped` | 历史 smoke；9/29 的 backward/standalone/forward 结果见 17.1 |
 | packed-QKV DCP stale-cache fix | `--` | save/load 后参数、optimizer、route/hash 正确 | correctness fix，不是速度候选 |
 
 ### 17.5 没有结果、结果无效或被 fail-closed 的执行尝试
@@ -1293,31 +1304,338 @@ speedup/loss 结论。
 | projection guard stopped formal attempt | `/home/xdai/profile-results/lumen-mxfp4-projection-guard-formal-fresh-20260922-4GQFhw/` |
 | projection harness shared runner dependency | `/home/xdai/profile-results/lumen-mxfp4-a4w4-e2e-fresh-20260920-193907/run_case.sh` |
 | fused SwiGLU dual-layout correctness | `/home/xdai/profile-results/lumen-mxfp4-fused-swiglu-dual-layout-fresh-20260921-203226/` |
+| projection guard formal A/B/C | `/home/xdai/profile-results/lumen-mxfp4-projection-guard-formal-fresh-20260928-numa0-kfdv4-E9aLIK/` |
+| final Policy A vs BF16 bracket | `/home/xdai/profile-results/lumen-mxfp4-final-policy-a-bf16-bracket-fresh-20260928-fOB5j0/` |
+| final Policy A fresh profiler | `/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/` |
+| AITER backward-fusion first correctness | `/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/` |
+| AITER backward-fusion component diagnostic | `/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-diagnostic-fresh-20260928-v2-CwA4L/` |
+| Lumen vs AITER standalone dual-layout | `/home/xdai/profile-results/lumen-mxfp4-dual-layout-aiter-fresh-20260929-QF0BtU/` |
+| AITER fused SwiGLU forward screen | `/home/xdai/profile-results/lumen-mxfp4-fused-swiglu-fwd-fresh-20260929-WIGCGq/` |
+
+上述本机绝对路径在机器释放后可能不存在。关键 runner、analysis、protocol 和小型
+console/CSV 已复制到仓库内 `docs/mxfp4_evidence_2026-09-29/`；大型 trace、编译缓存
+和多 GB 原始输出没有入 Git。
 
 ## 19. 最终决策表
 
 | 项目 | 状态 |
 |---|---|
 | Same-policy `>=1.6x` mean speedup | **未达到** |
+| Same-policy median `>=1.6x` | **未达到** |
 | Same-policy 95% CI lower `>=1.6x` | **未达到** |
-| 可接受短程 BF16-relative accuracy | tail0 **失败**；tail1 **尚未最终确认** |
+| 可接受短程 BF16-relative accuracy | Policy A `Delta NLL +0.00790`，**通过** |
 | 长期 convergence | **未运行** |
-| 当前保守策略 | tail2 + BF16 `lm_head`；尚无 final BF16 bracket |
-| 当前激进候选 | tail1 + BF16 `lm_head`；尚无 final BF16 bracket |
+| 当前选定工作策略（仅通过短程 NLL 门） | Policy A：最后一个完整 layer + `lm_head` BF16 |
+| 当前正式速度 | mean `1.558675x`；median `1.576439x`；CI `[1.542335x,1.573744x]` |
 | 最快但否决策略 | tail0 + BF16 `lm_head` |
 | 词表层量化 | 拒绝，embedding/lm_head 保持 BF16 |
 | WGrad ASM | 接受 |
 | packed QKV | 接受 |
 | split SwiGLU | 接受 |
 | packed gate/up | 拒绝为速度优化，保留 opt-in/default-off |
-| projection guard | route smoke 成功；formal 未运行，harness gate 失败 |
-| AITER fused SwiGLU dual-layout | correctness 已过；未接 Lumen、未测 E2E |
+| projection guard B/C | formal 已完成；B 精度失败，C 速度失败，均拒绝 |
+| AITER full backward fusion | `23 passed, 1 skipped`，但 BM256/BM32 均更慢，拒绝 |
+| AITER standalone dual-layout wrapper | bitwise equal，但完整 chain 约慢 `12.34%`，拒绝直接替换 |
+| AITER fused forward | micro-only `1.037x--1.062x`，无 E2E/NLL，不计入最终速度 |
+| `--aiter-attn` | 最终正式实验开启 |
+| `gc.freeze()` | 未实现、未开启、无 credit |
+| 唯一开放结构方向 | two-stage backward/row quant + joint H16 column quant |
 
 最终可对外陈述的结论只能是：
 
-> Lumen Qwen3-8B MXFP4 已通过多个 fresh、配对、8-GPU 消融把 tail5 baseline
-> 推进到接近 `1.6x` 的 tail0 性能点，但 tail0 在同 campaign BF16 对照中只有
-> `1.590387x` mean，95% CI 下界为 `1.576344x`，并出现 `+0.1445` validation
-> NLL 回归。因此“`1.6x` 且精度可接受”仍未实现。当前最合理的继续方向是先
-> 完成最后一层 projection-level BF16 guard 的 fresh 正式筛选，再评估 AITER
-> fused SwiGLU + dual-layout MXFP4 的结构性集成。
+> Policy A 在 fresh same-policy BF16 bracket 中以 `+0.00790` validation NLL
+> 通过短程质量门，但 mean/median speedup 仅为 `1.558675x/1.576439x`，95% CI
+> 为 `[1.542335x,1.573744x]`，因此 `1.6x` 目标仍未达到。Projection B/C、
+> backward full fusion 和当前 AITER standalone wrapper 均已拒绝；forward
+> fusion 只有约 `1.037x--1.062x` 的局部收益，尚无 E2E 或 NLL 证据。
+
+## 20. 2026-09-29 最终迁机交付（权威恢复入口）
+
+### 20.1 Git 交付点
+
+Lumen 当前完整开发快照已经提交到 `dev/mxfp4`：
+
+```text
+repository:  https://github.com/ZhangDanyang-AMD/Lumen.git
+branch:      dev/mxfp4
+code commit: 6da1a42f7bd176227391568d4f80da91fda13398
+```
+
+该 commit 保存本轮运行过的完整开发树，而不是声称所有路径均已接受。它包含
+accepted 链路、对应测试/benchmark，以及为避免迁机丢失而保留的 default-off
+研究实现。最终文档与 evidence 在其后的交接 commit 中；恢复时应直接获取远端
+`dev/mxfp4` tip，并确认 `6da1a42...` 是祖先。
+
+同一最终 tip 还会镜像到用户 fork 的迁机备份分支：
+
+```text
+repository: https://github.com/DaiXindi-AMD/Lumen.git
+branch:     backup/2026-09-29/mxfp4-final-handoff
+```
+
+该 ref 只用于恢复，不应整分支直接视为 PR-ready 变更。
+
+AITER 的可移植恢复点是：
+
+```text
+repository: https://github.com/DaiXindi-AMD/aiter.git
+branch:     backup/2026-09-29/mxfp4-current-handoff
+commit:     58fb9ee213b592627b1c5f668996469925b9f725
+```
+
+直接从旧 `e35bb17` 历史推送新的 source branch 时，GitHub HTTPS token 因缺少
+`workflow` scope 拒绝更新，SSH 也未配置。因此远端 portable branch 采用已经存在
+于 fork 的 recovery 历史，保存 21 个当前源码/测试/benchmark 文件、精确 SHA256、
+从 ROCm/main 共同祖先起算的 runtime base bundle，以及两个 clean newer-base
+operator 分支的 Git bundle。
+这不是 PR-ready branch，但它能完整恢复代码。
+
+另外两个辅助恢复点：
+
+| 仓库 | 分支 | commit | 内容 |
+|---|---|---|---|
+| Lumen fork | `backup/2026-09-28/mxfp4-projection-harness` | `84d3a6ac30bca49696af11946050896f4afd862c` | projection harness 与 16 件校验清单 |
+| Lumen fork | `backup/2026-09-29/aiter-kernel-migration-handoff` | `8eb5ed988dd2f525cd1e9951d599b6b52fcdb983` | 独立 AITER kernel migration prototype 与 operator handoff；不是本轮默认训练分支 |
+
+### 20.2 Lumen commit 中包含什么
+
+已验证并用于最终 Policy A 的核心：
+
+- exact-shape WGrad ASM registry/tuned row；
+- packed QKV 与 checkpoint/load 后 cache invalidation；
+- separate-input split SwiGLU；
+- MXFP4 forward、DGrad、WGrad 与 dual-layout quant/cache/autotune 链路；
+- FSDP2 BF16 reduction override、retained accumulated parameters；
+- Qwen3 FSDP CLI、route checks、tests 和 benchmark；
+- `lm_head` 与最后一个完整 transformer layer 保持 BF16 的 Policy A 能力。
+
+同一 commit 中仅为恢复而保留、不得默认为成功的内容：
+
+- packed gate/up：正式 E2E CI 穿过 1 且 NLL `+0.0117`，拒绝；
+- projection B/C：正式筛选失败，保留 CLI 仅用于复现；
+- root FSDP retention：未建立稳定收益，default-off；
+- FlyDSL challenger 与 Lumen-local kernel：default-off、未进入最终结果，后续若继续
+  应迁移到 AITER，不应作为 Lumen 新 kernel 提交；
+- Hadamard DGrad 与分析脚本：诊断/实验用途，不是最终配置；
+- Lumen 侧的 AITER direct-wrapper/parity benchmark，以及本地研究 kernel harness：
+  用于复现局部结果，不代表已集成；full-backward/forward-fusion 的最终源码、测试和
+  benchmark 在 20.1 的 AITER recovery branch。
+
+未提交：`.agents/`、`AGENTS.md`、Hadamard PNG/HTML/JSON 生成物、profile trace、
+编译缓存，以及 dirty `third_party/aiter` gitlink。该 gitlink 的内部差异只是无关
+A8W8 CSV 行尾变化，不是本轮依赖。完整实验账本提交为
+`.codex/tmp-training-bugs.md`。
+
+### 20.3 当前选定工作策略 Policy A（仅通过短程 NLL 门）
+
+关键开关/约束如下；新机器不要依赖 launcher 的旧默认值，必须显式设置：
+
+```text
+mode=mxfp4
+task=pretrain
+lora_rank=0
+fsdp_version=2
+sharding=full_shard
+fsdp_retain_accumulated_params=true
+activation_checkpointing=false
+fsdp_reduce_dtype=bf16
+num_layers_at_start_in_bf16=0
+num_layers_at_end_in_bf16=1
+mxfp4_pack_qkv=true
+mxfp4_fuse_swiglu=true
+aiter_attn=true
+lm_head=bf16
+```
+
+必须保持关闭：
+
+```text
+mxfp4_pack_gate_up=false
+mxfp4_last_layer_bf16_projections=()
+fsdp_retain_root_params=false
+fsdp_mxfp4_comm=false
+gc.freeze()=not implemented / disabled
+```
+
+最终正式 workload 为 Qwen3-8B、sequence length 8192、MBS2、GBS128/GA8、
+8 x MI350X/gfx950、seed 1234、50 updates、steps 11--50 计时、16 validation
+batches、NUMA node 0、kernel NUMA balancing disabled。
+
+### 20.4 Projection guard 正式结果
+
+Fresh formal campaign：
+`lumen-mxfp4-projection-guard-formal-fresh-20260928-numa0-kfdv4-E9aLIK`。
+
+| Policy | BF16 保留范围 | Mean / median | Validation NLL |
+|---|---|---:|---:|
+| A | 最后一个完整 layer + `lm_head` | `5185.329 / 5104.975 ms` | `7.88865` |
+| B | 最后层 `o_proj+down_proj` + `lm_head` | `5148.325 / 5070.450 ms` | `8.05890` |
+| C | 最后层 `down_proj` + `lm_head` | `5169.920 / 5067.750 ms` | `7.89820` |
+
+- A -> B：`1.007188x/1.006809x`，CI `[1.002001x,1.012199x]`，但 NLL
+  `+0.17025`，精度失败。
+- B -> C：`0.995823x/1.000533x`，CI `[0.991713x,0.999893x]`，速度失败。
+- A -> C：`1.002980x/1.007345x`，CI `[0.997648x,1.008260x]`；NLL
+  `+0.00955` 通过，但速度和 CI 失败。
+
+结论：保留 Policy A；不要继续从最后一层移除 BF16 projection。
+
+### 20.5 最终 BF16 bracket 与 fresh profiler
+
+正式 bracket artifact：
+`lumen-mxfp4-final-policy-a-bf16-bracket-fresh-20260928-fOB5j0`。
+Integrity `108/108`；全部 arm 50/50 updates 完成，无训练期 fallback、OOM、
+NaN/Inf 或 skipped update。最终数值见第 0 节：mean `1.558675x`、median
+`1.576439x`、CI `[1.542335x,1.573744x]`、NLL delta `+0.00790`。
+
+Fresh profiler artifact：
+`lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4`。原 analyzer 因 runner
+相对路径和跨 640/1024 sampler extent 的 first-update hash 比较而保留 FAIL；
+独立 supplemental audit PASS，未篡改原报告。
+
+| Profiler 指标 | BF16 | Policy A |
+|---|---:|---:|
+| span | `8144.621 ms` | `5203.277 ms` |
+| GPU busy union | `7998.705 ms` | `4922.522 ms` |
+| GPU envelope | `8142.013 ms` | `5198.703 ms` |
+| envelope idle | `143.308 ms` | `276.181 ms` |
+
+Profiler ratio 为 `1.565287x`，窗口内距离 1.6x 仍差 `112.888 ms/step`。
+Policy-A A4W4 + quant/layout overlap-safe union 为 `1597.108 ms/step`，占 span
+约 `30.69%`。Profile NLL `12.3832/12.7765` 受到 intrusive short profile 影响，
+`+0.3933` 只作诊断，不能替代正式 validation gate。
+
+### 20.6 9 月 29 日 AITER 候选结论
+
+#### Full backward fusion：正确但更慢，拒绝
+
+Targeted gfx950 suite：`23 passed, 1 skipped`。RTN/SR、row/H16-column payload
+和 scale 与 production reference bitwise equal。
+
+| Config | Unfused p20/median/p80 | Fused p20/median/p80 | Speedup |
+|---|---:|---:|---:|
+| BM256 | `1.076187/1.083571/1.094027 ms` | `1.099851/1.111831/1.143292 ms` | `0.9746x` |
+| BM32 | `1.087139/1.093771/1.102987 ms` | `1.464615/1.478496/1.487135 ms` | `0.7398x` |
+
+BM256 约慢 2.6%，BM32 约慢 35%；未进入 Lumen E2E，因此无 NLL。
+
+#### AITER standalone dual-layout 直接替换：bitwise equal 但更慢，拒绝
+
+- dual-layout only：Lumen `0.269634/0.266763 ms`，AITER
+  `0.331752/0.328103 ms`；ratio `0.812757x/0.813045x`。
+- split-SwiGLU bwd + 两个 quant：Lumen `0.970886/0.973950 ms`，AITER
+  `1.090677/1.087352 ms`；ratio `0.890169x/0.895709x`。
+- AITER 增加 `0.119791 ms/call`，按约 280 calls/update 约增加
+  `33.5 ms/step`。无 E2E/NLL。
+
+#### Forward fusion：小幅正收益，但证据不足以接入
+
+三次 fresh process 的 matching two-stage/fused median：
+
+| Run | Two-stage | Fused | Speedup | Saving |
+|---|---:|---:|---:|---:|
+| P1 | `0.515772 ms` | `0.485665 ms` | `1.061991x` | `0.030107 ms` |
+| P2 | `0.516266 ms` | `0.497885 ms` | `1.036917x` | `0.018381 ms` |
+| P3 | `0.514985 ms` | `0.492746 ms` | `1.045134x` | `0.022239 ms` |
+
+输出 bitwise equal，两边 peak increment 均 `588 MiB`。按约 280 calls/update
+仅约 `5.15--8.43 ms/update`，远小于 `133.844 ms/step` gap；无 ABBA/CI、
+Lumen E2E 或 NLL，且该 micro run 缺完整 formal source/postflight manifest。
+
+### 20.7 下一位 Agent 的唯一推荐开发方向
+
+不要继续 full fusion，也不要把当前 AITER wrapper 直接替换进 Lumen。下一候选必须
+另起名称并做 two-stage redesign：
+
+1. Stage 1：SwiGLU backward，同时产生 dgate/dup 两路 row-major MXFP4。
+2. Stage 2：联合读取 dgate/dup，一次产生两路 production-compatible H16
+   column MXFP4。
+
+必须保持：RTN/SR bitwise parity、现有 Philox mapping、10 个输出、独立 gate/up
+stream 和 BF16 rounding cuts。算术 break-even 约 `0.478 ms/call`；考虑 bootstrap
+裕量，进入 E2E 前的 micro gate 应至少节省 `0.70 ms/call`。
+
+验证顺序固定为：
+
+```text
+AITER exact correctness
+-> independent-process ABBA/BAAB exact-shape benchmark
+-> Lumen public-wrapper probe/try_backends/fallback test
+-> 8-GPU route smoke
+-> fresh unprofiled A/B/A
+-> fresh same-policy BF16 bracket
+-> 3 seeds x >=200 steps quality validation
+```
+
+### 20.8 新机器恢复命令
+
+Lumen：
+
+```bash
+git clone https://github.com/ZhangDanyang-AMD/Lumen.git
+cd Lumen
+git fetch origin dev/mxfp4
+git switch -c dev/mxfp4 --track origin/dev/mxfp4
+git merge-base --is-ancestor \
+  6da1a42f7bd176227391568d4f80da91fda13398 HEAD
+sed -n '1,40p' docs/mxfp4_optimization_handoff_2026-09-22.md
+awk '/^## 20\./,0' docs/mxfp4_optimization_handoff_2026-09-22.md
+```
+
+若上游 remote 不可访问，可从用户 fork 获取迁机备份：
+
+```bash
+git fetch https://github.com/DaiXindi-AMD/Lumen.git \
+  refs/heads/backup/2026-09-29/mxfp4-final-handoff:refs/remotes/recovery/mxfp4-final-handoff
+git switch --detach refs/remotes/recovery/mxfp4-final-handoff
+git merge-base --is-ancestor \
+  6da1a42f7bd176227391568d4f80da91fda13398 HEAD
+```
+
+最终远端 tip 的精确 commit 应以本次交付回复和 `git ls-remote` 的核验值为准。
+
+AITER portable recovery：
+
+```bash
+git clone https://github.com/ROCm/aiter.git
+cd aiter
+git fetch https://github.com/DaiXindi-AMD/aiter.git \
+  refs/heads/backup/2026-09-29/mxfp4-current-handoff:refs/remotes/recovery/mxfp4-current-handoff
+test "$(git rev-parse refs/remotes/recovery/mxfp4-current-handoff)" = \
+  58fb9ee213b592627b1c5f668996469925b9f725
+git show refs/remotes/recovery/mxfp4-current-handoff:recovery/README.md
+```
+
+然后严格执行 recovery README：抽取 `bench-ecfff3f-lumen-portable.bundle`，恢复
+`e35bb17f4f815903bf73598facedbb321e15af28`，按
+`recovery/dirty-code-paths.txt` 恢复 21 个路径，并用
+`recovery/dirty-code-files.sha256` 校验。两个 newer-base clean operator branch
+保存在 `recovery/mxfp4-pending-operators.bundle`，不要假设对应 `dai/...` ref 已发布。
+
+若需要恢复正式 projection harness（主 evidence 已包含结果与 runner）：
+
+```bash
+git fetch https://github.com/DaiXindi-AMD/Lumen.git \
+  refs/heads/backup/2026-09-28/mxfp4-projection-harness:refs/remotes/recovery/projection-harness
+test "$(git rev-parse refs/remotes/recovery/projection-harness)" = \
+  84d3a6ac30bca49696af11946050896f4afd862c
+git show refs/remotes/recovery/projection-harness:README_RECOVERY.md
+```
+
+### 20.9 本次交付前静态验证
+
+未启动新的 GPU benchmark。已有 fresh GPU 证据保持原样。本次只运行迁移所需的
+静态检查：
+
+- Lumen 与 AITER `git diff --check`：通过；
+- 迁机 evidence 的四个 CPU-only analyzer/harness 测试：`51 passed`；
+- `docs/mxfp4_evidence_2026-09-29/SHA256SUMS`：75 项全部通过；
+- 两仓所有相关 Python 文件 `py_compile`：通过；
+- 两个 Lumen launcher `bash -n`：通过；
+- AITER relevant files `ruff check`：通过；
+- AITER `ruff format --check`：4 个 WIP 文件仍会被重排，未为了格式改变已测源码；
+- Lumen Ruff：存在既有 E741/export-style F401 等，不声称全绿；
+- 大型 GPU tests 未重跑；引用与当前源码绑定的 fresh results。
+
+迁机后的第一步不是立即跑 E2E，而是先核对 `lumen`/`aiter` import path、AITER
+恢复 SHA、tuned CSV、autotune cache namespace、GPU/KFD 空闲和 workload hash。

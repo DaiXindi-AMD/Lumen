@@ -1,0 +1,465 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.12, pytest-9.1.1, pluggy-1.6.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /home/xdai/aiter
+configfile: pyproject.toml
+collecting ... collected 17 items
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_and_backward_apis_are_publicly_exported PASSED [  5%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_philox_stream_contract_uses_production_column_offset PASSED [ 11%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[canonical] FAILED [ 17%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[col-shuffle] FAILED [ 23%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[scale-swizzle] FAILED [ 29%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[both] FAILED [ 35%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_rtn_matches_split_plus_dual_layout[False] PASSED [ 41%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_rtn_matches_split_plus_dual_layout[True] FAILED [ 47%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_matches_two_production_quantizers_across_tiles[32] PASSED [ 52%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_matches_two_production_quantizers_across_tiles[64] FAILED [ 58%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_matches_two_production_quantizers_across_tiles[256] FAILED [ 64%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_preserves_split_bf16_rounding_cuts PASSED [ 70%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_is_reproducible_and_branch_isolated PASSED [ 76%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_dequant_snr_and_statistical_bias FAILED [ 82%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_validates_input_and_rng_contract PASSED [ 88%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_validates_swizzle_constraints PASSED [ 94%]
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_requires_gfx950 SKIPPED [100%]
+
+=================================== FAILURES ===================================
+________ test_dual_layout_quant_mxfp4_rtn_matches_reference[canonical] _________
+
+swizzle_scale = False, shuffle_col = False
+
+    @_GFX950
+    @pytest.mark.parametrize(
+        "swizzle_scale,shuffle_col",
+        [(False, False), (False, True), (True, False), (True, True)],
+        ids=("canonical", "col-shuffle", "scale-swizzle", "both"),
+    )
+    def test_dual_layout_quant_mxfp4_rtn_matches_reference(
+        swizzle_scale: bool,
+        shuffle_col: bool,
+    ):
+        torch.manual_seed(20260928)
+        x = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda") * 2
+        actual = _dual_api()(
+            x,
+            use_sr=False,
+            swizzle_scale=swizzle_scale,
+            shuffle_col=shuffle_col,
+        )
+        expected = _layout_reference(
+            x, swizzle_scale=swizzle_scale, shuffle_col=shuffle_col
+        )
+    
+        for result, reference in zip(actual, expected):
+>           torch.testing.assert_close(result, reference, atol=0, rtol=0)
+E           AssertionError: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 4428 / 32768 (13.5%)
+E           Greatest absolute difference: 68 at index (64, 111)
+E           Greatest relative difference: inf at index (21, 106)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:232: AssertionError
+_______ test_dual_layout_quant_mxfp4_rtn_matches_reference[col-shuffle] ________
+
+swizzle_scale = False, shuffle_col = True
+
+    @_GFX950
+    @pytest.mark.parametrize(
+        "swizzle_scale,shuffle_col",
+        [(False, False), (False, True), (True, False), (True, True)],
+        ids=("canonical", "col-shuffle", "scale-swizzle", "both"),
+    )
+    def test_dual_layout_quant_mxfp4_rtn_matches_reference(
+        swizzle_scale: bool,
+        shuffle_col: bool,
+    ):
+        torch.manual_seed(20260928)
+        x = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda") * 2
+        actual = _dual_api()(
+            x,
+            use_sr=False,
+            swizzle_scale=swizzle_scale,
+            shuffle_col=shuffle_col,
+        )
+        expected = _layout_reference(
+            x, swizzle_scale=swizzle_scale, shuffle_col=shuffle_col
+        )
+    
+        for result, reference in zip(actual, expected):
+>           torch.testing.assert_close(result, reference, atol=0, rtol=0)
+E           AssertionError: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 4428 / 32768 (13.5%)
+E           Greatest absolute difference: 68 at index (76, 15)
+E           Greatest relative difference: inf at index (28, 90)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:232: AssertionError
+______ test_dual_layout_quant_mxfp4_rtn_matches_reference[scale-swizzle] _______
+
+swizzle_scale = True, shuffle_col = False
+
+    @_GFX950
+    @pytest.mark.parametrize(
+        "swizzle_scale,shuffle_col",
+        [(False, False), (False, True), (True, False), (True, True)],
+        ids=("canonical", "col-shuffle", "scale-swizzle", "both"),
+    )
+    def test_dual_layout_quant_mxfp4_rtn_matches_reference(
+        swizzle_scale: bool,
+        shuffle_col: bool,
+    ):
+        torch.manual_seed(20260928)
+        x = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda") * 2
+        actual = _dual_api()(
+            x,
+            use_sr=False,
+            swizzle_scale=swizzle_scale,
+            shuffle_col=shuffle_col,
+        )
+        expected = _layout_reference(
+            x, swizzle_scale=swizzle_scale, shuffle_col=shuffle_col
+        )
+    
+        for result, reference in zip(actual, expected):
+>           torch.testing.assert_close(result, reference, atol=0, rtol=0)
+E           AssertionError: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 4428 / 32768 (13.5%)
+E           Greatest absolute difference: 68 at index (64, 111)
+E           Greatest relative difference: inf at index (21, 106)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:232: AssertionError
+___________ test_dual_layout_quant_mxfp4_rtn_matches_reference[both] ___________
+
+swizzle_scale = True, shuffle_col = True
+
+    @_GFX950
+    @pytest.mark.parametrize(
+        "swizzle_scale,shuffle_col",
+        [(False, False), (False, True), (True, False), (True, True)],
+        ids=("canonical", "col-shuffle", "scale-swizzle", "both"),
+    )
+    def test_dual_layout_quant_mxfp4_rtn_matches_reference(
+        swizzle_scale: bool,
+        shuffle_col: bool,
+    ):
+        torch.manual_seed(20260928)
+        x = torch.randn((256, 256), dtype=torch.bfloat16, device="cuda") * 2
+        actual = _dual_api()(
+            x,
+            use_sr=False,
+            swizzle_scale=swizzle_scale,
+            shuffle_col=shuffle_col,
+        )
+        expected = _layout_reference(
+            x, swizzle_scale=swizzle_scale, shuffle_col=shuffle_col
+        )
+    
+        for result, reference in zip(actual, expected):
+>           torch.testing.assert_close(result, reference, atol=0, rtol=0)
+E           AssertionError: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 4428 / 32768 (13.5%)
+E           Greatest absolute difference: 68 at index (76, 15)
+E           Greatest relative difference: inf at index (28, 90)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:232: AssertionError
+_________ test_fused_backward_rtn_matches_split_plus_dual_layout[True] _________
+
+swizzle_scale = True
+
+    @_GFX950
+    @pytest.mark.parametrize("swizzle_scale", [False, True])
+    def test_fused_backward_rtn_matches_split_plus_dual_layout(swizzle_scale: bool):
+        shape = (256, 256) if swizzle_scale else (96, 256)
+        torch.manual_seed(73)
+        grad = torch.randn(shape, dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn_like(grad)
+        up = torch.randn_like(grad)
+    
+        actual = _bwd_api()(grad, gate, up, use_sr=False, swizzle_scale=swizzle_scale)
+        expected = _split_reference(
+            grad,
+            gate,
+            up,
+            use_sr=False,
+            gate_seed=None,
+            gate_offset=None,
+            up_seed=None,
+            up_offset=None,
+            swizzle_scale=swizzle_scale,
+        )
+>       _assert_exact(actual, expected)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:262: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = (tensor([[-6.1719e-01,  3.0078e-01,  1.2578e+00,  ...,  5.2185e-03,
+         -5.0000e-01, -5.8289e-03],
+        [-3.92...,  ..., 125, 125, 125],
+        [125, 125, 126,  ..., 125, 126, 126]], device='cuda:0',
+       dtype=torch.uint8), ...)
+expected = (tensor([[-6.1719e-01,  3.0078e-01,  1.2578e+00,  ...,  5.2185e-03,
+         -5.0000e-01, -5.8289e-03],
+        [-3.92...,  ..., 125, 125, 125],
+        [126, 125, 125,  ..., 126, 125, 125]], device='cuda:0',
+       dtype=torch.uint8), ...)
+
+    def _assert_exact(actual, expected) -> None:
+        names = (
+            "dgate",
+            "dup",
+            "dgate_row",
+            "dgate_row_scale",
+            "dgate_col",
+            "dgate_col_scale",
+            "dup_row",
+            "dup_row_scale",
+            "dup_col",
+            "dup_col_scale",
+        )
+        assert len(actual) == len(expected) == len(names)
+        for name, result, reference in zip(names, actual, expected):
+            assert result.shape == reference.shape, f"{name} shape mismatch"
+            assert result.dtype == reference.dtype, f"{name} dtype mismatch"
+            assert result.is_contiguous(), f"{name} must be contiguous"
+>           torch.testing.assert_close(
+                result,
+                reference,
+                atol=0,
+                rtol=0,
+                msg=lambda message: f"{name} mismatch: {message}",
+            )
+E           AssertionError: dgate_col mismatch: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 10212 / 32768 (31.2%)
+E           Greatest absolute difference: 68 at index (2, 102)
+E           Greatest relative difference: inf at index (3, 81)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:127: AssertionError
+__ test_fused_backward_sr_matches_two_production_quantizers_across_tiles[64] ___
+
+rows = 64
+
+    @_GFX950
+    @pytest.mark.parametrize("rows", [32, 64, 256])
+    def test_fused_backward_sr_matches_two_production_quantizers_across_tiles(rows: int):
+        torch.manual_seed(11)
+        grad = torch.randn((rows, 256), dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn_like(grad)
+        up = torch.randn_like(grad)
+        kwargs = dict(
+            use_sr=True,
+            gate_philox_seed=101,
+            gate_philox_offset=1009,
+            up_philox_seed=211,
+            up_philox_offset=2003,
+        )
+    
+        actual = _bwd_api()(grad, gate, up, **kwargs)
+        expected = _split_reference(
+            grad,
+            gate,
+            up,
+            use_sr=True,
+            gate_seed=kwargs["gate_philox_seed"],
+            gate_offset=kwargs["gate_philox_offset"],
+            up_seed=kwargs["up_philox_seed"],
+            up_offset=kwargs["up_philox_offset"],
+            swizzle_scale=False,
+        )
+>       _assert_exact(actual, expected)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:292: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = (tensor([[-2.8133e-05,  3.4375e-01,  2.8125e-01,  ..., -6.8665e-04,
+          1.4465e-02, -1.9287e-02],
+        [ 3.06...     [125, 125],
+        [125, 125],
+        [125, 125],
+        [125, 125]], device='cuda:0', dtype=torch.uint8), ...)
+expected = (tensor([[-2.8133e-05,  3.4375e-01,  2.8125e-01,  ..., -6.8665e-04,
+          1.4465e-02, -1.9287e-02],
+        [ 3.06...     [125, 125],
+        [125, 125],
+        [125, 125],
+        [125, 125]], device='cuda:0', dtype=torch.uint8), ...)
+
+    def _assert_exact(actual, expected) -> None:
+        names = (
+            "dgate",
+            "dup",
+            "dgate_row",
+            "dgate_row_scale",
+            "dgate_col",
+            "dgate_col_scale",
+            "dup_row",
+            "dup_row_scale",
+            "dup_col",
+            "dup_col_scale",
+        )
+        assert len(actual) == len(expected) == len(names)
+        for name, result, reference in zip(names, actual, expected):
+            assert result.shape == reference.shape, f"{name} shape mismatch"
+            assert result.dtype == reference.dtype, f"{name} dtype mismatch"
+            assert result.is_contiguous(), f"{name} must be contiguous"
+>           torch.testing.assert_close(
+                result,
+                reference,
+                atol=0,
+                rtol=0,
+                msg=lambda message: f"{name} mismatch: {message}",
+            )
+E           AssertionError: dgate_col mismatch: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 1873 / 8192 (22.9%)
+E           Greatest absolute difference: 68 at index (40, 5)
+E           Greatest relative difference: inf at index (25, 14)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:127: AssertionError
+__ test_fused_backward_sr_matches_two_production_quantizers_across_tiles[256] __
+
+rows = 256
+
+    @_GFX950
+    @pytest.mark.parametrize("rows", [32, 64, 256])
+    def test_fused_backward_sr_matches_two_production_quantizers_across_tiles(rows: int):
+        torch.manual_seed(11)
+        grad = torch.randn((rows, 256), dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn_like(grad)
+        up = torch.randn_like(grad)
+        kwargs = dict(
+            use_sr=True,
+            gate_philox_seed=101,
+            gate_philox_offset=1009,
+            up_philox_seed=211,
+            up_philox_offset=2003,
+        )
+    
+        actual = _bwd_api()(grad, gate, up, **kwargs)
+        expected = _split_reference(
+            grad,
+            gate,
+            up,
+            use_sr=True,
+            gate_seed=kwargs["gate_philox_seed"],
+            gate_offset=kwargs["gate_philox_offset"],
+            up_seed=kwargs["up_philox_seed"],
+            up_offset=kwargs["up_philox_offset"],
+            swizzle_scale=False,
+        )
+>       _assert_exact(actual, expected)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:292: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+actual = (tensor([[-2.8133e-05,  3.4375e-01,  2.8125e-01,  ..., -6.8665e-04,
+          1.4465e-02, -1.9287e-02],
+        [ 3.06...,  ..., 125, 125, 125],
+        [125, 125, 125,  ..., 125, 125, 125]], device='cuda:0',
+       dtype=torch.uint8), ...)
+expected = (tensor([[-2.8133e-05,  3.4375e-01,  2.8125e-01,  ..., -6.8665e-04,
+          1.4465e-02, -1.9287e-02],
+        [ 3.06...,  ..., 125, 125, 125],
+        [125, 125, 125,  ..., 125, 125, 125]], device='cuda:0',
+       dtype=torch.uint8), ...)
+
+    def _assert_exact(actual, expected) -> None:
+        names = (
+            "dgate",
+            "dup",
+            "dgate_row",
+            "dgate_row_scale",
+            "dgate_col",
+            "dgate_col_scale",
+            "dup_row",
+            "dup_row_scale",
+            "dup_col",
+            "dup_col_scale",
+        )
+        assert len(actual) == len(expected) == len(names)
+        for name, result, reference in zip(names, actual, expected):
+            assert result.shape == reference.shape, f"{name} shape mismatch"
+            assert result.dtype == reference.dtype, f"{name} dtype mismatch"
+            assert result.is_contiguous(), f"{name} must be contiguous"
+>           torch.testing.assert_close(
+                result,
+                reference,
+                atol=0,
+                rtol=0,
+                msg=lambda message: f"{name} mismatch: {message}",
+            )
+E           AssertionError: dgate_col mismatch: Tensor-likes are not equal!
+E           
+E           Mismatched elements: 9336 / 32768 (28.5%)
+E           Greatest absolute difference: 68 at index (2, 53)
+E           Greatest relative difference: inf at index (2, 102)
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:127: AssertionError
+___________ test_fused_backward_sr_dequant_snr_and_statistical_bias ____________
+
+    @_GFX950
+    def test_fused_backward_sr_dequant_snr_and_statistical_bias():
+        torch.manual_seed(29)
+        grad = torch.randn((32, 256), dtype=torch.bfloat16, device="cuda")
+        gate = torch.randn_like(grad)
+        up = torch.randn_like(grad)
+        dgate, dup = swiglu_bwd_split(grad, gate, up)
+        references = (dgate, _h16_transposed(dgate), dup, _h16_transposed(dup))
+        accumulated_error = torch.zeros((), dtype=torch.float64, device="cuda")
+        accumulated_count = 0
+    
+        for sample in range(16):
+            output = _bwd_api()(
+                grad,
+                gate,
+                up,
+                use_sr=True,
+                gate_philox_seed=1000 + sample,
+                gate_philox_offset=2000 + sample * 17,
+                up_philox_seed=3000 + sample,
+                up_philox_offset=4000 + sample * 19,
+            )
+            dequantized = (
+                _dequantize(output[2], output[3]),
+                _dequantize(output[4], output[5]),
+                _dequantize(output[6], output[7]),
+                _dequantize(output[8], output[9]),
+            )
+            for reference, actual in zip(references, dequantized):
+>               assert _snr(reference, actual) >= 8.0
+E               AssertionError: assert 7.833588600158691 >= 8.0
+E                +  where 7.833588600158691 = _snr(tensor([[-0.0889,  0.2048,  0.3300,  ...,  0.1161,  0.3114,  1.3308],\n        [-0.8249,  0.4080,  0.4903,  ..., -0.5303,  0.0292,  0.0558],\n        [-0.7663, -0.2731,  0.4663,  ..., -0.3812, -0.5686,  0.0950],\n        ...,\n        [ 0.2857,  0.5598,  0.6682,  ..., -0.3515, -0.3310, -0.5162],\n        [-0.9246,  0.0930, -0.2482,  ...,  0.8042,  1.2857, -1.0049],\n        [ 0.1680, -0.5685, -0.2758,  ...,  0.3261, -0.9355, -0.9456]],\n       device='cuda:0'), tensor([[-0.1250,  0.2500,  0.3750,  ...,  0.1250,  0.2500,  1.0000],\n        [-0.7500,  0.5000,  0.5000,  ..., -0.5000,  0.1250,  0.1250],\n        [-0.7500, -0.2500,  0.5000,  ..., -0.3750, -0.5000,  0.1250],\n        ...,\n        [ 0.2500,  0.5000,  0.5000,  ..., -0.3750, -0.3750, -0.5000],\n        [-1.0000,  0.1250, -0.2500,  ...,  1.0000,  1.5000, -1.0000],\n        [ 0.1250, -0.5000, -0.2500,  ...,  0.2500, -1.0000, -1.0000]],\n       device='cuda:0'))
+
+op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py:371: AssertionError
+=========================== short test summary info ============================
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[canonical]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[col-shuffle]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[scale-swizzle]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_dual_layout_quant_mxfp4_rtn_matches_reference[both]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_rtn_matches_split_plus_dual_layout[True]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_matches_two_production_quantizers_across_tiles[64]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_matches_two_production_quantizers_across_tiles[256]
+FAILED op_tests/triton_tests/quant/test_fused_swiglu_bwd_dual_layout_mxfp4.py::test_fused_backward_sr_dequant_snr_and_statistical_bias
+=================== 8 failed, 8 passed, 1 skipped in 13.93s ====================
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/weakref.py", line 667, in _exitfunc
+    f()
+  File "/usr/lib/python3.10/weakref.py", line 591, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 667, in _del_library
+    _clear_torch_ops_cache(op_defs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 623, in _clear_torch_ops_cache
+    ns, name_with_overload = qualname.split("::")
+ValueError: too many values to unpack (expected 2)
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/weakref.py", line 667, in _exitfunc
+    f()
+  File "/usr/lib/python3.10/weakref.py", line 591, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 667, in _del_library
+    _clear_torch_ops_cache(op_defs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 623, in _clear_torch_ops_cache
+    ns, name_with_overload = qualname.split("::")
+ValueError: too many values to unpack (expected 2)

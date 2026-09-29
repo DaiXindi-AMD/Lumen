@@ -1,0 +1,9 @@
+49bb64c60490ca435db3302cf339abaeacfa563aa04d90311bf6f5acedadbb21  /home/xdai/profile-results/lumen-mxfp4-aiter-bwd-diagnostic-fresh-20260928-v2-CwA4L/diagnose_outputs.py
+f1572bdc8be3b1a09463ec6a66752485cc7bcabb7c8cff2f42ec48ac07777c32  /home/xdai/profile-results/lumen-mxfp4-aiter-bwd-diagnostic-fresh-20260928-v2-CwA4L/run_diagnostic.sh
+e7009d4e4506d4d1b960a87c7ff2b1987dfaee43bc6c85b0900b5dcd17d6ee29  /home/xdai/aiter/aiter/ops/triton/_triton_kernels/quant/quant.py
+66dfbd797511558d6de000f015852e3ee3e0fdf280fcfcef3804b0030aaa274b  /home/xdai/aiter/aiter/ops/triton/_triton_kernels/quant/fused_swiglu_dual_layout_mxfp4.py
+4bc99dfa2610c370c367a25d68a2ea63051c08f7d8b8e260f96c4fe6eec8ddae  /home/xdai/aiter/aiter/ops/triton/quant/fused_swiglu_dual_layout_mxfp4.py
+0e832dc96aaaf0678f5c7171ec065c219f38ddc36582ecd20abc348aea9573a3  /home/xdai/aiter/aiter/ops/triton/configs/quant/gfx950-DUAL-LAYOUT-MXFP4.json
+26733093ee0bb18650bd0a5294db3278819d6014697cfb753e71c5138aeee750  /home/xdai/aiter/aiter/ops/triton/configs/quant/gfx950-FUSED-SWIGLU-BWD-DUAL-LAYOUT-MXFP4.json
+51043ff1f6e04af4afedb01aadfbb5f9c249a2d21a6baacbf968ab234e63879b  /home/xdai/Lumen/lumen/ops/quantize/ops.py
+a34aa0d3825bd9e50595d18226f36248d9918a4c39b4899e850fd1658093f93a  /home/xdai/Lumen/lumen/kernels/mxfp4.py

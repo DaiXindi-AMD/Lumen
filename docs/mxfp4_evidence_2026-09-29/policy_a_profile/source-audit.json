@@ -1,0 +1,30 @@
+{
+  "aiter_commit": "e35bb17f4f815903bf73598facedbb321e15af28",
+  "aiter_tree_sha256": "97d328fed8375a723c0bd3fd3e6972a6fe274e490716af490f4ba52d72cba7d0",
+  "f4gemm_directory_sha256": "f5df7b567acecce6c03f6af0b89239047719818996e31d214762bbcf6056e2ca",
+  "harness_sha256": {
+    "/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/analyze_policy_a_profile.py": "6e5b8c7cfa30755706a626d2ac326e0d6f666f1c46d640da3fedb953c36095bc",
+    "/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/protocol.md": "9b53ba6499ce6d0750304a3bf794023209498e47bfc442d58c22cce73540613b",
+    "/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/route_entry.py": "c9a3393802a50d297c583209599af85ea8b35394881624cc272de06380f0ad68",
+    "/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/test_analyze_policy_a_profile.py": "c31464fa3e3206a2ed683909fc8f28b9a1e72903f4bc7bcb6ae1e6cb26f2bebe",
+    "/home/xdai/profile-results/lumen-mxfp4-policy-a-profile-fresh-20260928-BZluZ4/test_runner.py": "369250ef7def1b0c52b7433bc49266dcf9f206e144758f7688af9de494f3235c",
+    "run_policy_a_profile.sh": "c445deb1282d12b86b82230e774ab4d2420763a679573f01469bd5cca43a3541"
+  },
+  "imports": {
+    "aiter": "/home/xdai/aiter/aiter/__init__.py",
+    "lumen": "/home/xdai/Lumen/lumen/__init__.py"
+  },
+  "lumen_branch": "dev/mxfp4",
+  "lumen_commit": "6b9aee1569247eca20937c14319ba6adcd69e0cb",
+  "lumen_tree_sha256": "7aa2ed965f36ccda650daa3a920ca09d59fba882df082d4c1b6012e755ed76ee",
+  "runtime": {
+    "devices": 8,
+    "hip": "7.2.53211",
+    "torch": "2.13.0+rocm7.2"
+  },
+  "runtime_modules_sha256": "e6aeddca57b89a79c0f9d04c4708b4574c8737d58f07df8c2fbd099edb873c65",
+  "schema": 1,
+  "source_bundle_sha256": "e7094446b71d990671a8d164386103037b7d773ef209d682b76e9b18e47b5957",
+  "tuned_tables_sha256": "5bab624d8705902f6403840318bfeca290f43b703626d9b946a95feafd5333cd",
+  "workload_sha256": "da4b31dde571a889aceae845da762c20c9f71976644269e718a58ecc8b2fe3dd"
+}

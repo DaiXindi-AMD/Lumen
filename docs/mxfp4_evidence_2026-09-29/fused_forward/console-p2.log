@@ -1,0 +1,18 @@
+Environment
+  Device: AMD Instinct MI350X VF (gfx950:sramecc+:xnack-)
+  ROCm: 7.2.53211
+  PyTorch: 2.13.0+rocm7.2
+  Triton: 3.7.0
+  AITER version: 0.1.17.dev290+g667d6c669
+  AITER commit: e35bb17f4f815903bf73598facedbb321e15af28
+  AITER tree dirty: yes
+  AITER source: /home/xdai/aiter/aiter/__init__.py
+  Warmup: 50 ms
+  Repetitions: 300 ms
+  Unfused baseline includes Torch H16 transform and temporaries
+Providers
+  fused-swizzle-shuffle: fused swizzle + col B-payload shuffle
+  two-stage-swizzle-shuffle: two-stage swizzle + col B-payload shuffle
+M,D,provider,p20_ms,median_ms,p80_ms,speedup_vs_unfused,speedup_vs_two_stage,contract_gbps,peak_increment_mib
+16384,12288,fused-swizzle-shuffle,0.489966,0.497885,0.802449,n/a,1.0369,2855.818,588.000
+16384,12288,two-stage-swizzle-shuffle,0.513462,0.516266,0.519429,n/a,n/a,2754.143,588.000

@@ -1,0 +1,2 @@
+*.log -text -diff
+*.csv -text -diff

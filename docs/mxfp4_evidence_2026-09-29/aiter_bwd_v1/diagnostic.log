@@ -1,0 +1,48 @@
+[aiter] import [module_aiter_core] under /home/xdai/aiter/aiter/jit/module_aiter_core.so
+device=AMD Instinct MI350X VF
+CASE rtn_256x256
+aiter_vs_math.row: equal=True mismatch=0/32768 max_abs=0 first=None actual_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9 expected_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9
+aiter_vs_math.row_scale: equal=True mismatch=0/2048 max_abs=0 first=None actual_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6 expected_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6
+aiter_vs_math.col: equal=False mismatch=4428/32768 max_abs=68 first=((0, 112), 42, 76) actual_sha=c62925ed6234817917f79801b7ec9753d3cb77386b5ff50b9edaba989a7a6e97 expected_sha=bbd784d51da7299ecbb38d89e36fd63fa024f6f3f1233b03c89468a4d4c4114c
+aiter_vs_math.col_scale: equal=False mismatch=278/2048 max_abs=2 first=((0, 7), 127, 126) actual_sha=684b5d8ad1323489ab2c9ac6a1444d058c8a8e3beec5d1e23e8152ed5e1547a4 expected_sha=fbeb60736b8f3361025cf0b414b829e6339ad5fa18dccb8a8966b1dc99a76ad0
+lumen_vs_math.row: equal=True mismatch=0/32768 max_abs=0 first=None actual_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9 expected_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9
+lumen_vs_math.row_scale: equal=True mismatch=0/2048 max_abs=0 first=None actual_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6 expected_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6
+lumen_vs_math.col: equal=False mismatch=4428/32768 max_abs=68 first=((0, 112), 42, 76) actual_sha=c62925ed6234817917f79801b7ec9753d3cb77386b5ff50b9edaba989a7a6e97 expected_sha=bbd784d51da7299ecbb38d89e36fd63fa024f6f3f1233b03c89468a4d4c4114c
+lumen_vs_math.col_scale: equal=False mismatch=278/2048 max_abs=2 first=((0, 7), 127, 126) actual_sha=684b5d8ad1323489ab2c9ac6a1444d058c8a8e3beec5d1e23e8152ed5e1547a4 expected_sha=fbeb60736b8f3361025cf0b414b829e6339ad5fa18dccb8a8966b1dc99a76ad0
+aiter_vs_lumen.row: equal=True mismatch=0/32768 max_abs=0 first=None actual_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9 expected_sha=8809195eb8da1c1ef77aa3bfa90a2697699050a08afd9f2b6a6c2589feb018a9
+aiter_vs_lumen.row_scale: equal=True mismatch=0/2048 max_abs=0 first=None actual_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6 expected_sha=7dbf234c4a0fca2954fd9188e369ae2f1b51cebeaa4a617aae1f7d933d1514e6
+aiter_vs_lumen.col: equal=True mismatch=0/32768 max_abs=0 first=None actual_sha=c62925ed6234817917f79801b7ec9753d3cb77386b5ff50b9edaba989a7a6e97 expected_sha=c62925ed6234817917f79801b7ec9753d3cb77386b5ff50b9edaba989a7a6e97
+aiter_vs_lumen.col_scale: equal=True mismatch=0/2048 max_abs=0 first=None actual_sha=684b5d8ad1323489ab2c9ac6a1444d058c8a8e3beec5d1e23e8152ed5e1547a4 expected_sha=684b5d8ad1323489ab2c9ac6a1444d058c8a8e3beec5d1e23e8152ed5e1547a4
+CASE bwd_64x256
+Traceback (most recent call last):
+  File "/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/diagnose_outputs.py", line 149, in <module>
+    main()
+  File "/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/diagnose_outputs.py", line 143, in main
+    diagnose_bwd(64)
+  File "/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/diagnose_outputs.py", line 132, in diagnose_bwd
+    compare(f"fused_vs_aiter.{name}", actual, expected)
+  File "/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/diagnose_outputs.py", line 31, in compare
+    f"max_abs={max_abs} first={first} actual_sha={digest(actual)} "
+  File "/home/xdai/profile-results/lumen-mxfp4-aiter-bwd-fusion-fresh-20260928-v1/diagnose_outputs.py", line 16, in digest
+    tensor.detach().cpu().contiguous().numpy().tobytes()
+TypeError: Got unsupported ScalarType BFloat16
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/weakref.py", line 667, in _exitfunc
+    f()
+  File "/usr/lib/python3.10/weakref.py", line 591, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 667, in _del_library
+    _clear_torch_ops_cache(op_defs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 623, in _clear_torch_ops_cache
+    ns, name_with_overload = qualname.split("::")
+ValueError: too many values to unpack (expected 2)
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/weakref.py", line 667, in _exitfunc
+    f()
+  File "/usr/lib/python3.10/weakref.py", line 591, in __call__
+    return info.func(*info.args, **(info.kwargs or {}))
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 667, in _del_library
+    _clear_torch_ops_cache(op_defs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/library.py", line 623, in _clear_torch_ops_cache
+    ns, name_with_overload = qualname.split("::")
+ValueError: too many values to unpack (expected 2)
