@@ -3,7 +3,23 @@
 The authoritative detailed guide is
 [`mxfp4_optimization_handoff_2026-09-22.md`](mxfp4_optimization_handoff_2026-09-22.md).
 Its historical filename is retained so existing recovery links keep working;
-the document itself is updated through 2026-09-29. Read sections 0 and 20 first.
+the document itself is updated through 2026-10-07. Read sections 0 and 20 first.
+
+2026-10-07 AITER/Lumen migration update:
+
+- ROCm/aiter #5542 merged as
+  `48b13652fd05ed6e65d82204d3e040373ff74708`. Lumen should call
+  `aiter.ops.triton.activation.silu_and_mul_backward` through its public
+  wrapper; Megatron is the direct consumer, while the current HF/FSDP path is
+  not.
+- The merged backward is gfx950-only. Architecture-guard follow-up #6124 is
+  still open at `b207635449d945d9e445df3f0d55717c7dab3d2d`; until it lands in the
+  pinned AITER, Lumen must check the input device architecture and use a logged
+  fallback on non-gfx950 devices.
+- Full migration still waits for separate AITER PRs for
+  `dual_layout_quant_mxfp4` and `dequant_hadamard_quant_mxfp4`. Preserve the
+  existing dual-layout, backward DGrad/WGrad, and dequant -> transpose -> H16
+  -> requant RHT positions.
 
 Current selected working policy (short-run quality gate only):
 
@@ -25,7 +41,10 @@ Recovery refs:
   handoff tip as the primary branch at delivery time.
 - AITER: `DaiXindi-AMD/aiter`, branch
   `backup/2026-09-29/mxfp4-current-handoff`, commit
-  `58fb9ee213b592627b1c5f668996469925b9f725`.
+  `7c4a9a496600bb38496ee5c88a18551c0fd76ea7`.
+- Lumen AITER-migration recovery: `DaiXindi-AMD/Lumen`, branch
+  `backup/2026-09-29/aiter-kernel-migration-handoff`, commit
+  `6c19736a6d50093f622970285937d80556b364fd`.
 - Small evidence archive: `mxfp4_evidence_2026-09-29/`.
 
 Do not start with a new E2E run. Restore and verify both repositories, read the

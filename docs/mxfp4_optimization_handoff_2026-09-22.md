@@ -1,6 +1,6 @@
 # Lumen Qwen3-8B MXFP4 训练优化交接
 
-更新时间：2026-09-29（US/Central；文件名为保持已有链接而保留）
+更新时间：2026-10-07（US/Central；文件名为保持已有链接而保留）
 
 ## 0. 一分钟结论
 
@@ -36,6 +36,13 @@ standalone dual-layout wrapper 均已正式拒绝。Forward fused SwiGLU 只有�
 
 本文第 1--19 节保留了 9 月 22 日之前的实验历史；其中“projection formal 未跑”、
 “tail2/tail1 尚待确认”等旧状态已过期。**恢复与继续开发应以第 20 节和本节为准。**
+
+2026-10-07 依赖更新：AITER #5542 已合并为
+`48b13652fd05ed6e65d82204d3e040373ff74708`，公开 backward API 是
+`aiter.ops.triton.activation.silu_and_mul_backward`，最终仅支持 gfx950。
+架构保护 follow-up #6124 仍 open；详见 20.10。完整 Lumen kernel migration
+仍等待 `dual_layout_quant_mxfp4` 与 `dequant_hadamard_quant_mxfp4` 两个独立
+AITER PR。
 
 ## 1. 9 月 22 日历史迁移快照（最终 Git 交付见 20.1/20.8）
 
@@ -1380,7 +1387,7 @@ AITER 的可移植恢复点是：
 ```text
 repository: https://github.com/DaiXindi-AMD/aiter.git
 branch:     backup/2026-09-29/mxfp4-current-handoff
-commit:     58fb9ee213b592627b1c5f668996469925b9f725
+commit:     7c4a9a496600bb38496ee5c88a18551c0fd76ea7
 ```
 
 直接从旧 `e35bb17` 历史推送新的 source branch 时，GitHub HTTPS token 因缺少
@@ -1395,7 +1402,7 @@ operator 分支的 Git bundle。
 | 仓库 | 分支 | commit | 内容 |
 |---|---|---|---|
 | Lumen fork | `backup/2026-09-28/mxfp4-projection-harness` | `84d3a6ac30bca49696af11946050896f4afd862c` | projection harness 与 16 件校验清单 |
-| Lumen fork | `backup/2026-09-29/aiter-kernel-migration-handoff` | `8eb5ed988dd2f525cd1e9951d599b6b52fcdb983` | 独立 AITER kernel migration prototype 与 operator handoff；不是本轮默认训练分支 |
+| Lumen fork | `backup/2026-09-29/aiter-kernel-migration-handoff` | `6c19736a6d50093f622970285937d80556b364fd` | 独立 AITER kernel migration prototype、已更新的 #5542 集成计划与 operator handoff；不是本轮默认训练分支 |
 
 ### 20.2 Lumen commit 中包含什么
 
@@ -1602,7 +1609,7 @@ cd aiter
 git fetch https://github.com/DaiXindi-AMD/aiter.git \
   refs/heads/backup/2026-09-29/mxfp4-current-handoff:refs/remotes/recovery/mxfp4-current-handoff
 test "$(git rev-parse refs/remotes/recovery/mxfp4-current-handoff)" = \
-  58fb9ee213b592627b1c5f668996469925b9f725
+  7c4a9a496600bb38496ee5c88a18551c0fd76ea7
 git show refs/remotes/recovery/mxfp4-current-handoff:recovery/README.md
 ```
 
@@ -1639,3 +1646,29 @@ git show refs/remotes/recovery/projection-harness:README_RECOVERY.md
 
 迁机后的第一步不是立即跑 E2E，而是先核对 `lumen`/`aiter` import path、AITER
 恢复 SHA、tuned CSV、autotune cache namespace、GPU/KFD 空闲和 workload hash。
+
+### 20.10 2026-10-07 AITER #5542 合并更新
+
+- [ROCm/aiter #5542](https://github.com/ROCm/aiter/pull/5542) 已于
+  2026-09-30 合并，merge commit 为
+  `48b13652fd05ed6e65d82204d3e040373ff74708`；该提交已是 2026-10-07
+  检查的 `ROCm/aiter:main @ b1cdc19ebf3a52b101221fee5b24a3ef7753c244`
+  的祖先。
+- Lumen 使用公共 API
+  `aiter.ops.triton.activation.silu_and_mul_backward`。Megatron 的 packed
+  `[gate, up]` SwiGLU 是直接消费者；当前 Hugging Face/FSDP MLP 不是直接
+  消费者，不要为复用它额外拼接大 tensor。
+- #5542 最终 tuning config 和支持声明仅覆盖 gfx950。不能把 public symbol
+  import 成功当成运行能力；Lumen 必须基于输入 tensor 所在设备判断架构，并在
+  非 gfx950 上记录原因后 fallback。
+- [ROCm/aiter #6124](https://github.com/ROCm/aiter/pull/6124) 截至
+  2026-10-07 仍 open，head 为
+  `b207635449d945d9e445df3f0d55717c7dab3d2d`。它为 AITER wrapper 增加
+  fail-closed 架构保护；最终 pin 若尚未包含它，Lumen 自身 guard 不能省略。
+- #5542 已不再阻塞完整迁移。剩余生产 AITER 工作仍是逐算子提交
+  `dual_layout_quant_mxfp4`，再提交
+  `dequant_hadamard_quant_mxfp4`。Lumen 最终仍只做 public API dispatch，合为
+  一个贡献者提交。
+- 接入时不得改变原有 RHT/H16：forward dual-layout、backward DGrad/WGrad
+  dual-layout，以及 dequant -> transpose -> H16 -> requant 三处都必须保留。
+- 本次仅更新文档和远端恢复点，没有在借用机器上运行 GPU 测试。
