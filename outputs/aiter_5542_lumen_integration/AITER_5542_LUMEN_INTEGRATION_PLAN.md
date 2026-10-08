@@ -1,16 +1,23 @@
 # AITER #5542 合并后的 Lumen 集成计划
 
-**日期**：2026-09-20
+**初版日期**：2026-09-20；**状态更新**：2026-10-07
 
 **Lumen 基线**：`codex/aiter-kernel-migration @ 0f2cc90398ad05379d4eff125cfd365aaa71a7ce`
 
-**当前 AITER pin**：`third_party/aiter @ f4f95c3d548b19e1824070b9daf075908a410a9b`
+**原型 AITER pin**：`third_party/aiter @ f4f95c3d548b19e1824070b9daf075908a410a9b`
+
+**上游状态**：#5542 已合并为
+`48b13652fd05ed6e65d82204d3e040373ff74708`；2026-10-07 检查的
+`ROCm/aiter:main` 为 `b1cdc19ebf3a52b101221fee5b24a3ef7753c244`。
+架构保护 follow-up #6124 仍 open，head 为
+`b207635449d945d9e445df3f0d55717c7dab3d2d`。
 
 **目标**：AITER #5542 合并后，让 Lumen 只通过 upstream AITER 公共 API 使用 fused SiLU-and-multiply forward/backward，并移除 fork-only API 与 vendor workaround。
 
 **提交策略**：AITER 继续逐算子 PR；Lumen 的 API 适配、测试、vendor 清理和 submodule bump 合为一个提交。
 
-> 本文是合并后的执行清单，不要求把 PR 临时 head 固定进 Lumen。文中的 AITER revision 必须替换为最终进入 `ROCm/aiter:main` 的 commit。
+> #5542 已进入 `ROCm/aiter:main`。Lumen 最终 pin 必须是其 merge commit 的
+> 后代，并同时包含其他生产依赖；不要固定任何 open PR head。
 
 ## 1. 最终状态
 
@@ -40,7 +47,9 @@ Megatron fused_bias_swiglu
 
 这次迁移不在 Lumen 新增或复制任何 GPU kernel；kernel、repr、unit test、benchmark 和 tuning config 继续由 AITER 维护。
 
-#5542 最新审查版本已把 backward 放进现有 activation family，与 `fused_silu_mul` 共用模块和 activation helper。Lumen 不应再要求 AITER 提供 `swiglu_*` compatibility alias，也不应在自己仓库实现相同 kernel。
+#5542 最终版本已把 backward 放进现有 activation family，与
+`fused_silu_mul` 共用模块和 activation helper。Lumen 不应再要求 AITER
+提供 `swiglu_*` compatibility alias，也不应在自己仓库实现相同 kernel。
 
 改动总览：
 
@@ -55,13 +64,12 @@ Megatron fused_bias_swiglu
 | `tests/ops/`、`tests/patches/` | 更新 API mock，增加 probe、installer、`out=` 和 fallback 覆盖 |
 | `lumen/ops/quantize/linear.py` | 不因 #5542 修改；保留原有 MXFP4 RHT/H16 链路 |
 
-## 2. 合并前置条件
+## 2. Upstream pin 前置条件
 
-### 2.1 不要 pin PR head
+### 2.1 使用 #5542 merge commit 的后代
 
-截至本文日期，#5542 仍为 open，当前 head 为 `9920a8ab9b56dab94853906dfa0a0fd18a54208d`。这个 SHA 只用于审查，不能作为 Lumen 的最终依赖。
-
-合并后先取得最终 upstream revision，并验证公共 API：
+#5542 已于 2026-09-30 合并。最终 merge commit 是
+`48b13652fd05ed6e65d82204d3e040373ff74708`。选择 Lumen 的 AITER pin 时验证：
 
 ```bash
 gh pr view 5542 --repo ROCm/aiter \
@@ -69,7 +77,7 @@ gh pr view 5542 --repo ROCm/aiter \
 
 git -C third_party/aiter fetch origin main
 git -C third_party/aiter merge-base --is-ancestor \
-  <PR_5542_MERGE_SHA> <TARGET_AITER_SHA>
+  48b13652fd05ed6e65d82204d3e040373ff74708 <TARGET_AITER_SHA>
 
 git -C third_party/aiter show <TARGET_AITER_SHA>:aiter/ops/triton/activation.py \
   | rg 'def (fused_silu_mul|silu_and_mul_backward)'
@@ -77,10 +85,13 @@ git -C third_party/aiter show <TARGET_AITER_SHA>:aiter/ops/triton/activation.py 
 
 验收条件：
 
-- #5542 状态为 `MERGED`。
-- `TARGET_AITER_SHA` 是 #5542 merge commit 的后代。
+- #5542 状态为 `MERGED`，merge commit 与上面一致。
+- `TARGET_AITER_SHA` 是 `48b13652...` 的后代。
 - 两个函数都能从 `aiter.ops.triton.activation` 导入。
-- 最终 AITER 代码仍含 backward kernel repr、单测、benchmark，以及 gfx942/gfx950 的 tuning config。
+- 最终 AITER 代码仍含 backward kernel repr、单测、benchmark，以及 gfx950
+  tuning config；不要恢复已删除的 gfx942 支持声明或配置。
+- 如果目标 pin 尚未包含 #6124，Lumen 自己必须在调用前进行 gfx950
+  capability guard，并在其他架构走已记录原因的 fallback。
 
 ### 2.2 何时切换到 `ROCm/aiter:main`
 
@@ -104,7 +115,10 @@ git -C third_party/aiter show <TARGET_AITER_SHA>:aiter/ops/triton/activation.py 
 
 然后把 gitlink 固定到同时包含全部依赖的一个 upstream commit。不要使用 `git submodule update --remote` 作为提交结果；Lumen 必须记录可复现的精确 SHA。
 
-如果只有 #5542 先合并，其余 PR 尚未合并，可以先在 Lumen 临时分支完成 API 适配和测试，但不要把最终 submodule 从集成 fork 切到 upstream main，也不要重新复制 #5542 kernel 到 `third_party/aiter_vendor/`。
+#5531、#5538、#5542、#5548 均已进入 upstream。完整迁移仍要等待
+`dual_layout_quant_mxfp4` 和 `dequant_hadamard_quant_mxfp4` 各自合并后，才把
+最终 submodule pin 切到同时包含全部依赖的 upstream revision。不要重新复制
+#5542 kernel 到 `third_party/aiter_vendor/`。
 
 ## 3. Lumen 逐文件修改
 
@@ -135,7 +149,7 @@ AITER #5542 的 backward contract：
 - 支持 FP16、BF16、FP32。
 - `grad_output` 与 `y` 同 dtype/device；允许 strided tensor。
 - 可选 `out` 必须与 `y` shape/dtype/device 一致且 contiguous。
-- 当前 tuning config 仅覆盖 gfx942 和 gfx950。
+- 当前 tuning config 和支持声明仅覆盖 gfx950。
 
 ### 3.2 `lumen/ops/dispatch.py`
 
@@ -150,7 +164,12 @@ from aiter.ops.triton.activation import (  # noqa: F401
 
 不能只探测 forward。否则旧版 AITER 会让安装器成功替换 forward，却在第一次 backward 时失败。
 
-该 probe 只证明符号可导入，不证明当前 GPU 有 tuning config。`LUMEN_FUSED_SWIGLU=1` 的支持范围应明确为 gfx942/gfx950；启动预检或集成测试必须在 kernel 真正执行后再判定可用，不能用 import success 代替运行验证。
+该 probe 只证明符号可导入，不证明当前 GPU 有 tuning config。
+`LUMEN_FUSED_SWIGLU=1` 的 backward 支持范围应明确为 gfx950。Lumen 应从输入
+tensor 所在设备取得并规范化 `gcnArchName`，非 gfx950 走 logged fallback。
+启动预检或集成测试必须在 kernel 真正执行后再判定可用，不能用 import success
+代替运行验证。#6124 合并并进入目标 pin 后，AITER 自身也会提供 fail-closed
+保护，但 Lumen 的 fallback 决策仍应保留。
 
 ### 3.3 `lumen/patches/runtime/megatron_import.py`
 
@@ -298,7 +317,7 @@ git diff --check
 
 ### 6.2 GPU 数值测试
 
-在 gfx942 和 gfx950 上通过 AITER 公共 wrapper 调用，至少覆盖：
+在 gfx950 上通过 AITER 公共 wrapper 调用，至少覆盖：
 
 | Case | 目的 |
 | --- | --- |
@@ -310,6 +329,9 @@ git diff --check
 | empty leading rows | 验证空 batch 行为 |
 
 结果与 PyTorch autograd reference 比较，使用 Lumen 的 `compute_snr` / `check_close` 或有依据的 dtype tolerance。不能只检查 shape 或“没有抛异常”。
+
+另加非 gfx950 的 dispatch/fallback 覆盖：在 gfx942 上不得启动 #5542 kernel，
+应明确走 Megatron/PyTorch fallback；这不是 #5542 数值 kernel coverage。
 
 还要对 forward 做 BF16/FP16 回归：upstream `fused_silu_mul` 当前在乘法前把 SiLU 结果 cast 回输入 dtype，而旧 vendored forward 保持 FP32 到乘法结束。若 loss/gradient 超出既有噪声范围，应先在 AITER 修正并补测试，不要在 Lumen 恢复一份私有 kernel。
 
@@ -408,7 +430,8 @@ LUMEN_FUSED_SWIGLU=0
 - Lumen 不再引用 `swiglu_fwd`、`swiglu_bwd` 或 vendored activation kernel。
 - Lumen 只调用 AITER public wrapper，不导入 `_triton_kernels`。
 - mock/probe/patch integration tests 全部通过。
-- gfx942、gfx950 的目标 GPU 数值测试通过。
+- gfx950 的目标 GPU 数值测试通过；gfx942 验证明确 fallback，不能启动该
+  backward kernel。
 - Megatron Qwen3 MXFP4 profile 确认实际运行 #5542 backward kernel。
 - Megatron paired A/B 的 loss 与 grad norm 对齐，性能无不可接受回退。
 - FSDP2 MXFP4 regression 通过，但不宣称它已使用 #5542。
