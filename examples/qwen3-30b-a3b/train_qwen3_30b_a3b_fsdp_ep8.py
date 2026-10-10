@@ -393,7 +393,8 @@ def main():
                    help="Store weights as FP8 in FSDP2 shard "
                         "(all-gather FP8 instead of BF16)")
     p.add_argument("--aiter-attn", action="store_true",
-                   help="Route SDPA via AITER CK FMHA")
+                   help="Route SDPA via AITER FMHA (v3 ASM when eligible, "
+                        "CK/Triton fallback)")
     p.add_argument("--lumen-norm", action="store_true",
                    help="Replace Qwen3MoeRMSNorm with Lumen fused RMSNorm")
     p.add_argument("--fuse-rope", action="store_true",

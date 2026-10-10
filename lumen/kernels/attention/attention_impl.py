@@ -1922,8 +1922,10 @@ def attention_forward(
             return out, softmax_lse, exp_scores, q, k, v, q_scale, k_scale, v_scale, p_scale, rng_state
         except RuntimeError as _csrc_err:
             # Known trigger: CP A2A scatter can produce nheads==1 per rank,
-            # which the CK fmha_fwd kernel rejects.  Safe to fall through
-            # to the Triton path below — numerically equivalent.
+            # which the AITER csrc FMHA entry rejects (v3 ASM shape
+            # constraints in ENABLE_CK=0 builds, CK fmha_fwd in CK builds).
+            # Safe to fall through to the Triton path below — numerically
+            # equivalent.
             logger.warning(
                 "attention_forward: aiter csrc rejected " "(q=%s, k=%s, causal=%s): %s — falling back to Triton",
                 tuple(q.shape),

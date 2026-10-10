@@ -5,7 +5,7 @@
 ###############################################################################
 
 """Monkey-patch ``torch.nn.functional.scaled_dot_product_attention`` with
-AITER-backed Lumen attention (CK csrc → Triton fallback).
+AITER-backed Lumen attention (FMHA v3 ASM when eligible, CK/Triton fallback).
 
 Usage::
 
@@ -14,7 +14,8 @@ Usage::
 
 After this call every ``F.scaled_dot_product_attention(q, k, v, …)`` in the
 process is routed through :func:`lumen.ops.attention.attention`, which
-dispatches to AITER CK kernels (with Triton fallback).
+dispatches to AITER FMHA — the v3 ASM kernels when arch/dtype/head-shape
+conditions hold, CK mha_fwd/mha_bwd otherwise, with Triton fallback.
 
 Layout handling:
     PyTorch ``F.scaled_dot_product_attention`` uses **(B, H, T, D)**.

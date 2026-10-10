@@ -519,7 +519,7 @@ def build_parser():
     p.add_argument(
         "--aiter-attn",
         action="store_true",
-        help="route SDPA attention through AITER (CK FMHA) instead of PyTorch AOTriton (hf_attn_patch)",
+        help="route SDPA attention through AITER FMHA (hf_attn_patch) instead of PyTorch AOTriton; the AITER csrc entry runs the v3 ASM kernels when arch/dtype/head-shape conditions hold, otherwise falls back to CK mha_fwd/mha_bwd, or Triton when CK is compiled out",
     )
     p.add_argument(
         "--lumen-norm",
@@ -987,7 +987,7 @@ def main():
             num_layers_at_end_in_bf16=args.num_layers_at_end_in_bf16,
             num_layers=model.config.num_hidden_layers,
             lumen_norm=args.lumen_norm,
-            hf_attn_patch=args.aiter_attn,  # route SDPA -> AITER CK FMHA when set
+            hf_attn_patch=args.aiter_attn,  # route SDPA -> AITER FMHA when set (v3 ASM when eligible, CK/Triton fallback)
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout,

@@ -502,10 +502,11 @@ _LUMEN_FP8_ATTN_BWD = _os.environ.get("LUMEN_FP8_ATTN_BWD", "0") == "1"
 
 
 class AttentionCsrcFP8BwdFunction(torch.autograd.Function):
-    """CK csrc forward + Triton FP8 backward.
+    """AITER csrc FMHA forward + Triton FP8 backward.
 
-    Uses AITER's highly optimized CK forward kernel (BF16), but routes the
-    backward through Lumen's Triton FP8 backward kernels which quantize dO,
+    Uses AITER's FMHA forward (BF16; v3 ASM when arch/dtype/head-shape
+    conditions hold, CK otherwise), but routes the backward through Lumen's
+    Triton FP8 backward kernels which quantize dO,
     Q, K to FP8 blockwise for reduced memory bandwidth.
 
     Controlled by ``LUMEN_FP8_ATTN_BWD=1``.
@@ -665,7 +666,8 @@ def attention(
         elif alibi_slopes.shape[0] == 1 and batch > 1:
             alibi_slopes = alibi_slopes.expand(batch, -1)
 
-    # Resolve "auto": prefer CK csrc when available, fall back to Triton.
+    # Resolve "auto": prefer the AITER csrc entry (FMHA v3 ASM when eligible,
+    # CK otherwise) when available, fall back to Triton.
     if backend_type == "auto":
         backend_type = "aiter_csrc" if _is_aiter_available() else "aiter_triton"
 
@@ -790,7 +792,8 @@ def attention(
         else:
             raise NotImplementedError(f"not supported backend_type {backend_type} cp_comm_type {cp_comm_type} yet")
 
-    # Single-GPU path: prefer CK csrc, fall back to Triton.
+    # Single-GPU path: prefer the AITER csrc entry (FMHA v3 ASM when
+    # eligible, CK otherwise), fall back to Triton.
     if backend_type == "aiter_csrc":
         if not _is_aiter_available():
             raise RuntimeError(
@@ -801,9 +804,10 @@ def attention(
         _needs_grad = torch.is_grad_enabled() and any(t.requires_grad for t in [q, k, v])
         _internal_return_lse = return_lse or _needs_grad
 
-        # CK csrc requires bias as 2D [sq, sk] — one bias broadcast across
-        # all batches and heads.  Squeeze (1,1,sq,sk) silently; route
-        # per-head / per-batch bias directly to Triton (csrc can't handle it).
+        # The AITER csrc FMHA entry requires bias as 2D [sq, sk] — one bias
+        # broadcast across all batches and heads.  Squeeze (1,1,sq,sk)
+        # silently; route per-head / per-batch bias directly to Triton
+        # (csrc can't handle it).
         _csrc_bias = bias
         _csrc_bias_unsupported = False
         if _csrc_bias is not None and _csrc_bias.dim() == 4:
