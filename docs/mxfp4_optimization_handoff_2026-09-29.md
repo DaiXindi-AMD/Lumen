@@ -32,6 +32,24 @@ Current selected working policy (short-run quality gate only):
 - Validation delta NLL: `+0.00790` (short-run quality gate passes).
 - The requested `1.6x` speed target is not reached.
 
+2026-10-10 dispatch audit addendum (records what the `6da1a42` commit message
+does not state):
+
+- `6da1a42f7bd176227391568d4f80da91fda13398` ("preserve the optimized Qwen3
+  training stack") also changed the MXFP4 GEMM backend dispatch:
+  `_gemm_mxfp4_aiter_asm` now calls
+  `aiter.ops.gemm_op_a4w4.gemm_a4w4_asm` directly with a validated ASM tuned
+  entry, replacing the generic `aiter.gemm_a4w4` call whose tuned selector
+  could pick ASM or CK. The Lumen MXFP4 GEMM registry (forward, DGrad, WGrad)
+  therefore contains no CK candidate. The AITER generic `gemm_a4w4` API keeps
+  its CK selector but is bypassed on this path.
+- CK is not removed from the training stack: AITER attention keeps the CK
+  `mha_fwd` / `mha_bwd` fallback for shapes outside the v3 constraints. The
+  saved Policy A profile shows attention producers `aiter::fmha_v3_fwd/bwd`
+  (ASM v3), and the current AITER compile registration maps those v3 modules
+  to `asm_mha_fwd/bwd.cu` with `-DENABLE_CK=0`. The trainer's historical
+  "CK FMHA" help text did not describe the actual default path.
+
 Recovery refs:
 
 - Lumen: `ZhangDanyang-AMD/Lumen`, branch `dev/mxfp4`; code snapshot ancestor
